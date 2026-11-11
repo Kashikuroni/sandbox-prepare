@@ -1,0 +1,20 @@
+# Zed icons
+
+SVG files copied without modifications from
+[zed-industries/zed](https://github.com/zed-industries/zed/tree/b1962f7cd8569ecade486c40320e3cff2d4b9d22/assets/icons),
+commit `b1962f7cd8569ecade486c40320e3cff2d4b9d22`.
+
+The upstream [LICENSES](LICENSES) notice is preserved verbatim and embedded
+alongside the icons in the executable. Keep this notice when redistributing
+these assets.
+
+| UI element | SVG |
+| --- | --- |
+| Backups | `archive.svg` |
+| Processes | `terminal.svg` |
+| Sandboxes | `box.svg` |
+| Settings | `settings.svg` |
+| Sidebar visible | `threads_sidebar_left_open.svg` |
+| Sidebar hidden | `threads_sidebar_left_closed.svg` |
+
+Debug/logging button: `debug.svg` (same upstream commit and license).

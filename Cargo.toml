@@ -1,0 +1,19 @@
+[package]
+name = "sandbox-prepare"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+aws-config = "1.13.1"
+aws-sdk-s3 = "1.158.0"
+gpui = "0.2.2"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
+toml = "1.2.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+unicode-segmentation = "1"
+serde_json = "1"
