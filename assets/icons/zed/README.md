@@ -14,6 +14,7 @@ these assets.
 | Processes | `terminal.svg` |
 | Sandboxes | `box.svg` |
 | Settings | `settings.svg` |
+| Search settings | `magnifying_glass.svg` |
 | Sidebar visible | `threads_sidebar_left_open.svg` |
 | Sidebar hidden | `threads_sidebar_left_closed.svg` |
 | Refresh logs | `rotate_cw.svg` |

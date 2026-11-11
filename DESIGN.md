@@ -44,7 +44,7 @@ UI inherits GPUI's default family and `text_base`; secondary descriptions, butto
 ## Layout
 
 Main window opens at 1100 × 720 with a 640 × 400 minimum and a 40 px titlebar. Its right-aligned 28 px Zed gear opens settings. Settings reuses its existing window, opening at 1000 × 740 with a 760 × 500 minimum.
-Settings has a fixed 240 px left panel: native drag/control area, search, then Appearance, Storage, Logging. The right side has an 88 px header with a User badge, `sandbox-prepare`, and the form/JSON switch. Content scrolls below it with 24 px horizontal inset.
+Settings has a fixed 240 px left panel: native drag/control area, search, then Appearance, Storage, Logging. The right side has a 48 px draggable header with the form/JSON switch aligned right; there is no user/project label. Content scrolls below it with 24 px horizontal inset.
 Setting rows place a flexible title/description column left and a fixed control right, separated by 24 px; rows have 20 px vertical padding and bottom dividers. Storage fields are 280 px wide; logging fields are 120 px. Save actions align right.
 The main log panel opens on the right, defaults to 420 px, and resizes from its left edge with a 260 px minimum. Narrow windows hide navigation while logs are open; the resize edge changes cursor without a hover highlight.
 
@@ -54,12 +54,12 @@ Normal surfaces use tonal layering and thin borders. Confirmation dialogs add a 
 
 ## Shapes
 
-Buttons, inputs, and the User badge use GPUI `rounded_sm`; confirmation dialogs use `rounded_md`. Controls have 1 px borders; button borders are transparent until focused unless explicitly outlined.
+Buttons and inputs use GPUI `rounded_sm`; confirmation dialogs use `rounded_md`. Controls have 1 px borders; button borders are transparent until focused unless explicitly outlined.
 
 ## Components
 
-Settings search matches section names, setting titles, and descriptions across all sections. Empty results say “No matching settings.” Selected navigation and theme choices use `element_selected`; buttons use `element_hover` on hover and `border_focused` for focus.
-Appearance applies immediately. Storage masks access and secret keys and saves through “Save connection”; credentials remain in SQLite. Logging has an explicit save, retention status, “Check now”, and “Clear all logs…”. Feedback appears below the header, with errors using the UI error color.
+The 28 px search input uses the original Zed magnifying-glass icon and 20 px line height. Input carets use `text_muted` gray in both themes. Search matches section names, setting titles, and descriptions across all sections. Empty results say “No matching settings.” Selected navigation and theme choices use `element_selected`; buttons use `element_hover` on hover and `border_focused` for focus.
+Appearance applies immediately. Storage masks access and secret keys and saves through “Save connection”; credentials remain in SQLite. Logging saves each valid edited field automatically after a 300 ms debounce, without resetting text, selection, or focus. Invalid drafts show inline errors and do not alter saved values. Pending edits are flushed before navigation or close. Logging also has retention status, “Check now”, and “Clear all logs…”. Feedback appears below the header, with errors using the UI error color.
 “Edit settings.json” replaces the form with a multiline editor inside the same window; “Back to settings” returns. “Save JSON” validates and applies settings, then synchronizes forms. Credentials are edited in Storage.
 Tab/Shift-Tab traverse settings controls; Enter/Space activate buttons. JSON Tab inserts indentation; Shift-Tab can leave the editor. Cmd/Ctrl+S saves the current form or JSON. Cmd/Ctrl+, opens settings from the workspace.
 Closing settings or switching form/JSON destinations with unsaved edits opens a discard confirmation. Clearing logs requires a destructive confirmation. Cancel receives initial focus; Tab/Shift-Tab remain between the two modal buttons; Escape cancels. Destructive action text uses the UI error color.
@@ -69,5 +69,5 @@ Log rows show local timestamp, bold colored level, first message line, and a rig
 ## Do's and Don'ts
 
 - Do use semantic `Palette` roles and the existing Zed icon assets for consistent new controls.
-- Do preserve label/description/control rows, visible focus borders, explicit form saves, and confirmation focus containment.
+- Do preserve label/description/control rows, visible focus borders, automatic Logging saves, explicit Storage/JSON saves, and confirmation focus containment.
 - Don't substitute UI error colors for the custom log severity colors or move credentials into general settings JSON.

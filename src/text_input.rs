@@ -1,7 +1,7 @@
 // Text editing adapted from the GPUI 0.2.2 input example (Apache-2.0).
 use std::ops::Range;
 
-use crate::theme::ThemeMode;
+use crate::{icons::Icon, theme::ThemeMode};
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
@@ -32,9 +32,13 @@ actions!(
     ]
 );
 
+pub struct Edited;
+impl gpui::EventEmitter<Edited> for TextInput {}
+
 pub struct TextInput {
     secret: bool,
     multiline: bool,
+    compact: bool,
     last_lines: Vec<(usize, ShapedLine)>,
     scroll: gpui::ScrollHandle,
     viewport_height: Pixels,
@@ -55,6 +59,7 @@ impl TextInput {
         Self {
             secret,
             multiline: false,
+            compact: false,
             last_lines: vec![],
             scroll: gpui::ScrollHandle::new(),
             viewport_height: px(200.),
@@ -83,8 +88,11 @@ impl TextInput {
         self.scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
     }
-    pub fn set_placeholder(&mut self, text: &'static str) {
-        self.placeholder = text.into();
+    pub fn search(theme: ThemeMode, cx: &mut Context<Self>) -> Self {
+        let mut input = Self::new(String::new(), false, theme, cx);
+        input.placeholder = "Search settings…".into();
+        input.compact = true;
+        input
     }
     pub fn focus(&self, window: &mut Window) {
         self.focus_handle.focus(window);
@@ -435,11 +443,15 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        let previous = self.content.clone();
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
+        if self.content != previous {
+            cx.emit(Edited);
+        }
         self.reveal_cursor();
         cx.notify();
     }
@@ -461,6 +473,7 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        let previous = self.content.clone();
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
@@ -475,6 +488,9 @@ impl EntityInputHandler for TextInput {
             .map(|new_range| new_range.start + range.start..new_range.end + range.start)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
 
+        if self.content != previous {
+            cx.emit(Edited);
+        }
         cx.notify();
     }
 
@@ -670,7 +686,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    gpui::blue(),
+                    rgb(input.theme.palette(window.appearance()).text_muted),
                 )),
             )
         } else {
@@ -797,7 +813,7 @@ fn multiline_prepaint(
                     point(bounds.left() + line.x_for_index(cursor - start), top),
                     size(px(2.), px(22.)),
                 ),
-                rgb(palette.icon_accent),
+                rgb(palette.text_muted),
             ));
         } else if input.selected_range.start <= end && input.selected_range.end > start {
             let left = line.x_for_index(
@@ -869,16 +885,29 @@ impl Render for TextInput {
             .border_1()
             .border_color(rgb(palette.border))
             .focus(|style| style.border_color(rgb(palette.border_focused)))
-            .line_height(px(if self.multiline { 22. } else { 30. }))
+            .line_height(px(if self.multiline {
+                22.
+            } else if self.compact {
+                20.
+            } else {
+                30.
+            }))
+            .when(self.compact, |el| {
+                el.h(px(28.)).items_center().px_2().gap_1()
+            })
             .when(self.multiline, |el| {
                 el.flex_col().size_full().min_h_0().font_family("Menlo")
             })
             .text_size(px(14.))
+            .when(self.compact, |el| {
+                el.child(Icon::Search.render(palette.icon_muted).size(px(14.)))
+            })
             .child(
                 div()
                     .id("input-content")
-                    .h(px(30. + 4. * 2.))
+                    .h(px(if self.compact { 20. } else { 38. }))
                     .w_full()
+                    .when(self.compact, |el| el.w(px(0.)).flex_1().min_w_0())
                     .when(self.multiline, |el| {
                         el.flex_1()
                             .h_full()
@@ -886,7 +915,7 @@ impl Render for TextInput {
                             .overflow_scroll()
                             .track_scroll(&self.scroll)
                     })
-                    .p(px(4.))
+                    .p(px(if self.compact { 0. } else { 4. }))
                     .bg(rgb(background))
                     .relative()
                     .child(TextElement { input: cx.entity() })

@@ -2,8 +2,8 @@ use crate::{
     backups::StorageConfig,
     backups_view::BackupsView,
     logging,
-    settings::{LogSettings, Settings, SettingsModel},
-    text_input::TextInput,
+    settings::{Settings, SettingsModel},
+    text_input::{Edited, TextInput},
     theme::{Palette, ThemeMode},
 };
 use gpui::{Context, Div, Entity, FocusHandle, Render, Stateful, Window, div, prelude::*, px, rgb};
@@ -52,6 +52,8 @@ pub struct SettingsWindow {
     modal: Option<Confirmation>,
     modal_focus: [FocusHandle; 2],
     busy: bool,
+    log_save_tasks: [Option<gpui::Task<()>>; 4],
+    log_errors: [Option<String>; 4],
 }
 impl SettingsWindow {
     pub fn new(
@@ -62,11 +64,7 @@ impl SettingsWindow {
     ) -> Self {
         let settings = model.read(cx).value.clone();
         let theme = settings.theme;
-        let search = cx.new(|cx| {
-            let mut input = TextInput::new(String::new(), false, theme, cx);
-            input.set_placeholder("Search settings…");
-            input
-        });
+        let search = cx.new(|cx| TextInput::search(theme, cx));
         cx.observe(&search, |_, _, cx| cx.notify()).detach();
         let config = crate::database::load_storage();
         let message = config
@@ -88,10 +86,16 @@ impl SettingsWindow {
         let logs = std::array::from_fn(|index| {
             cx.new(|cx| TextInput::new(values[index].clone(), false, theme, cx))
         });
+        for (index, field) in logs.iter().enumerate() {
+            cx.subscribe(field, move |view, _, _: &Edited, cx| {
+                view.schedule_log_save(index, cx)
+            })
+            .detach();
+        }
         let editor =
             cx.new(|cx| TextInput::multiline(settings.json().unwrap_or_default(), theme, cx));
         let focus = cx.focus_handle();
-        focus.focus(window);
+        search.read(cx).focus(window);
         cx.observe(&model, |view, model, cx| {
             view.set_input_theme(model.read(cx).value.theme, cx);
             cx.notify();
@@ -107,6 +111,7 @@ impl SettingsWindow {
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |view, cx| {
+                view.flush_logging(cx);
                 if view.has_unsaved(cx) {
                     view.confirm(Confirmation::Discard(Destination::Close), window, cx);
                     false
@@ -141,6 +146,8 @@ impl SettingsWindow {
             modal: None,
             modal_focus: std::array::from_fn(|_| cx.focus_handle()),
             busy: false,
+            log_save_tasks: std::array::from_fn(|_| None),
+            log_errors: std::array::from_fn(|_| None),
         }
     }
     fn set_input_theme(&self, theme: ThemeMode, cx: &mut Context<Self>) {
@@ -166,11 +173,10 @@ impl SettingsWindow {
     fn has_unsaved(&self, cx: &gpui::App) -> bool {
         let settings = &self.model.read(cx).value;
         (self.json_mode && self.editor.read(cx).value() != settings.json().unwrap_or_default())
-            || self
-                .logs
-                .iter()
-                .zip(log_values(settings))
-                .any(|(field, value)| field.read(cx).value() != value)
+            || self.logs.iter().enumerate().any(|(index, field)| {
+                !logging_edit(settings, index, &field.read(cx).value())
+                    .is_ok_and(|edited| edited == *settings)
+            })
             || self
                 .storage
                 .iter()
@@ -192,6 +198,7 @@ impl SettingsWindow {
         cx.notify();
     }
     fn request(&mut self, destination: Destination, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_logging(cx);
         if self.has_unsaved(cx) {
             self.confirm(Confirmation::Discard(destination), window, cx);
         } else {
@@ -219,6 +226,8 @@ impl SettingsWindow {
         cx.notify();
     }
     fn discard(&mut self, destination: Destination, window: &mut Window, cx: &mut Context<Self>) {
+        self.log_save_tasks = std::array::from_fn(|_| None);
+        self.log_errors = std::array::from_fn(|_| None);
         self.sync_fields(cx);
         for (field, value) in self.storage.iter().zip(&self.saved_storage) {
             field.update(cx, |field, cx| field.set_value(value.clone(), cx));
@@ -248,39 +257,35 @@ impl SettingsWindow {
         }
         cx.notify();
     }
-    fn save_logging(&mut self, cx: &mut Context<Self>) {
-        let result = (|| -> anyhow::Result<Settings> {
-            let values: Vec<_> = self
-                .logs
-                .iter()
-                .map(|field| field.read(cx).value())
-                .collect();
-            let mut settings = self.model.read(cx).value.clone();
-            settings.current_log_limit = values[0].trim().parse().map_err(|_| {
-                anyhow::anyhow!("Current log records must be a positive whole number")
-            })?;
-            let parse = |index: usize, label: &str| {
-                values[index]
-                    .trim()
-                    .parse::<u32>()
-                    .map_err(|_| anyhow::anyhow!("{label} must be a positive whole number"))
-            };
-            settings.logging = LogSettings {
-                max_file_mib: parse(1, "File size")?,
-                retention_days: parse(2, "Retention")?,
-                check_interval_hours: parse(3, "Check interval")?,
-            };
-            settings.validate()?;
-            Ok(settings)
-        })();
-        match result {
-            Ok(settings) => {
-                if self.save(settings, cx) {
-                    self.sync_fields(cx);
-                }
+    fn schedule_log_save(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.log_errors[index] = None;
+        self.log_save_tasks[index] = Some(cx.spawn(async move |view, cx| {
+            gpui::Timer::after(Duration::from_millis(300)).await;
+            let _ = view.update(cx, |view, cx| view.apply_log_edit(index, cx));
+        }));
+        cx.notify();
+    }
+    fn flush_logging(&mut self, cx: &mut Context<Self>) {
+        self.log_save_tasks = std::array::from_fn(|_| None);
+        if !self.json_mode {
+            for index in 0..self.logs.len() {
+                self.apply_log_edit(index, cx);
             }
-            Err(error) => self.message = Some((true, error.to_string())),
         }
+    }
+    fn apply_log_edit(&mut self, index: usize, cx: &mut Context<Self>) {
+        let current = &self.model.read(cx).value;
+        let result = logging_edit(current, index, &self.logs[index].read(cx).value());
+        self.log_errors[index] = match result {
+            Ok(settings) if settings == *current => None,
+            Ok(settings) => self
+                .model
+                .update(cx, |model, cx| model.save(settings, cx))
+                .err()
+                .map(|error| format!("{error:#}")),
+            Err(error) => Some(error.to_string()),
+        };
+        // Do not replace input values: edits must preserve selection, caret, and focus.
         cx.notify();
     }
     fn save_storage(&mut self, cx: &mut Context<Self>) {
@@ -309,6 +314,17 @@ impl SettingsWindow {
     fn maintenance(&mut self, clear: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
+        }
+        if !clear {
+            self.flush_logging(cx);
+            if self.log_errors.iter().any(Option::is_some) {
+                self.message = Some((
+                    true,
+                    "Correct logging settings before checking retention.".into(),
+                ));
+                cx.notify();
+                return;
+            }
         }
         self.modal = None;
         self.focus.focus(window);
@@ -429,7 +445,6 @@ impl SettingsWindow {
                 |view, _, cx| view.save_storage(cx),
             )));
         }
-        let mut logging_visible = false;
         for (index, (title, description)) in [
             (
                 "Current log records",
@@ -452,13 +467,21 @@ impl SettingsWindow {
         .enumerate()
         {
             if self.matches(title, description, Section::Logging, cx) {
-                logging_visible = true;
                 rows.push(
                     setting_row(title, description, palette).child(
                         div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
                             .w(px(120.))
                             .flex_shrink_0()
-                            .child(self.logs[index].clone()),
+                            .child(self.logs[index].clone())
+                            .children(self.log_errors[index].as_ref().map(|error| {
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette.error))
+                                    .child(error.clone())
+                            })),
                     ),
                 );
             }
@@ -531,15 +554,6 @@ impl SettingsWindow {
                             ),
                     ),
             );
-        }
-        if logging_visible {
-            rows.push(div().flex().justify_end().py_4().child(button(
-                "save-logging",
-                "Save logging settings",
-                palette,
-                cx,
-                |view, _, cx| view.save_logging(cx),
-            )));
         }
         div()
             .id("settings-form")
@@ -665,7 +679,7 @@ impl Render for SettingsWindow {
             .on_action(cx.listener(|view, _: &crate::FocusPrevious, window, cx| { view.move_focus(true, window); cx.stop_propagation(); }))
             .on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "s" && (event.keystroke.modifiers.platform || event.keystroke.modifiers.control) && view.modal.is_none() {
-                    if view.json_mode { view.save_json(cx); } else { match view.section { Section::Storage => view.save_storage(cx), Section::Logging => view.save_logging(cx), _ => {} } }
+                    if view.json_mode { view.save_json(cx); } else { match view.section { Section::Storage => view.save_storage(cx), Section::Logging => view.flush_logging(cx), _ => {} } }
                     cx.stop_propagation();
                 }
             }))
@@ -678,11 +692,9 @@ impl Render for SettingsWindow {
                         .mx_3().h(px(34.)).when(!self.json_mode && self.section == section, |el| el.bg(rgb(palette.element_selected)))
                 })))
             .child(div().flex().flex_col().flex_1().min_w_0().h_full()
-                .child(div().flex().items_center().h(px(88.)).flex_shrink_0().px_6().gap_2()
+                .child(div().flex().items_center().h(px(48.)).flex_shrink_0().px_6().gap_2()
                     .child(div().flex().items_center().flex_1().h_full().gap_2().window_control_area(gpui::WindowControlArea::Drag)
-                        .on_mouse_down(gpui::MouseButton::Left, |event, window, _| { if event.click_count == 2 { window.titlebar_double_click(); } else { window.start_window_move(); } })
-                        .child(div().px_2().py_1().rounded_sm().bg(rgb(palette.border_focused)).text_color(rgb(palette.icon_accent)).child("User"))
-                        .child("sandbox-prepare"))
+                        .on_mouse_down(gpui::MouseButton::Left, |event, window, _| { if event.click_count == 2 { window.titlebar_double_click(); } else { window.start_window_move(); } }))
                     .child(if self.json_mode {
                         button("show-form", "Back to settings", palette, cx, |view, window, cx| view.request(Destination::Form(view.section), window, cx))
                     } else { button("edit-settings-json", "Edit settings.json", palette, cx, |view, window, cx| view.request(Destination::Json, window, cx)) }.border_color(rgb(palette.border)).bg(rgb(palette.panel_background))))
@@ -696,6 +708,21 @@ impl Render for SettingsWindow {
             .when(self.modal.is_some(), |el| el.child(self.render_modal(palette, cx)))
     }
 }
+fn logging_edit(current: &Settings, index: usize, value: &str) -> anyhow::Result<Settings> {
+    let mut settings = current.clone();
+    let value = value.trim();
+    let invalid = || anyhow::anyhow!("Enter a positive whole number.");
+    match index {
+        0 => settings.current_log_limit = value.parse().map_err(|_| invalid())?,
+        1 => settings.logging.max_file_mib = value.parse().map_err(|_| invalid())?,
+        2 => settings.logging.retention_days = value.parse().map_err(|_| invalid())?,
+        3 => settings.logging.check_interval_hours = value.parse().map_err(|_| invalid())?,
+        _ => anyhow::bail!("Unknown logging field"),
+    }
+    settings.validate()?;
+    Ok(settings)
+}
+
 fn log_values(settings: &Settings) -> [String; 4] {
     [
         settings.current_log_limit.to_string(),
@@ -760,4 +787,41 @@ fn button(
             }),
         )
         .child(label)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logging_edits_rebase_on_current_settings_without_changing_other_fields() {
+        let settings = Settings {
+            theme: ThemeMode::Dark,
+            ..Default::default()
+        };
+        let settings = logging_edit(&settings, 1, "15").unwrap();
+        let settings = logging_edit(&settings, 2, "14").unwrap();
+        assert_eq!(settings.theme, ThemeMode::Dark);
+        assert_eq!(settings.current_log_limit, 2000);
+        assert_eq!(settings.logging.max_file_mib, 15);
+        assert_eq!(settings.logging.retention_days, 14);
+        assert_eq!(settings.logging.check_interval_hours, 24);
+    }
+
+    #[test]
+    fn invalid_drafts_are_rejected_and_equivalent_text_is_already_saved() {
+        let settings = Settings::default();
+        for (index, value) in [
+            (0, ""),
+            (0, "-1"),
+            (1, "0"),
+            (1, "10241"),
+            (2, "1.5"),
+            (3, "no"),
+        ] {
+            assert!(logging_edit(&settings, index, value).is_err());
+        }
+        assert_eq!(logging_edit(&settings, 0, " 002000 ").unwrap(), settings);
+        assert_eq!(logging_edit(&settings, 2, "007").unwrap(), settings);
+    }
 }
