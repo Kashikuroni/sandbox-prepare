@@ -1,4 +1,5 @@
 use crate::{
+    icons::Icon,
     logging::{self, Cursor, Entry, Filter, LogStore, Page},
     theme::{Palette, ThemeMode},
 };
@@ -7,6 +8,8 @@ use gpui::{
     prelude::*, px, rgb,
 };
 use std::{
+    cell::Cell,
+    rc::Rc,
     sync::{Arc, mpsc},
     time::Duration,
 };
@@ -14,6 +17,31 @@ use std::{
 enum Source {
     Current,
     History,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilterKind {
+    Category,
+    Level,
+}
+impl FilterKind {
+    fn index(self) -> usize {
+        if self == Self::Category { 0 } else { 1 }
+    }
+    fn options(self) -> &'static [&'static str] {
+        match self {
+            Self::Category => &[
+                "All categories",
+                "startup",
+                "ui",
+                "settings",
+                "storage",
+                "s3",
+                "download",
+                "panic",
+            ],
+            Self::Level => &["All levels", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
+        }
+    }
 }
 pub struct LogsView {
     store: Arc<LogStore>,
@@ -34,6 +62,12 @@ pub struct LogsView {
     details: Option<Arc<Entry>>,
     copied: bool,
     copy_error: Option<String>,
+    open_filter: Option<FilterKind>,
+    menu_index: usize,
+    menu_focus: gpui::FocusHandle,
+    selector_focus: [gpui::FocusHandle; 2],
+    source_focus: [gpui::FocusHandle; 2],
+    selector_bounds: [Rc<Cell<Option<gpui::Bounds<gpui::Pixels>>>>; 2],
 }
 impl LogsView {
     pub fn new(theme: ThemeMode, cx: &mut Context<Self>) -> Self {
@@ -101,6 +135,12 @@ impl LogsView {
             details: None,
             copied: false,
             copy_error: None,
+            open_filter: None,
+            menu_index: 0,
+            menu_focus: cx.focus_handle(),
+            selector_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            source_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            selector_bounds: std::array::from_fn(|_| Rc::new(Cell::new(None))),
         };
         view.refresh_current();
         view
@@ -178,6 +218,7 @@ impl LogsView {
         cx.notify();
     }
     fn source(&mut self, source: Source, cx: &mut Context<Self>) {
+        self.open_filter = None;
         self.source = source;
         self.request += 1;
         self.loading = false;
@@ -193,6 +234,269 @@ impl LogsView {
             px(400.),
         );
         self.refresh(cx);
+    }
+    fn selected_filter(&self, kind: FilterKind) -> usize {
+        let value = match kind {
+            FilterKind::Category => &self.filter.category,
+            FilterKind::Level => &self.filter.level,
+        };
+        value
+            .as_ref()
+            .and_then(|value| kind.options().iter().position(|option| *option == value))
+            .unwrap_or(0)
+    }
+    fn close_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(kind) = self.open_filter.take() {
+            self.selector_focus[kind.index()].focus(window);
+        }
+        cx.notify();
+    }
+    fn toggle_filter(&mut self, kind: FilterKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_filter == Some(kind) {
+            self.close_filter(window, cx);
+        } else {
+            self.open_filter = Some(kind);
+            self.menu_index = self.selected_filter(kind);
+            self.menu_focus.focus(window);
+            cx.notify();
+        }
+    }
+    fn choose_filter(
+        &mut self,
+        kind: FilterKind,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = (index != 0).then(|| kind.options()[index].to_owned());
+        match kind {
+            FilterKind::Category => self.filter.category = value,
+            FilterKind::Level => self.filter.level = value,
+        }
+        self.close_filter(window, cx);
+        self.refresh(cx);
+    }
+    fn selector(&self, kind: FilterKind, palette: Palette, cx: &mut Context<Self>) -> Div {
+        let bounds = self.selector_bounds[kind.index()].clone();
+        let open = self.open_filter == Some(kind);
+        div()
+            .relative()
+            .min_w_0()
+            .child(
+                div()
+                    .id(("log-selector", kind.index()))
+                    .w_full()
+                    .min_w_0()
+                    .track_focus(&self.selector_focus[kind.index()])
+                    .flex()
+                    .items_center()
+                    .h(px(28.))
+                    .px_2()
+                    .gap_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(rgb(palette.text_muted))
+                    .when(open, |el| el.bg(rgb(palette.element_selected)))
+                    .hover(|el| el.bg(rgb(palette.element_hover)))
+                    .focus(|el| el.border_color(rgb(palette.border_focused)))
+                    .on_click(
+                        cx.listener(move |view, _, window, cx| {
+                            view.toggle_filter(kind, window, cx)
+                        }),
+                    )
+                    .on_key_down(cx.listener(
+                        move |view, event: &gpui::KeyDownEvent, window, cx| {
+                            if matches!(
+                                event.keystroke.key.as_str(),
+                                "enter" | "space" | "down" | "up"
+                            ) {
+                                view.toggle_filter(kind, window, cx);
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(kind.options()[self.selected_filter(kind)]),
+                    )
+                    .child(Icon::ChevronDown.render(palette.icon_muted).size(px(12.))),
+            )
+            .child(
+                gpui::canvas(
+                    move |rectangle, _, _| bounds.set(Some(rectangle)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .when(open, |el| {
+                el.child(
+                    div().absolute().top_0().left_0().child(
+                        gpui::deferred(
+                            gpui::anchored()
+                                .offset(gpui::point(px(0.), px(32.)))
+                                .snap_to_window_with_margin(px(8.))
+                                .child(self.filter_menu(kind, palette, cx)),
+                        )
+                        .with_priority(1),
+                    ),
+                )
+            })
+    }
+    fn filter_menu(
+        &self,
+        kind: FilterKind,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        div()
+            .id("log-filter-menu")
+            .track_focus(&self.menu_focus)
+            .occlude()
+            .flex()
+            .flex_col()
+            .w(px(200.))
+            .p_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(palette.border))
+            .shadow_md()
+            .bg(rgb(palette.panel_background))
+            .text_color(rgb(palette.text))
+            .on_mouse_down_out(
+                cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
+                    if !view.selector_bounds[kind.index()]
+                        .get()
+                        .is_some_and(|bounds| bounds.contains(&event.position))
+                    {
+                        view.open_filter = None;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_key_down(
+                cx.listener(move |view, event: &gpui::KeyDownEvent, window, cx| {
+                    let len = kind.options().len();
+                    match event.keystroke.key.as_str() {
+                        "escape" => view.close_filter(window, cx),
+                        "down" => view.menu_index = (view.menu_index + 1) % len,
+                        "up" => view.menu_index = (view.menu_index + len - 1) % len,
+                        "home" => view.menu_index = 0,
+                        "end" => view.menu_index = len - 1,
+                        "enter" | "space" => view.choose_filter(kind, view.menu_index, window, cx),
+                        "tab" => {
+                            view.close_filter(window, cx);
+                            return;
+                        }
+                        _ => return,
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }),
+            )
+            .children(kind.options().iter().enumerate().map(|(index, label)| {
+                let selected = index == self.selected_filter(kind);
+                div()
+                    .id(("filter-option", index))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(30.))
+                    .px_2()
+                    .rounded_sm()
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(selected, |el| el.bg(rgb(palette.element_selected)))
+                    .when(!selected && index == self.menu_index, |el| {
+                        el.bg(rgb(palette.element_hover))
+                    })
+                    .hover(|el| {
+                        el.bg(rgb(if selected {
+                            palette.element_selected
+                        } else {
+                            palette.element_hover
+                        }))
+                    })
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.choose_filter(kind, index, window, cx)
+                    }))
+                    .child(*label)
+                    .when(selected, |el| {
+                        el.child(Icon::Check.render(palette.icon_accent).size(px(14.)))
+                    })
+            }))
+    }
+    fn source_tab(
+        &self,
+        source: Source,
+        index: usize,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let selected = self.source == source;
+        div()
+            .id(("log-source", index))
+            .track_focus(&self.source_focus[index])
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .items_center()
+            .justify_center()
+            .text_sm()
+            .cursor_pointer()
+            .text_color(rgb(if selected {
+                palette.text
+            } else {
+                palette.text_muted
+            }))
+            .bg(rgb(if selected {
+                palette.panel_background
+            } else {
+                palette.editor_background
+            }))
+            .border_b_1()
+            .border_color(if selected {
+                gpui::transparent_black()
+            } else {
+                rgb(palette.border).into()
+            })
+            .focus(|el| el.text_color(rgb(palette.text)))
+            .on_click(cx.listener(move |view, _, window, cx| {
+                view.source_focus[index].focus(window);
+                view.source(source, cx);
+            }))
+            .on_key_down(
+                cx.listener(move |view, event: &gpui::KeyDownEvent, window, cx| {
+                    let selected = match event.keystroke.key.as_str() {
+                        "left" | "home" => 0,
+                        "right" | "end" => 1,
+                        "enter" | "space" => index,
+                        _ => return,
+                    };
+                    view.source_focus[selected].focus(window);
+                    view.source(
+                        if selected == 0 {
+                            Source::Current
+                        } else {
+                            Source::History
+                        },
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }),
+            )
+            .child(if source == Source::Current {
+                "Current"
+            } else {
+                "History"
+            })
     }
     fn row(&self, index: usize, palette: Palette, cx: &mut Context<Self>) -> Div {
         let entry = self.entries[index].clone();
@@ -434,106 +738,49 @@ impl Render for LogsView {
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .h(px(44.))
+                    .w_full()
+                    .h(px(32.))
                     .flex_shrink_0()
-                    .px_2()
-                    .gap_1()
-                    .border_b_1()
-                    .border_color(rgb(palette.border))
-                    .child(button(
-                        "logs-current",
-                        "Current",
-                        palette,
-                        self.source == Source::Current,
-                        cx,
-                        |view, _, cx| view.source(Source::Current, cx),
-                    ))
-                    .child(button(
-                        "logs-history",
-                        "History",
-                        palette,
-                        self.source == Source::History,
-                        cx,
-                        |view, _, cx| view.source(Source::History, cx),
-                    ))
-                    .child(div().flex_1())
-                    .child(button(
-                        "refresh-logs",
-                        "Refresh",
-                        palette,
-                        false,
-                        cx,
-                        |view, _, cx| {
-                            if !view.loading {
-                                view.refresh(cx)
-                            }
-                        },
-                    )),
+                    .child(self.source_tab(Source::Current, 0, palette, cx))
+                    .child(
+                        div()
+                            .w(px(1.))
+                            .h_full()
+                            .flex_shrink_0()
+                            .bg(rgb(palette.border)),
+                    )
+                    .child(self.source_tab(Source::History, 1, palette, cx)),
             )
             .child(
                 div()
                     .flex()
-                    .flex_col()
+                    .w_full()
+                    .items_center()
+                    .h(px(40.))
                     .flex_shrink_0()
-                    .p_2()
+                    .px_2()
                     .gap_1()
-                    .border_b_1()
-                    .border_color(rgb(palette.border))
+                    .child(self.selector(FilterKind::Category, palette, cx))
+                    .child(self.selector(FilterKind::Level, palette, cx))
+                    .child(div().flex_1())
                     .child(
-                        div().flex().flex_wrap().gap_1().children(
-                            [
-                                "All", "startup", "ui", "settings", "storage", "s3", "download",
-                                "panic",
-                            ]
-                            .into_iter()
-                            .map(|category| {
-                                let selected = self.filter.category.as_deref()
-                                    == if category == "All" {
-                                        None
-                                    } else {
-                                        Some(category)
-                                    };
-                                button(
-                                    gpui::SharedString::from(format!("category-{category}")),
-                                    category,
-                                    palette,
-                                    selected,
-                                    cx,
-                                    move |view, _, cx| {
-                                        view.filter.category =
-                                            (category != "All").then(|| category.into());
-                                        view.refresh(cx);
-                                    },
-                                )
-                            }),
-                        ),
-                    )
-                    .child(
-                        div().flex().flex_wrap().gap_1().children(
-                            ["All levels", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"]
-                                .into_iter()
-                                .map(|level| {
-                                    let selected = self.filter.level.as_deref()
-                                        == if level == "All levels" {
-                                            None
-                                        } else {
-                                            Some(level)
-                                        };
-                                    button(
-                                        gpui::SharedString::from(format!("level-{level}")),
-                                        level,
-                                        palette,
-                                        selected,
-                                        cx,
-                                        move |view, _, cx| {
-                                            view.filter.level =
-                                                (level != "All levels").then(|| level.into());
-                                            view.refresh(cx);
-                                        },
-                                    )
-                                }),
-                        ),
+                        button("refresh-logs", "", palette, false, cx, |view, _, cx| {
+                            if !view.loading {
+                                view.refresh(cx)
+                            }
+                        })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(28.))
+                        .h(px(28.))
+                        .p_0()
+                        .child(Icon::Refresh.render(if self.loading {
+                            palette.icon_muted
+                        } else {
+                            palette.icon
+                        }))
+                        .tooltip(move |_, cx| cx.new(|_| RefreshTooltip(palette)).into()),
                     ),
             )
             .child(
@@ -633,6 +880,20 @@ impl Render for LogsView {
                 )
             })
             .into_any_element()
+    }
+}
+
+struct RefreshTooltip(Palette);
+impl Render for RefreshTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .text_xs()
+            .rounded_sm()
+            .bg(rgb(self.0.panel_background))
+            .text_color(rgb(self.0.text))
+            .child("Refresh logs")
     }
 }
 

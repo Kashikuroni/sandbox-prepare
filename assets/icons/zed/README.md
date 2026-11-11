@@ -16,5 +16,8 @@ these assets.
 | Settings | `settings.svg` |
 | Sidebar visible | `threads_sidebar_left_open.svg` |
 | Sidebar hidden | `threads_sidebar_left_closed.svg` |
+| Refresh logs | `rotate_cw.svg` |
+| Filter dropdown | `chevron_down.svg` |
+| Selected filter option | `check.svg` |
 
 Debug/logging button: `debug.svg` (same upstream commit and license).
