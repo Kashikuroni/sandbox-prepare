@@ -519,14 +519,19 @@ impl LogsView {
                     .gap_2()
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .min_w_0()
                             .text_xs()
                             .text_color(rgb(palette.text_muted))
-                            .child(format!(
-                                "{} {}",
-                                entry.level,
-                                display_timestamp(&entry.timestamp)
-                            )),
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(rgb(palette.log_level_color(&entry.level)))
+                                    .child(entry.level.clone()),
+                            )
+                            .child(display_timestamp(&entry.timestamp)),
                     )
                     .child(div().flex_1())
                     .child(button(

@@ -33,8 +33,9 @@ impl ThemeMode {
     }
 }
 
-/// Exact opaque UI tokens from Zed's Ayu Light and Ayu Mirage themes, matching the reference editor.
+/// Base UI tokens from Zed's Ayu Light and Ayu Mirage themes, matching the reference editor.
 /// https://github.com/zed-industries/zed/blob/b1962f7cd8569ecade486c40320e3cff2d4b9d22/assets/themes/ayu/ayu.json
+/// Log levels use a custom muted palette for each theme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
     pub editor_background: u32,
@@ -53,6 +54,10 @@ pub struct Palette {
     pub element_hover: u32,
     pub element_selected: u32,
     pub error: u32,
+    pub log_debug: u32,
+    pub log_info: u32,
+    pub log_warning: u32,
+    pub log_error: u32,
 }
 
 impl Palette {
@@ -73,6 +78,10 @@ impl Palette {
         element_hover: 0xdfe0e1,
         element_selected: 0xcfd0d2,
         error: 0xef7271,
+        log_debug: 0x656a70,
+        log_info: 0x517255,
+        log_warning: 0x92602f,
+        log_error: 0xa15353,
     };
 
     pub const AYU_MIRAGE: Self = Self {
@@ -92,7 +101,20 @@ impl Palette {
         element_hover: 0x43464f,
         element_selected: 0x53565d,
         error: 0xf18779,
+        log_debug: 0xa4a7ad,
+        log_info: 0xa7c6a0,
+        log_warning: 0xd7b58a,
+        log_error: 0xe6a0a0,
     };
+
+    pub fn log_level_color(self, level: &str) -> u32 {
+        match level {
+            "INFO" => self.log_info,
+            "WARN" | "WARNING" => self.log_warning,
+            "ERROR" => self.log_error,
+            _ => self.log_debug,
+        }
+    }
 }
 
 #[cfg(test)]
