@@ -37,6 +37,7 @@ impl FilterKind {
                 "storage",
                 "s3",
                 "download",
+                "sandbox",
                 "panic",
             ],
             Self::Level => &["All levels", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"],

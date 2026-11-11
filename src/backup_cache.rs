@@ -103,7 +103,9 @@ pub struct Cache {
 }
 impl Cache {
     pub fn application() -> Result<Self> {
-        let database = crate::database::database_path()?;
+        Self::for_database(crate::database::database_path()?)
+    }
+    pub fn for_database(database: PathBuf) -> Result<Self> {
         let root = database
             .parent()
             .context("Application directory is missing")?
@@ -130,7 +132,7 @@ impl Cache {
             .write(true)
             .open(self.root.join(".lock"))?;
         file.try_lock()
-            .context("Backups are busy in another application instance")?;
+            .context("Backups are in use by another operation or application instance")?;
         Ok(file)
     }
     fn read_pair(&self) -> Result<Option<Pair>> {
@@ -188,6 +190,34 @@ impl Cache {
             warnings,
         })
     }
+    pub fn lease(&self) -> Result<BackupLease> {
+        let lock = self.lock()?;
+        let pair = self.read_pair()?.context("Download both backups first")?;
+        let directory = self.root.join(&pair.generation);
+        ensure!(
+            fs::symlink_metadata(&directory)?.file_type().is_dir(),
+            "Invalid local backup directory"
+        );
+        for (index, record) in pair.records.iter().enumerate() {
+            let modified = file_time(&directory.join(FILES[index]), record.size)?;
+            ensure!(
+                record.verification_error.is_none(),
+                "Local backup failed verification; download it again"
+            );
+            ensure!(
+                record
+                    .local_modified
+                    .as_ref()
+                    .is_none_or(|old| old == &modified),
+                "Local backup changed; verify integrity or download again"
+            );
+        }
+        Ok(BackupLease {
+            _lock: lock,
+            pair,
+            directory,
+        })
+    }
     fn cleanup(&self, keep: Option<&str>) -> Vec<String> {
         let mut warnings = Vec::new();
         let result = (|| -> Result<()> {
@@ -229,6 +259,12 @@ impl Cache {
         })
     }
 }
+pub struct BackupLease {
+    _lock: File,
+    pub pair: Pair,
+    pub directory: PathBuf,
+}
+
 fn owned_name(name: &str, prefix: &str) -> bool {
     name.strip_prefix(prefix).is_some_and(|suffix| {
         let parts: Vec<_> = suffix.split('-').collect();
@@ -671,6 +707,21 @@ mod tests {
         assert_eq!(serde_json::to_value(cache.read_pair()?)?, before);
         assert!(!cache.load()?.missing());
         assert!(cache.root.join(pair.generation).join(FILES[0]).exists());
+        fs::remove_dir_all(cache.database.parent().unwrap())?;
+        Ok(())
+    }
+    #[test]
+    fn restore_lease_pins_the_pair_and_rejects_changed_files() -> Result<()> {
+        let cache = cache("restore-lease");
+        let pair = install(&cache, &StorageConfig::default())?.pair.unwrap();
+        let lease = cache.lease()?;
+        assert_eq!(lease.pair.generation, pair.generation);
+        assert!(cache.begin().is_err());
+        assert!(cache.load().is_err());
+        drop(lease);
+        let path = cache.root.join(pair.generation).join(FILES[0]);
+        fs::write(&path, b"changed")?;
+        assert!(cache.lease().is_err());
         fs::remove_dir_all(cache.database.parent().unwrap())?;
         Ok(())
     }

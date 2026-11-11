@@ -8,10 +8,15 @@ mod backup_cache;
 mod backups;
 mod backups_view;
 mod database;
+mod docker;
 mod icons;
 mod log_files;
 mod logging;
 mod logs_view;
+mod process_log;
+mod sandbox;
+mod sandbox_store;
+mod sandboxes_view;
 mod settings;
 mod settings_view;
 mod text_input;
@@ -28,7 +33,8 @@ actions!(
         ToggleLogs,
         OpenSettings,
         FocusNext,
-        FocusPrevious
+        FocusPrevious,
+        QuitSandbox
     ]
 );
 
@@ -67,6 +73,7 @@ struct Workspace {
     settings_model: gpui::Entity<SettingsModel>,
     settings_window: Option<gpui::WindowHandle<settings_view::SettingsWindow>>,
     backups: gpui::Entity<backups_view::BackupsView>,
+    sandbox: gpui::Entity<sandboxes_view::SandboxesView>,
     logs: gpui::Entity<logs_view::LogsView>,
     logs_open: bool,
     logs_width: f32,
@@ -98,6 +105,10 @@ impl Workspace {
             this.settings = model.read(cx).value.clone();
             let theme = this.settings.theme;
             this.logs.update(cx, |logs, cx| logs.set_theme(theme, cx));
+            this.sandbox.update(cx, |sandbox, cx| {
+                sandbox.configure_logs(&this.settings);
+                sandbox.set_theme(theme, cx);
+            });
             this.backups.update(cx, |backups, cx| {
                 backups.set_theme(theme, cx);
             });
@@ -106,6 +117,27 @@ impl Workspace {
         .detach();
         let logs = cx.new(|cx| logs_view::LogsView::new(settings.theme, cx));
         let backups = cx.new(|cx| backups_view::BackupsView::new(runtime, settings.theme, cx));
+        let sandbox = cx.new(|cx| sandboxes_view::SandboxesView::new(&settings, cx));
+        let weak = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            weak.update(cx, |workspace, cx| {
+                if workspace.sandbox.read(cx).may_close() {
+                    true
+                } else {
+                    workspace
+                        .sandbox
+                        .update(cx, |sandbox, cx| sandbox.request_exit(cx));
+                    false
+                }
+            })
+            .unwrap_or(true)
+        });
+        cx.on_app_quit(|workspace, cx| {
+            workspace.sandbox.read(cx).shutdown_fallback();
+            async {}
+        })
+        .detach();
+
         Self {
             active_section: Section::Backups,
             sidebar_open: true,
@@ -114,6 +146,7 @@ impl Workspace {
             settings_model,
             settings_window: None,
             backups,
+            sandbox,
             logs,
             logs_open: false,
             logs_width: 420.,
@@ -212,6 +245,7 @@ impl Workspace {
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.active_section = section;
+                                this.sandbox.update(cx, |sandbox, cx| sandbox.show_processes(section == Section::Processes, cx));
                                 tracing::debug!(target:"app::ui",section=section.label(),"Section opened");
                                 cx.notify();
                             }))
@@ -219,6 +253,7 @@ impl Workspace {
                                 move |this, event: &gpui::KeyDownEvent, _, cx| {
                                     if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                                         this.active_section = section;
+                                this.sandbox.update(cx, |sandbox, cx| sandbox.show_processes(section == Section::Processes, cx));
                                 tracing::debug!(target:"app::ui",section=section.label(),"Section opened");
                                         cx.notify();
                                         cx.stop_propagation();
@@ -277,6 +312,10 @@ impl Render for Workspace {
                 this.toggle_sidebar(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleLogs, _, cx| this.toggle_logs(cx)))
+            .on_action(cx.listener(|this, _: &QuitSandbox, _, cx| {
+                this.sandbox
+                    .update(cx, |sandbox, cx| sandbox.request_exit(cx))
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|_, _: &FocusNext, window, _| window.focus_next()))
             .on_action(cx.listener(|_, _: &FocusPrevious, window, _| window.focus_prev()))
@@ -360,6 +399,9 @@ impl Render for Workspace {
                             )
                             .when(self.active_section == Section::Backups, |content| {
                                 content.child(self.backups.clone())
+                            })
+                            .when(self.active_section != Section::Backups, |content| {
+                                content.child(self.sandbox.clone())
                             }),
                     )
                     .when(self.logs_open, |row| {
@@ -461,6 +503,9 @@ impl Render for Workspace {
 }
 
 fn main() {
+    if sandbox::watchdog_mode() {
+        return;
+    }
     logging::init();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -471,7 +516,17 @@ fn main() {
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             text_input::bind_keys(cx);
+            cx.set_menus(vec![gpui::Menu {
+                name: "Sandbox Prepare".into(),
+                items: vec![
+                    gpui::MenuItem::action("Settings…", OpenSettings),
+                    gpui::MenuItem::separator(),
+                    gpui::MenuItem::action("Quit Sandbox Prepare", QuitSandbox),
+                ],
+            }]);
             cx.bind_keys([
+                KeyBinding::new("cmd-q", QuitSandbox, None),
+                KeyBinding::new("ctrl-q", QuitSandbox, None),
                 KeyBinding::new("cmd-,", OpenSettings, Some("Workspace")),
                 KeyBinding::new("ctrl-,", OpenSettings, Some("Workspace")),
                 KeyBinding::new("cmd-shift-l", ToggleLogs, Some("Workspace")),
@@ -486,20 +541,31 @@ fn main() {
 
             let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
 
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(640.0), px(400.0))),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Sandbox Prepare".into()),
-                        appears_transparent: true,
+            let workspace_window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        window_min_size: Some(size(px(640.0), px(400.0))),
+                        titlebar: Some(TitlebarOptions {
+                            title: Some("Sandbox Prepare".into()),
+                            appears_transparent: true,
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                |window, cx| cx.new(|cx| Workspace::new(window, runtime_handle, cx)),
-            )
-            .expect("Не удалось открыть окно");
+                    },
+                    |window, cx| cx.new(|cx| Workspace::new(window, runtime_handle, cx)),
+                )
+                .expect("Не удалось открыть окно");
+            cx.on_action(move |_: &OpenSettings, cx| {
+                let _ = workspace_window.update(cx, |workspace, _, cx| workspace.open_settings(cx));
+            });
+            cx.on_action(move |_: &QuitSandbox, cx| {
+                let _ = workspace_window.update(cx, |workspace, _, cx| {
+                    workspace
+                        .sandbox
+                        .update(cx, |sandbox, cx| sandbox.request_exit(cx));
+                });
+            });
 
             tracing::info!(target:"app::startup","Application window opened");
             cx.activate(true);
