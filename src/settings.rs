@@ -15,6 +15,7 @@ pub struct Settings {
     pub theme: ThemeMode,
     pub current_log_limit: usize,
     pub logging: LogSettings,
+    pub download_directory: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -23,6 +24,7 @@ impl Default for Settings {
             theme: ThemeMode::default(),
             current_log_limit: 2000,
             logging: LogSettings::default(),
+            download_directory: None,
         }
     }
 }
@@ -37,11 +39,30 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(directory) = &self.download_directory {
+            anyhow::ensure!(
+                directory.is_absolute(),
+                "Download folder must be an absolute path"
+            );
+        }
         anyhow::ensure!(
             self.current_log_limit > 0,
             "Current log records must be greater than zero"
         );
         self.logging.validate()
+    }
+
+    pub fn backup_directory(&self) -> Option<PathBuf> {
+        self.download_directory.clone().or_else(|| {
+            env::var_os(if cfg!(target_os = "windows") {
+                "USERPROFILE"
+            } else {
+                "HOME"
+            })
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .map(|home| home.join("Downloads"))
+        })
     }
 
     pub fn from_json(contents: &str) -> Result<Self> {
@@ -213,11 +234,19 @@ mod tests {
             r#"{"logging":{"check_interval_hours":0}}"#,
             r#"{"logging":{"max_file_mib":4294967295}}"#,
             r#"{"loging":{}}"#,
+            r#"{"download_directory":"relative/backups"}"#,
+            r#"{"download_directory":""}"#,
             "{",
         ] {
             assert!(Settings::from_json(json).is_err(), "{json}");
         }
         assert_eq!(Settings::from_json("{}").unwrap(), Settings::default());
+        assert!(
+            Settings::from_json("{}")
+                .unwrap()
+                .download_directory
+                .is_none()
+        );
     }
     #[test]
     fn preferences_and_policy_survive_reloading() -> Result<()> {
@@ -232,6 +261,7 @@ mod tests {
                 retention_days: 2,
                 check_interval_hours: 12,
             },
+            download_directory: Some(dir.join("Backups with spaces")),
         };
         settings.save_to(&path)?;
         assert_eq!(Settings::load_from(&path)?, settings);

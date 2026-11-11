@@ -19,6 +19,7 @@ const SOURCES: [(&str, &str); 2] = [("ClickHouse", "ch/"), ("MySQL", "mysql/")];
 
 enum DownloadState {
     Idle,
+    Preparing,
     Choosing,
     Running {
         bytes: u64,
@@ -42,13 +43,17 @@ impl BackupRow {
     fn busy(&self) -> bool {
         matches!(
             self.download,
-            DownloadState::Choosing | DownloadState::Running { .. } | DownloadState::Cancelling
+            DownloadState::Preparing
+                | DownloadState::Choosing
+                | DownloadState::Running { .. }
+                | DownloadState::Cancelling
         )
     }
 }
 
 enum Event {
     Listed(usize, Result<Option<Backup>, String>),
+    Prepared(usize, Backup, Result<backups::DownloadDestination, String>),
     Progress(usize, u64),
     Finished(usize, Result<PathBuf, DownloadError>),
 }
@@ -59,11 +64,16 @@ pub struct BackupsView {
     rows: [BackupRow; 2],
     events: mpsc::Sender<Event>,
     theme: ThemeMode,
-    download_directory: PathBuf,
+    download_directory: Option<PathBuf>,
 }
 
 impl BackupsView {
-    pub fn new(runtime: Handle, theme: ThemeMode, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        runtime: Handle,
+        theme: ThemeMode,
+        download_directory: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (events, receiver) = mpsc::channel();
         // Poll only the small, throttled UI event queue. All S3 and disk I/O runs on Tokio.
         cx.spawn(async move |view, cx| {
@@ -76,7 +86,7 @@ impl BackupsView {
                             return;
                         }
                         for event in pending {
-                            view.handle_event(event);
+                            view.handle_event(event, cx);
                         }
                         cx.notify();
                     })
@@ -101,10 +111,7 @@ impl BackupsView {
             }),
             events,
             theme,
-            download_directory: std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join("Downloads"))
-                .unwrap_or_else(std::env::temp_dir),
+            download_directory,
         };
         view.refresh(cx);
         view
@@ -140,8 +147,24 @@ impl BackupsView {
         cx.notify();
     }
 
-    fn handle_event(&mut self, event: Event) {
+    pub fn set_download_directory(&mut self, directory: Option<PathBuf>) {
+        self.download_directory = directory;
+    }
+
+    fn handle_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
+            Event::Prepared(index, backup, result) => match result {
+                Ok(backups::DownloadDestination::Direct(path)) => {
+                    self.start_download(index, backup, path)
+                }
+                Ok(backups::DownloadDestination::ChooseName(path)) => {
+                    self.choose_destination(index, backup, path, cx)
+                }
+                Err(error) => {
+                    tracing::error!(target:"app::download",source=SOURCES[index].0,%error,"Could not prepare download");
+                    self.rows[index].download = DownloadState::Failed(error);
+                }
+            },
             Event::Listed(index, result) => {
                 let row = &mut self.rows[index];
                 row.loading = false;
@@ -209,7 +232,7 @@ impl BackupsView {
         cx.notify();
     }
 
-    fn choose_destination(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn download_latest(&mut self, index: usize, cx: &mut Context<Self>) {
         let row = &mut self.rows[index];
         if row.busy() {
             return;
@@ -217,13 +240,34 @@ impl BackupsView {
         let Some(backup) = row.backup.clone() else {
             return;
         };
-        let name = backup.file_name();
-        if name.is_empty() || matches!(name, "." | "..") || name.contains('\\') {
-            row.download = DownloadState::Failed("The backup has an invalid file name".into());
+        let Some(directory) = self.download_directory.clone() else {
+            row.download =
+                DownloadState::Failed("Choose a download folder in Settings → Backups.".into());
             cx.notify();
             return;
-        }
-        let prompt = cx.prompt_for_new_path(&self.download_directory, Some(name));
+        };
+        row.download = DownloadState::Preparing;
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            let result = backups::prepare_destination(&directory, backup.file_name())
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = events.send(Event::Prepared(index, backup, result));
+        });
+        cx.notify();
+    }
+
+    fn choose_destination(
+        &mut self,
+        index: usize,
+        backup: Backup,
+        suggested: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let directory = suggested.parent().unwrap();
+        let name = suggested.file_name().and_then(|name| name.to_str());
+        let prompt = cx.prompt_for_new_path(directory, name);
+        let row = &mut self.rows[index];
         row.download = DownloadState::Choosing;
         cx.notify();
         cx.spawn(async move |view, cx| {
@@ -253,9 +297,6 @@ impl BackupsView {
             started: Instant::now(),
             cancel,
         };
-        if let Some(parent) = path.parent() {
-            self.download_directory = parent.to_owned();
-        }
         let config = self.config.clone();
         let events = self.events.clone();
         self.runtime.spawn(async move {
@@ -316,7 +357,7 @@ impl BackupsView {
                             palette,
                             !row.busy(),
                             cx,
-                            move |view, _, cx| view.choose_destination(index, cx),
+                            move |view, _, cx| view.download_latest(index, cx),
                         ))
                     }),
             );
@@ -407,6 +448,9 @@ impl BackupsView {
                                 move |view, _, cx| view.cancel(index, cx),
                             )),
                     );
+            }
+            DownloadState::Preparing => {
+                content = content.child(div().text_sm().child("Preparing download…"));
             }
             DownloadState::Choosing => {
                 content = content.child(div().text_sm().child("Choose where to save the backup…"))

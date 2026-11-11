@@ -96,13 +96,17 @@ impl Workspace {
             this.settings = model.read(cx).value.clone();
             let theme = this.settings.theme;
             this.logs.update(cx, |logs, cx| logs.set_theme(theme, cx));
-            this.backups
-                .update(cx, |backups, cx| backups.set_theme(theme, cx));
+            this.backups.update(cx, |backups, cx| {
+                backups.set_download_directory(this.settings.backup_directory());
+                backups.set_theme(theme, cx);
+            });
             cx.notify();
         })
         .detach();
         let logs = cx.new(|cx| logs_view::LogsView::new(settings.theme, cx));
-        let backups = cx.new(|cx| backups_view::BackupsView::new(runtime, settings.theme, cx));
+        let backups = cx.new(|cx| {
+            backups_view::BackupsView::new(runtime, settings.theme, settings.backup_directory(), cx)
+        });
         Self {
             active_section: Section::Backups,
             sidebar_open: true,
