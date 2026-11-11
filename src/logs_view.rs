@@ -51,6 +51,7 @@ pub struct LogsView {
     entries: Vec<Arc<Entry>>,
     list: ListState,
     revision: u64,
+    history_revision: u64,
     history: Vec<Option<Cursor>>,
     next: Option<Cursor>,
     loading: bool,
@@ -79,6 +80,21 @@ impl LogsView {
                 if view
                     .update(cx, |view, cx| {
                         let mut changed = false;
+                        if view.history_revision != view.store.history_revision() {
+                            view.history_revision = view.store.history_revision();
+                            view.request += 1;
+                            view.details = None;
+                            view.entries.clear();
+                            view.list.reset(0);
+                            view.history = vec![None];
+                            view.next = None;
+                            if view.source == Source::History {
+                                view.read_history(None, cx);
+                            } else {
+                                view.refresh_current();
+                            }
+                            changed = true;
+                        }
                         for (request, result) in receiver.try_iter() {
                             if request != view.request {
                                 continue;
@@ -124,6 +140,7 @@ impl LogsView {
             entries: vec![],
             list: ListState::new(0, ListAlignment::Bottom, px(400.)),
             revision: u64::MAX,
+            history_revision: 0,
             history: vec![None],
             next: None,
             loading: false,

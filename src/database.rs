@@ -4,6 +4,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
 pub fn database_path() -> Result<PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(directory) = std::env::var_os("SANDBOX_PREPARE_TEST_DATA_DIR") {
+        return Ok(PathBuf::from(directory).join("application.sqlite3"));
+    }
     let home = std::env::var_os("HOME").context("Home directory is unavailable")?;
     let base = if cfg!(target_os = "macos") {
         PathBuf::from(home).join("Library/Application Support")

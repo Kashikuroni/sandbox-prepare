@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
-    fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Seek, SeekFrom, Write},
+    fs::File,
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -45,6 +45,12 @@ struct State {
 enum WriteEvent {
     Entry(Arc<Entry>),
     Flush(mpsc::Sender<()>),
+    Shutdown,
+    Configure(crate::settings::LogSettings),
+    Maintain {
+        clear: bool,
+        done: mpsc::Sender<crate::log_files::MaintenanceReport>,
+    },
 }
 pub struct LogStore {
     state: Mutex<State>,
@@ -53,6 +59,9 @@ pub struct LogStore {
     directory: Option<PathBuf>,
     sender: mpsc::SyncSender<WriteEvent>,
     disk_error: Arc<Mutex<Option<String>>>,
+    history_revision: Arc<AtomicU64>,
+    maintenance: Arc<Mutex<crate::log_files::MaintenanceReport>>,
+    writer: Option<thread::JoinHandle<()>>,
 }
 static STORE: OnceLock<Arc<LogStore>> = OnceLock::new();
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -64,54 +73,69 @@ fn now() -> std::time::Duration {
         .unwrap_or_default()
 }
 impl LogStore {
+    #[cfg(test)]
     pub fn new(directory: Option<PathBuf>, limit: usize) -> Arc<Self> {
+        Self::with_policy(directory, limit, crate::settings::LogSettings::default())
+    }
+    pub fn with_policy(
+        directory: Option<PathBuf>,
+        limit: usize,
+        policy: crate::settings::LogSettings,
+    ) -> Arc<Self> {
         let session_id = format!("{}-{}", now().as_nanos(), std::process::id());
         let disk_error = Arc::new(Mutex::new(None));
         let (sender, receiver) = mpsc::sync_channel::<WriteEvent>(1024);
         let error = disk_error.clone();
         let dir = directory.clone();
         let session = session_id.clone();
-        thread::Builder::new()
+        let history_revision = Arc::new(AtomicU64::new(0));
+        let history_changed = history_revision.clone();
+        let maintenance = Arc::new(Mutex::new(crate::log_files::MaintenanceReport::default()));
+        let status = maintenance.clone();
+        let writer = thread::Builder::new()
             .name("log-writer".into())
             .spawn(move || {
-                let mut file = None;
-                let mut part = 0;
-                let mut bytes = 0u64;
-                for event in receiver {
+                let mut files = crate::log_files::LogFiles::new(dir, session, policy);
+                *lock(&status) = files.last_report.clone();
+                loop {
+                    if files.due() {
+                        let report = files.maintain(false);
+                        if report.deleted_files > 0 {
+                            history_changed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        *lock(&status) = report;
+                    }
+                    let event = match receiver.recv_timeout(files.wait_time()) {
+                        Ok(event) => event,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     match event {
+                        WriteEvent::Shutdown => {
+                            let _ = files.flush();
+                            break;
+                        }
                         WriteEvent::Entry(entry) => {
                             let result = (|| -> Result<()> {
-                                let dir = dir
-                                    .as_ref()
-                                    .context("Application log directory is unavailable")?;
-                                if file.is_none() || bytes >= 10 * 1024 * 1024 {
-                                    std::fs::create_dir_all(dir)?;
-                                    let path = dir.join(format!("{session}-{part:06}.log"));
-                                    part += 1;
-                                    let mut options = OpenOptions::new();
-                                    options.create_new(true).write(true);
-                                    #[cfg(unix)]
-                                    {
-                                        use std::os::unix::fs::OpenOptionsExt;
-                                        options.mode(0o600);
-                                    }
-                                    file = Some(options.open(path)?);
-                                    bytes = 0;
-                                }
                                 let mut line = serde_json::to_vec(&*entry)?;
                                 line.push(b'\n');
-                                file.as_mut().unwrap().write_all(&line)?;
-                                bytes += line.len() as u64;
-                                Ok(())
+                                files.write(&line)
                             })();
                             if let Err(failure) = result {
                                 *lock(&error) = Some(format!("Log file write failed: {failure}"));
                             }
                         }
+                        WriteEvent::Configure(policy) => files.configure(policy),
+                        WriteEvent::Maintain { clear, done } => {
+                            let report = files.maintain(clear);
+                            if clear || report.deleted_files > 0 {
+                                history_changed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            *lock(&status) = report.clone();
+                            let _ = done.send(report);
+                        }
                         WriteEvent::Flush(done) => {
-                            if let Some(file) = &mut file
-                                && let Err(failure) = file.sync_data()
-                            {
+                            if let Err(failure) = files.flush() {
                                 *lock(&error) = Some(format!("Log file sync failed: {failure}"));
                             }
                             let _ = done.send(());
@@ -133,7 +157,37 @@ impl LogStore {
             directory,
             sender,
             disk_error,
+            history_revision,
+            maintenance,
+            writer: Some(writer),
         })
+    }
+    pub fn configure(&self, policy: crate::settings::LogSettings) -> Result<()> {
+        self.sender
+            .send(WriteEvent::Configure(policy))
+            .context("Log writer stopped")
+    }
+    pub fn history_revision(&self) -> u64 {
+        self.history_revision.load(Ordering::Relaxed)
+    }
+    pub fn maintenance_status(&self) -> crate::log_files::MaintenanceReport {
+        lock(&self.maintenance).clone()
+    }
+    pub fn maintain(&self, clear: bool) -> Result<crate::log_files::MaintenanceReport> {
+        // Holding the sequencing lock also prevents new entries racing a full reset.
+        let mut state = clear.then(|| lock(&self.state));
+        let (done, wait) = mpsc::channel();
+        self.sender
+            .send(WriteEvent::Maintain { clear, done })
+            .context("Log writer stopped")?;
+        let report = wait.recv().context("Log writer stopped")?;
+        if let Some(state) = &mut state {
+            state.entries.clear();
+            state.evicted = 0;
+            self.revision.fetch_add(1, Ordering::Relaxed);
+            *lock(&self.disk_error) = None;
+        }
+        Ok(report)
     }
     pub fn snapshot(&self) -> Vec<Arc<Entry>> {
         lock(&self.state).entries.iter().cloned().collect()
@@ -214,6 +268,14 @@ impl LogStore {
             anyhow::bail!(error);
         }
         Ok(())
+    }
+}
+impl Drop for LogStore {
+    fn drop(&mut self) {
+        let _ = self.sender.send(WriteEvent::Shutdown);
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
     }
 }
 pub fn store() -> Arc<LogStore> {
@@ -300,7 +362,8 @@ pub fn init() {
     let directory = crate::database::database_path()
         .ok()
         .and_then(|p| p.parent().map(|p| p.join("logs")));
-    let logger = LogStore::new(directory, limit);
+    let policy = settings.as_ref().map(|s| s.logging).unwrap_or_default();
+    let logger = LogStore::with_policy(directory, limit, policy);
     let _ = STORE.set(logger.clone());
     tracing_subscriber::registry().with(AppLayer(logger)).init();
     std::panic::set_hook(Box::new(|info| {
@@ -403,6 +466,37 @@ pub fn history_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs::OpenOptions, io::Write};
+
+    #[test]
+    fn clearing_resets_current_and_history_without_reusing_sequence_numbers() -> Result<()> {
+        let directory = directory("clear");
+        let store = LogStore::new(Some(directory.clone()), 2);
+        for _ in 0..3 {
+            store.append("INFO", "ui", "before".into(), BTreeMap::new());
+        }
+        let generation = store.history_revision();
+        let report = store.maintain(true)?;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.deleted_files, 1);
+        assert!(store.snapshot().is_empty());
+        assert_eq!(store.evicted(), 0);
+        assert!(store.history_revision() > generation);
+        assert!(
+            history_page(&directory, None, &Filter::default(), 10)?
+                .entries
+                .is_empty()
+        );
+        store.append("INFO", "ui", "after".into(), BTreeMap::new());
+        store.flush()?;
+        let page = history_page(&directory, None, &Filter::default(), 10)?;
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].message, "after");
+        assert_eq!(page.entries[0].seq, 4);
+        drop(store);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
     fn directory(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "sandbox-logs-{label}-{}-{}",
@@ -519,7 +613,11 @@ mod tests {
         store.append("INFO", "app", "ready".into(), BTreeMap::new());
         store.append("ERROR", "s3", "failed".into(), BTreeMap::new());
         store.flush()?;
-        let path = std::fs::read_dir(&directory)?.next().unwrap()?.path();
+        let path = std::fs::read_dir(&directory)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "log"))
+            .unwrap();
         let mut file = OpenOptions::new().append(true).open(&path)?;
         file.write_all(b"broken\n{\"unfinished\"")?;
         let page = history_page(
