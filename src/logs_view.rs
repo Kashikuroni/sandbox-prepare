@@ -31,6 +31,9 @@ pub struct LogsView {
     request: u64,
     events: mpsc::Sender<(u64, Result<Page, String>)>,
     disk_error: Option<String>,
+    details: Option<Arc<Entry>>,
+    copied: bool,
+    copy_error: Option<String>,
 }
 impl LogsView {
     pub fn new(theme: ThemeMode, cx: &mut Context<Self>) -> Self {
@@ -95,6 +98,9 @@ impl LogsView {
             request: 0,
             events,
             disk_error: None,
+            details: None,
+            copied: false,
+            copy_error: None,
         };
         view.refresh_current();
         view
@@ -190,55 +196,187 @@ impl LogsView {
     }
     fn row(&self, index: usize, palette: Palette, cx: &mut Context<Self>) -> Div {
         let entry = self.entries[index].clone();
-        let copy = entry.clone();
+        let details = entry.clone();
         div()
             .flex()
             .flex_col()
+            .w_full()
             .min_w_0()
             .px_3()
-            .py_3()
+            .py_2()
             .gap_1()
             .border_b_1()
             .border_color(rgb(palette.border))
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
+                    .w_full()
                     .items_center()
                     .gap_2()
                     .child(
                         div()
+                            .min_w_0()
                             .text_xs()
-                            .text_color(rgb(if entry.level == "ERROR" {
-                                palette.error
-                            } else {
-                                palette.text_muted
-                            }))
+                            .text_color(rgb(palette.text_muted))
                             .child(format!(
-                                "{} · {} · {} · #{}",
-                                entry.timestamp, entry.level, entry.category, entry.seq
+                                "{} {}",
+                                entry.level,
+                                display_timestamp(&entry.timestamp)
                             )),
                     )
+                    .child(div().flex_1())
                     .child(button(
-                        ("copy-log", index),
-                        "Copy",
+                        ("log-details", index),
+                        "Details",
                         palette,
                         false,
                         cx,
-                        move |_, _, cx| {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.text()))
+                        move |view, _, cx| {
+                            view.details = Some(details.clone());
+                            view.copied = false;
+                            view.copy_error = None;
+                            cx.notify();
                         },
                     )),
             )
-            .child(div().text_sm().child(entry.message.clone()))
-            .children(entry.fields.iter().map(|(key, value)| {
+            .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(palette.text_muted))
-                    .child(format!("{key}: {value}"))
-            }))
+                    .w_full()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(log_title(&entry.message).to_owned()),
+            )
+    }
+    fn render_details(&self, entry: Arc<Entry>, palette: Palette, cx: &mut Context<Self>) -> Div {
+        let copy = entry.clone();
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .bg(rgb(palette.panel_background))
+            .text_color(rgb(palette.text))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .h(px(44.))
+                    .px_2()
+                    .border_b_1()
+                    .border_color(rgb(palette.border))
+                    .child(button(
+                        "back-to-logs",
+                        "Back",
+                        palette,
+                        false,
+                        cx,
+                        |view, _, cx| {
+                            view.details = None;
+                            cx.notify();
+                        },
+                    ))
+                    .child(div().flex_1())
+                    .child(button(
+                        "copy-log-json",
+                        if self.copied { "Copied" } else { "Copy" },
+                        palette,
+                        false,
+                        cx,
+                        move |view, _, cx| {
+                            match copy.json() {
+                                Ok(json) => {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(json));
+                                    view.copied = true;
+                                    view.copy_error = None;
+                                }
+                                Err(error) => {
+                                    view.copy_error = Some(format!("Could not copy JSON: {error}"))
+                                }
+                            };
+                            cx.notify();
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .id(gpui::SharedString::from(format!(
+                        "log-detail-{}-{}",
+                        entry.session_id, entry.seq
+                    )))
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .p_3()
+                    .gap_4()
+                    .children(self.copy_error.as_ref().map(|error| {
+                        div()
+                            .text_sm()
+                            .text_color(rgb(palette.error))
+                            .child(error.clone())
+                    }))
+                    .child(detail_field("Message", &entry.message, palette))
+                    .child(detail_field("Level", &entry.level, palette))
+                    .child(detail_field(
+                        "Date (local time)",
+                        &display_timestamp(&entry.timestamp),
+                        palette,
+                    ))
+                    .child(detail_field("Timestamp (UTC)", &entry.timestamp, palette))
+                    .child(detail_field("Category", &entry.category, palette))
+                    .child(detail_field("Session", &entry.session_id, palette))
+                    .child(detail_field("Sequence", &entry.seq.to_string(), palette))
+                    .children(
+                        entry
+                            .fields
+                            .iter()
+                            .map(|(key, value)| detail_field(key, value, palette)),
+                    ),
+            )
     }
 }
+fn detail_field(label: &str, value: &str, palette: Palette) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(palette.text_muted))
+                .child(label.to_owned()),
+        )
+        .child(div().text_sm().w_full().child(value.to_owned()))
+}
+fn log_title(message: &str) -> &str {
+    message
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("(empty message)")
+}
+fn display_timestamp(timestamp: &str) -> String {
+    timestamp_in_zone(timestamp, &chrono::Local)
+}
+fn timestamp_in_zone<T: chrono::TimeZone>(timestamp: &str, zone: &T) -> String
+where
+    T::Offset: std::fmt::Display,
+{
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|date| {
+            date.with_timezone(zone)
+                .format("%d.%m.%Y %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|_| timestamp.to_owned())
+}
+
 fn button(
     id: impl Into<gpui::ElementId>,
     label: &str,
@@ -282,6 +420,9 @@ fn button(
 impl Render for LogsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.theme.palette(window.appearance());
+        if let Some(entry) = self.details.clone() {
+            return self.render_details(entry, palette, cx).into_any_element();
+        }
         div()
             .flex()
             .flex_col()
@@ -449,6 +590,7 @@ impl Render for LogsView {
                         view.row(index, palette, cx).into_any_element()
                     }),
                 )
+                .w_full()
                 .flex_1()
                 .min_h_0(),
             )
@@ -490,5 +632,43 @@ impl Render for LogsView {
                         }),
                 )
             })
+            .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn dates_use_the_selected_zone_and_requested_format() {
+        let zone = chrono::FixedOffset::east_opt(3 * 3600).unwrap();
+        assert_eq!(
+            timestamp_in_zone("2026-11-11T06:59:35.123Z", &zone),
+            "11.11.2026 09:59:35"
+        );
+        assert_eq!(
+            timestamp_in_zone("2026-12-31T23:59:59Z", &zone),
+            "01.01.2027 02:59:59"
+        );
+        assert_eq!(timestamp_in_zone("unknown", &zone), "unknown");
+    }
+    #[test]
+    fn details_json_preserves_all_information_and_multiline_messages() -> anyhow::Result<()> {
+        let entry = Entry {
+            session_id: "session-1".into(),
+            seq: 42,
+            timestamp: "2026-11-11T06:59:35Z".into(),
+            level: "ERROR".into(),
+            category: "s3".into(),
+            message: "Connection failed\nFull diagnostic details".into(),
+            fields: std::collections::BTreeMap::from([("reason".into(), "unavailable".into())]),
+        };
+        assert_eq!(log_title(&entry.message), "Connection failed");
+        let copied: Entry = serde_json::from_str(&entry.json()?)?;
+        assert_eq!(copied.message, entry.message);
+        assert_eq!(copied.session_id, entry.session_id);
+        assert_eq!(copied.seq, entry.seq);
+        assert_eq!(copied.fields, entry.fields);
+        Ok(())
     }
 }

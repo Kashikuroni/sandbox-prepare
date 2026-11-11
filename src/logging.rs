@@ -31,15 +31,8 @@ pub struct Entry {
     pub fields: BTreeMap<String, String>,
 }
 impl Entry {
-    pub fn text(&self) -> String {
-        let mut text = format!(
-            "{} {} [{}] {}",
-            self.timestamp, self.level, self.category, self.message
-        );
-        for (key, value) in &self.fields {
-            text.push_str(&format!("\n{key}: {value}"));
-        }
-        text
+    pub fn json(&self) -> Result<String> {
+        Ok(serde_json::to_string_pretty(self)?)
     }
 }
 struct State {

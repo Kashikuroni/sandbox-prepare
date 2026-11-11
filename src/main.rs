@@ -539,31 +539,34 @@ impl Render for Workspace {
                     .when(self.logs_open, |row| {
                         row.child(
                             div()
-                                .id("resize-logs")
-                                .w(px(6.))
-                                .h_full()
-                                .flex_shrink_0()
-                                .cursor(gpui::CursorStyle::ResizeLeftRight)
-                                .border_l_1()
-                                .border_color(rgb(palette.border))
-                                .hover(|el| el.bg(rgb(palette.element_hover)))
-                                .on_mouse_down(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(
-                                        move |this, event: &gpui::MouseDownEvent, _, cx| {
-                                            this.resizing_logs = Some((event.position.x, width));
-                                            cx.stop_propagation();
-                                        },
-                                    ),
-                                ),
-                        )
-                        .child(
-                            div()
+                                .relative()
                                 .w(px(width))
                                 .h_full()
                                 .min_h_0()
                                 .flex_shrink_0()
-                                .child(self.logs.clone()),
+                                .border_l_1()
+                                .border_color(rgb(palette.border))
+                                .child(self.logs.clone())
+                                .child(
+                                    div()
+                                        .id("resize-logs")
+                                        .absolute()
+                                        .left(px(-3.))
+                                        .top_0()
+                                        .bottom_0()
+                                        .w(px(6.))
+                                        .cursor(gpui::CursorStyle::ResizeLeftRight)
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(
+                                                move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                                    this.resizing_logs =
+                                                        Some((event.position.x, width));
+                                                    cx.stop_propagation();
+                                                },
+                                            ),
+                                        ),
+                                ),
                         )
                     }),
             )
