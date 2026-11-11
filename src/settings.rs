@@ -15,7 +15,6 @@ pub struct Settings {
     pub theme: ThemeMode,
     pub current_log_limit: usize,
     pub logging: LogSettings,
-    pub download_directory: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -24,7 +23,6 @@ impl Default for Settings {
             theme: ThemeMode::default(),
             current_log_limit: 2000,
             logging: LogSettings::default(),
-            download_directory: None,
         }
     }
 }
@@ -39,12 +37,6 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if let Some(directory) = &self.download_directory {
-            anyhow::ensure!(
-                directory.is_absolute(),
-                "Download folder must be an absolute path"
-            );
-        }
         anyhow::ensure!(
             self.current_log_limit > 0,
             "Current log records must be greater than zero"
@@ -52,21 +44,13 @@ impl Settings {
         self.logging.validate()
     }
 
-    pub fn backup_directory(&self) -> Option<PathBuf> {
-        self.download_directory.clone().or_else(|| {
-            env::var_os(if cfg!(target_os = "windows") {
-                "USERPROFILE"
-            } else {
-                "HOME"
-            })
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .map(|home| home.join("Downloads"))
-        })
-    }
-
     pub fn from_json(contents: &str) -> Result<Self> {
-        let settings: Self = serde_json::from_str(contents).context("Invalid settings JSON")?;
+        let mut json: serde_json::Value =
+            serde_json::from_str(contents).context("Invalid settings JSON")?;
+        if let Some(object) = json.as_object_mut() {
+            object.remove("download_directory");
+        }
+        let settings: Self = serde_json::from_value(json).context("Invalid settings JSON")?;
         settings.validate()?;
         Ok(settings)
     }
@@ -77,13 +61,27 @@ impl Settings {
 
     fn load_from(path: &Path) -> Result<Self> {
         match fs::read_to_string(path) {
-            Ok(contents) => Self::from_json(&contents),
+            Ok(contents) => {
+                let settings = Self::from_json(&contents)?;
+                if serde_json::from_str::<serde_json::Value>(&contents)?
+                    .get("download_directory")
+                    .is_some()
+                {
+                    settings.save_to(path)?;
+                }
+                Ok(settings)
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 let legacy = path.with_extension("toml");
                 match fs::read_to_string(&legacy) {
                     Ok(contents) => {
-                        let settings: Self =
+                        let mut legacy: toml::Value =
                             toml::from_str(&contents).context("Invalid legacy settings")?;
+                        if let Some(table) = legacy.as_table_mut() {
+                            table.remove("download_directory");
+                        }
+                        let settings: Self =
+                            legacy.try_into().context("Invalid legacy settings")?;
                         settings.validate()?;
                         settings.save_to(path)?;
                         Ok(settings)
@@ -234,19 +232,29 @@ mod tests {
             r#"{"logging":{"check_interval_hours":0}}"#,
             r#"{"logging":{"max_file_mib":4294967295}}"#,
             r#"{"loging":{}}"#,
-            r#"{"download_directory":"relative/backups"}"#,
-            r#"{"download_directory":""}"#,
             "{",
         ] {
             assert!(Settings::from_json(json).is_err(), "{json}");
         }
         assert_eq!(Settings::from_json("{}").unwrap(), Settings::default());
-        assert!(
-            Settings::from_json("{}")
-                .unwrap()
-                .download_directory
-                .is_none()
-        );
+    }
+    #[test]
+    fn retired_download_directory_is_removed_without_resetting_preferences() -> Result<()> {
+        let directory = directory("retired-folder");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"theme":"dark","current_log_limit":37,"logging":{"retention_days":12},"download_directory":"old/folder"}"#,
+        )?;
+        let settings = Settings::load_from(&path)?;
+        assert_eq!(settings.theme, ThemeMode::Dark);
+        assert_eq!(settings.current_log_limit, 37);
+        assert_eq!(settings.logging.retention_days, 12);
+        let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        assert!(json.get("download_directory").is_none());
+        fs::remove_dir_all(directory)?;
+        Ok(())
     }
     #[test]
     fn preferences_and_policy_survive_reloading() -> Result<()> {
@@ -261,7 +269,6 @@ mod tests {
                 retention_days: 2,
                 check_interval_hours: 12,
             },
-            download_directory: Some(dir.join("Backups with spaces")),
         };
         settings.save_to(&path)?;
         assert_eq!(Settings::load_from(&path)?, settings);

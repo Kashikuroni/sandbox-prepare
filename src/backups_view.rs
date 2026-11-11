@@ -1,82 +1,55 @@
-use std::{
-    path::PathBuf,
-    sync::mpsc,
-    time::{Duration, Instant},
-};
-
-use gpui::{
-    Context, Div, InteractiveElement, IntoElement, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Window, div, prelude::*, px, rgb,
-};
-use tokio::{runtime::Handle, sync::watch};
-
 use crate::{
+    backup_cache::{self, Cache, Progress, SOURCES, Snapshot},
     backups::{self, Backup, DownloadError, StorageConfig, format_size},
     theme::{Palette, ThemeMode},
 };
+use gpui::{Context, Div, Render, Window, div, prelude::*, px, rgb};
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
+};
+use tokio::runtime::Handle;
 
-const SOURCES: [(&str, &str); 2] = [("ClickHouse", "ch/"), ("MySQL", "mysql/")];
-
-enum DownloadState {
+enum Transfer {
     Idle,
-    Preparing,
-    Choosing,
     Running {
         bytes: u64,
         speed: u64,
         started: Instant,
-        cancel: watch::Sender<bool>,
     },
-    Cancelling,
-    Cancelled,
-    Complete(PathBuf),
-    Failed(String),
+    Verifying,
+    Verified,
 }
-
-struct BackupRow {
+struct Row {
     loading: bool,
-    backup: Option<Backup>,
+    remote: Option<Backup>,
     error: Option<String>,
-    download: DownloadState,
+    transfer: Transfer,
 }
-
-impl BackupRow {
-    fn busy(&self) -> bool {
-        matches!(
-            self.download,
-            DownloadState::Preparing
-                | DownloadState::Choosing
-                | DownloadState::Running { .. }
-                | DownloadState::Cancelling
-        )
-    }
-}
-
 enum Event {
+    Local(Result<Snapshot, String>),
     Listed(usize, Result<Option<Backup>, String>),
-    Prepared(usize, Backup, Result<PathBuf, String>),
-    Progress(usize, u64),
-    Finished(usize, Result<PathBuf, DownloadError>),
+    Progress(Progress),
+    Finished(Result<Snapshot, DownloadError>),
 }
-
 pub struct BackupsView {
     config: StorageConfig,
     runtime: Handle,
-    rows: [BackupRow; 2],
+    rows: [Row; 2],
     events: mpsc::Sender<Event>,
     theme: ThemeMode,
-    download_directory: Option<PathBuf>,
+    cache: Option<Cache>,
+    local: Snapshot,
+    local_loading: bool,
+    local_error: Option<String>,
+    cancel: Option<backup_cache::UpdateControl>,
+    cancelling: bool,
+    publishing: bool,
+    message: Option<String>,
 }
-
 impl BackupsView {
-    pub fn new(
-        runtime: Handle,
-        theme: ThemeMode,
-        download_directory: Option<PathBuf>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(runtime: Handle, theme: ThemeMode, cx: &mut Context<Self>) -> Self {
         let (events, receiver) = mpsc::channel();
-        // Poll only the small, throttled UI event queue. All S3 and disk I/O runs on Tokio.
         cx.spawn(async move |view, cx| {
             loop {
                 gpui::Timer::after(Duration::from_millis(100)).await;
@@ -87,7 +60,7 @@ impl BackupsView {
                             return;
                         }
                         for event in pending {
-                            view.handle_event(event, cx);
+                            view.handle(event, cx);
                         }
                         cx.notify();
                     })
@@ -98,35 +71,44 @@ impl BackupsView {
             }
         })
         .detach();
+        let cache = Cache::application();
+        let local_error = cache.as_ref().err().map(|error| format!("{error:#}"));
         let mut view = Self {
             config: crate::database::load_storage()
                 .ok()
                 .flatten()
                 .unwrap_or_default(),
             runtime,
-            rows: std::array::from_fn(|_| BackupRow {
-                loading: false,
-                backup: None,
-                error: None,
-                download: DownloadState::Idle,
-            }),
-            events,
             theme,
-            download_directory,
+            events,
+            rows: std::array::from_fn(|_| Row {
+                loading: false,
+                remote: None,
+                error: None,
+                transfer: Transfer::Idle,
+            }),
+            cache: cache.ok(),
+            local: Snapshot::default(),
+            local_loading: false,
+            local_error,
+            cancel: None,
+            cancelling: false,
+            publishing: false,
+            message: None,
         };
-        view.refresh(cx);
+        view.check(cx);
         view
     }
-
+    fn busy(&self) -> bool {
+        self.cancel.is_some() || self.local_loading || self.rows.iter().any(|row| row.loading)
+    }
     pub fn configure(
         &mut self,
         config: StorageConfig,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        if self.rows.iter().any(|row| row.loading || row.busy()) {
-            return Err(
-                "Wait for the current operation to finish before changing the connection.".into(),
-            );
+        if self.busy() {
+            return Err("Wait for the current operation before changing the connection.".into());
         }
         if config.access_key.is_empty()
             || config.secret_key.is_empty()
@@ -139,86 +121,36 @@ impl BackupsView {
         crate::database::save_storage(&config)
             .map_err(|error| format!("Could not save connection: {error}"))?;
         self.config = config;
-        self.refresh(cx);
+        self.check(cx);
         Ok(())
     }
-
     pub fn set_theme(&mut self, theme: ThemeMode, cx: &mut Context<Self>) {
         self.theme = theme;
         cx.notify();
     }
-
-    pub fn set_download_directory(&mut self, directory: Option<PathBuf>) {
-        self.download_directory = directory;
+    fn remote(&self) -> Option<[Backup; 2]> {
+        Some([self.rows[0].remote.clone()?, self.rows[1].remote.clone()?])
     }
-
-    fn handle_event(&mut self, event: Event, cx: &mut Context<Self>) {
-        match event {
-            Event::Prepared(index, backup, result) => match result {
-                Ok(path) => self.choose_destination(index, backup, path, cx),
-                Err(error) => {
-                    tracing::error!(target:"app::download",source=SOURCES[index].0,%error,"Could not prepare download");
-                    self.rows[index].download = DownloadState::Failed(error);
-                }
-            },
-            Event::Listed(index, result) => {
-                let row = &mut self.rows[index];
-                row.loading = false;
-                match result {
-                    Ok(backup) => {
-                        tracing::info!(target:"app::s3",source=SOURCES[index].0,found=backup.is_some(),"Latest backup lookup completed");
-                        row.backup = backup;
-                    }
-                    Err(error) => {
-                        tracing::error!(target:"app::s3",source=SOURCES[index].0,%error,"Backup lookup failed");
-                        row.error = Some(error);
-                    }
-                }
-            }
-            Event::Progress(index, bytes) => {
-                if let DownloadState::Running {
-                    bytes: downloaded,
-                    speed,
-                    started,
-                    ..
-                } = &mut self.rows[index].download
-                {
-                    *downloaded = bytes;
-                    *speed = (bytes as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
-                }
-            }
-            Event::Finished(index, result) => {
-                self.rows[index].download = match result {
-                    Ok(path) => {
-                        tracing::info!(target:"app::download",source=SOURCES[index].0,path=%path.display(),"Backup saved");
-                        DownloadState::Complete(path)
-                    }
-                    Err(DownloadError::Cancelled) => {
-                        tracing::info!(target:"app::download",source=SOURCES[index].0,"Download cancelled");
-                        DownloadState::Cancelled
-                    }
-                    Err(DownloadError::Failed(error)) => {
-                        tracing::error!(target:"app::download",source=SOURCES[index].0,%error,"Download failed");
-                        DownloadState::Failed(error)
-                    }
-                };
-            }
-        }
+    fn current(&self) -> bool {
+        self.remote()
+            .is_some_and(|remote| self.local.current(&self.config, &remote))
     }
-
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.rows.iter().any(|row| row.loading || row.busy()) {
-            return;
-        }
+    fn actionable(&self) -> bool {
+        !self.busy()
+            && self.local_error.is_none()
+            && self.cache.is_some()
+            && self
+                .rows
+                .iter()
+                .all(|row| row.error.is_none() && row.remote.is_some())
+            && !self.current()
+    }
+    fn check_remote(&mut self) {
         for (index, (_, prefix)) in SOURCES.into_iter().enumerate() {
-            self.rows[index] = BackupRow {
-                loading: true,
-                backup: None,
-                error: None,
-                download: DownloadState::Idle,
-            };
-            let events = self.events.clone();
+            self.rows[index].loading = true;
+            self.rows[index].error = None;
             let config = self.config.clone();
+            let events = self.events.clone();
             self.runtime.spawn(async move {
                 let result = async {
                     let client = config.client().await?;
@@ -229,192 +161,244 @@ impl BackupsView {
                 let _ = events.send(Event::Listed(index, result));
             });
         }
-        cx.notify();
     }
-
-    fn download_latest(&mut self, index: usize, cx: &mut Context<Self>) {
-        let row = &mut self.rows[index];
-        if row.busy() {
+    fn check(&mut self, cx: &mut Context<Self>) {
+        if self.busy() {
             return;
         }
-        let Some(backup) = row.backup.clone() else {
-            return;
-        };
-        let Some(directory) = self.download_directory.clone() else {
-            row.download =
-                DownloadState::Failed("Choose a download folder in Settings → Backups.".into());
-            cx.notify();
-            return;
-        };
-        row.download = DownloadState::Preparing;
-        let events = self.events.clone();
-        self.runtime.spawn(async move {
-            let result = backups::prepare_destination(&directory, backup.file_name())
-                .await
-                .map_err(|error| format!("{error:#}"));
-            let _ = events.send(Event::Prepared(index, backup, result));
-        });
-        cx.notify();
-    }
-
-    fn choose_destination(
-        &mut self,
-        index: usize,
-        backup: Backup,
-        suggested: PathBuf,
-        cx: &mut Context<Self>,
-    ) {
-        let directory = suggested.parent().unwrap();
-        let name = suggested.file_name().and_then(|name| name.to_str());
-        let prompt = cx.prompt_for_new_path(directory, name);
-        let row = &mut self.rows[index];
-        row.download = DownloadState::Choosing;
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let result = prompt.await;
-            let _ = view.update(cx, |view, cx| {
-                match result {
-                    Ok(Ok(Some(path))) => view.start_download(index, backup, path),
-                    Ok(Ok(None)) => view.rows[index].download = DownloadState::Idle,
-                    Ok(Err(error)) => {
-                        view.rows[index].download = DownloadState::Failed(format!(
-                            "Could not open the save dialog: {error}"
-                        ))
-                    }
-                    Err(_) => view.rows[index].download = DownloadState::Idle,
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn start_download(&mut self, index: usize, backup: Backup, path: PathBuf) {
-        tracing::info!(target:"app::download",source=SOURCES[index].0,key=%backup.key,bytes=backup.size,"Download started");
-        let (cancel, receiver) = watch::channel(false);
-        self.rows[index].download = DownloadState::Running {
-            bytes: 0,
-            speed: 0,
-            started: Instant::now(),
-            cancel,
-        };
-        let config = self.config.clone();
-        let events = self.events.clone();
-        self.runtime.spawn(async move {
-            let result = match config.client().await {
-                Ok(client) => {
-                    backups::download(&client, &config.bucket, &backup, &path, receiver, |bytes| {
-                        let _ = events.send(Event::Progress(index, bytes));
-                    })
+        self.message = None;
+        if let Some(cache) = self.cache.clone() {
+            self.local_loading = true;
+            let events = self.events.clone();
+            self.runtime.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || cache.load())
                     .await
-                }
-                Err(error) => Err(DownloadError::Failed(format!("{error:#}"))),
-            };
-            let _ = events.send(Event::Finished(index, result));
-        });
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| format!("{error:#}")));
+                let _ = events.send(Event::Local(result));
+            });
+        }
+        self.check_remote();
+        cx.notify();
     }
-
-    fn cancel(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let DownloadState::Running { cancel, .. } = &self.rows[index].download {
-            let _ = cancel.send(true);
-            self.rows[index].download = DownloadState::Cancelling;
-            tracing::debug!(target:"app::download",source=SOURCES[index].0,"Cancellation requested");
+    fn download(&mut self, cx: &mut Context<Self>) {
+        if !self.actionable() {
+            return;
+        }
+        let Some(remote) = self.remote() else {
+            return;
+        };
+        let Some(cache) = self.cache.clone() else {
+            return;
+        };
+        let control = backup_cache::UpdateControl::new();
+        self.cancel = Some(control.clone());
+        self.cancelling = false;
+        self.publishing = false;
+        self.message = None;
+        for row in &mut self.rows {
+            row.transfer = Transfer::Idle;
+        }
+        let events = self.events.clone();
+        let config = self.config.clone();
+        self.runtime.spawn(async move {
+            let result = backup_cache::update(cache, config, remote, control, |progress| {
+                let _ = events.send(Event::Progress(progress));
+            })
+            .await;
+            let _ = events.send(Event::Finished(result));
+        });
+        cx.notify();
+    }
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        if !self.publishing
+            && let Some(cancel) = &self.cancel
+        {
+            if cancel.cancel() {
+                self.cancelling = true;
+            } else {
+                self.publishing = true;
+            }
             cx.notify();
         }
     }
-
-    fn render_row(&self, index: usize, palette: Palette, cx: &mut Context<Self>) -> Div {
-        let (label, prefix) = SOURCES[index];
+    fn handle(&mut self, event: Event, _: &mut Context<Self>) {
+        match event {
+            Event::Local(result) => {
+                self.local_loading = false;
+                match result {
+                    Ok(local) => {
+                        self.local = local;
+                        self.local_error = None;
+                    }
+                    Err(error) => self.local_error = Some(error),
+                }
+            }
+            Event::Listed(index, result) => {
+                let row = &mut self.rows[index];
+                row.loading = false;
+                match result {
+                    Ok(remote) => row.remote = remote,
+                    Err(error) => {
+                        row.remote = None;
+                        row.error = Some(error);
+                    }
+                }
+            }
+            Event::Progress(progress) => match progress {
+                Progress::Started(index) => {
+                    self.rows[index].transfer = Transfer::Running {
+                        bytes: 0,
+                        speed: 0,
+                        started: Instant::now(),
+                    };
+                    tracing::info!(target:"app::download",source=SOURCES[index].0,"Backup download started");
+                }
+                Progress::Bytes(index, bytes) => {
+                    if let Transfer::Running {
+                        bytes: current,
+                        speed,
+                        started,
+                    } = &mut self.rows[index].transfer
+                    {
+                        *current = bytes;
+                        *speed = (bytes as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
+                    }
+                }
+                Progress::Verifying(index) => {
+                    self.rows[index].transfer = Transfer::Verifying;
+                    tracing::info!(target:"app::download",source=SOURCES[index].0,"Verifying backup archive");
+                }
+                Progress::Verified(index) => self.rows[index].transfer = Transfer::Verified,
+                Progress::Publishing => self.publishing = true,
+            },
+            Event::Finished(result) => {
+                self.cancel = None;
+                self.cancelling = false;
+                self.publishing = false;
+                for row in &mut self.rows {
+                    row.transfer = Transfer::Idle;
+                }
+                match result {
+                    Ok(local) => {
+                        self.local = local;
+                        self.message = Some("Both backups downloaded and verified.".into());
+                        tracing::info!(target:"app::download","Verified backup pair activated");
+                        self.check_remote();
+                    }
+                    Err(DownloadError::Cancelled) => {
+                        self.message =
+                            Some("Download cancelled. Current local backups are unchanged.".into());
+                        tracing::info!(target:"app::download","Backup update cancelled");
+                    }
+                    Err(DownloadError::Failed(error)) => {
+                        tracing::error!(target:"app::download",%error,"Backup update failed; previous pair retained");
+                        self.message = Some(format!(
+                            "Update failed: {error}. Current local backups are unchanged."
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    fn row(&self, index: usize, palette: Palette) -> Div {
         let row = &self.rows[index];
         let mut content = div()
             .flex()
             .flex_col()
+            .min_w_0()
             .gap_3()
             .py_5()
             .border_b_1()
             .border_color(rgb(palette.border))
+            .child(SOURCES[index].0)
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div().flex().flex_col().gap_1().child(label).child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(palette.text_muted))
-                                .child(format!("{}/{prefix}", self.config.bucket)),
-                        ),
-                    )
-                    .when(row.backup.is_some() && !row.loading, |header| {
-                        header.child(control(
-                            ("download", index),
-                            if row.busy() {
-                                "Downloading…"
-                            } else {
-                                "Download latest"
-                            },
-                            palette,
-                            !row.busy(),
-                            cx,
-                            move |view, _, cx| view.download_latest(index, cx),
-                        ))
-                    }),
-            );
-        if row.loading {
-            content = content.child(
                 div()
                     .text_sm()
                     .text_color(rgb(palette.text_muted))
-                    .child("Looking for the latest backup…"),
+                    .child(format!("{}/{}", self.config.bucket, SOURCES[index].1)),
             );
-        } else if let Some(error) = &row.error {
+        if row.loading {
+            content = content.child(div().text_sm().child("Checking S3…"));
+        }
+        if let Some(error) = &row.error {
             content = content.child(
                 div()
                     .text_sm()
                     .text_color(rgb(palette.error))
                     .child(error.clone()),
             );
-        } else if let Some(backup) = &row.backup {
+        } else if let Some(remote) = &row.remote {
             content = content
                 .child(
                     div()
-                        .min_w_0()
+                        .text_sm()
                         .overflow_hidden()
                         .text_ellipsis()
-                        .child(backup.file_name().to_owned()),
+                        .child(remote.file_name().to_owned()),
                 )
                 .child(
                     div()
                         .text_sm()
                         .text_color(rgb(palette.text_muted))
                         .child(format!(
-                            "{}  ·  {} UTC",
-                            format_size(backup.size),
-                            backup.modified
+                            "{} · {} UTC",
+                            format_size(remote.size),
+                            remote.modified
                         )),
                 );
+        } else if !row.loading {
+            content = content.child(div().text_sm().child("No backup found in S3."));
+        }
+        if self.local_loading {
+            content = content.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(palette.text_muted))
+                    .child("Checking local copy…"),
+            );
+        } else if self.local.valid[index] {
+            if let Some(pair) = &self.local.pair {
+                let record = &pair.records[index];
+                let status = if row.loading || row.error.is_some() {
+                    "Local copy available; freshness unknown"
+                } else if pair.origin == backup_cache::Origin::new(&self.config)
+                    && row
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| record.matches(remote))
+                {
+                    "Local copy is up to date"
+                } else {
+                    "Update available"
+                };
+                content = content.child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(palette.text_muted))
+                        .child(format!("{status} · {}", record.key)),
+                );
+            }
         } else {
             content = content.child(
                 div()
                     .text_sm()
                     .text_color(rgb(palette.text_muted))
-                    .child("No backup files found in this folder."),
+                    .child("Local copy is missing or failed verification."),
             );
         }
-        match &row.download {
-            DownloadState::Running { bytes, speed, .. } => {
-                let total = row.backup.as_ref().map_or(0, |backup| backup.size);
+        match &row.transfer {
+            Transfer::Running { bytes, speed, .. } => {
+                let total = row.remote.as_ref().map_or(0, |backup| backup.size);
                 let fraction = if total == 0 {
-                    0.0
+                    0.
                 } else {
-                    (*bytes as f64 / total as f64).clamp(0.0, 1.0)
+                    (*bytes as f64 / total as f64).clamp(0., 1.)
                 };
                 content = content
                     .child(
                         div()
-                            .h(px(4.0))
+                            .h(px(4.))
                             .w_full()
                             .bg(rgb(palette.element_background))
                             .child(
@@ -443,76 +427,31 @@ impl BackupsView {
                                     .child("/")
                                     .child(progress_value(100., format_size(total))),
                             )
-                            .child(progress_value(120., format!("{}/s", format_size(*speed))))
-                            .child(div().flex_1())
-                            .child(control(
-                                ("cancel", index),
-                                "Cancel",
-                                palette,
-                                true,
-                                cx,
-                                move |view, _, cx| view.cancel(index, cx),
-                            )),
+                            .child(progress_value(120., format!("{}/s", format_size(*speed)))),
                     );
             }
-            DownloadState::Preparing => {
-                content = content.child(div().text_sm().child("Preparing download…"));
+            Transfer::Verifying => {
+                content = content.child(div().text_sm().child("Verifying archive integrity…"))
             }
-            DownloadState::Choosing => {
-                content = content.child(div().text_sm().child("Choose where to save the backup…"))
-            }
-            DownloadState::Cancelling => {
-                content = content.child(div().text_sm().child("Cancelling download…"))
-            }
-            DownloadState::Cancelled => {
+            Transfer::Verified => {
                 content = content.child(
                     div()
                         .text_sm()
-                        .text_color(rgb(palette.text_muted))
-                        .child("Download cancelled."),
+                        .child("New file verified; waiting for the complete pair."),
                 )
             }
-            DownloadState::Failed(error) => {
-                content = content.child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(palette.error))
-                        .child(error.clone()),
-                )
-            }
-            DownloadState::Complete(path) => {
-                let reveal = path.clone();
-                content = content
-                    .child(
-                        div()
-                            .text_sm()
-                            .child(format!("Saved to {}", path.display())),
-                    )
-                    .child(control(
-                        ("reveal", index),
-                        "Show in folder",
-                        palette,
-                        true,
-                        cx,
-                        move |_, _, cx| cx.reveal_path(&reveal),
-                    ));
-            }
-            DownloadState::Idle => {}
+            Transfer::Idle => {}
         }
         content
     }
 }
-
 impl Drop for BackupsView {
     fn drop(&mut self) {
-        for row in &self.rows {
-            if let DownloadState::Running { cancel, .. } = &row.download {
-                let _ = cancel.send(true);
-            }
+        if let Some(cancel) = &self.cancel {
+            let _ = cancel.cancel();
         }
     }
 }
-
 fn progress_value(width: f32, text: String) -> Div {
     let mut value = div()
         .w(px(width))
@@ -585,56 +524,34 @@ fn control(
 impl Render for BackupsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.theme.palette(window.appearance());
-        let can_refresh = !self.rows.iter().any(|row| row.loading || row.busy());
-        div()
-            .id("backups-content")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .overflow_y_scroll()
-            .p_6()
-            .text_color(rgb(palette.text))
-            .bg(rgb(palette.editor_background))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .pb_2()
-                    .child(div().text_lg().child("Latest backups"))
-                    .child(control(
-                        "refresh-backups",
-                        if self.rows.iter().any(|row| row.loading) {
-                            "Checking…"
-                        } else {
-                            "Refresh"
-                        },
-                        palette,
-                        can_refresh,
-                        cx,
-                        |view, _, cx| view.refresh(cx),
-                    )),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(palette.text_muted))
-                    .child("The newest file in each folder, selected by last modified time."),
-            )
-            .children((0..SOURCES.len()).map(|index| self.render_row(index, palette, cx)))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .pt_4()
-                    .text_sm()
-                    .text_color(rgb(palette.text_muted))
-                    .child("Connection managed in Settings → Storage")
-                    .child(self.config.endpoint.clone()),
-            )
+        let label = if self.cancel.is_some() {
+            if self.publishing {
+                "Finishing…"
+            } else if self.cancelling {
+                "Cancelling…"
+            } else {
+                "Cancel"
+            }
+        } else if self.local.missing() {
+            "Download"
+        } else if self.current() {
+            "Up to date"
+        } else {
+            "Update"
+        };
+        let enabled = if self.cancel.is_some() {
+            !self.publishing && !self.cancelling
+        } else {
+            self.actionable()
+        };
+        div().id("backups-content").flex().flex_col().flex_1().min_h_0().min_w_0().overflow_y_scroll().p_6().text_color(rgb(palette.text)).bg(rgb(palette.editor_background))
+            .child(div().flex().items_center().flex_wrap().gap_2().pb_2().child(div().text_lg().child("Latest backups")).child(div().flex_1())
+                .child(control("check-backups", "Refresh", palette, !self.busy(), cx, |view, _, cx| view.check(cx)))
+                .child(control("download-backups", label, palette, enabled, cx, |view, _, cx| { if view.cancel.is_some() { view.cancel(cx); } else { view.download(cx); } })))
+            .child(div().text_sm().text_color(rgb(palette.text_muted)).child("One local copy per database. Download and update always replace both backups together."))
+            .children(self.message.as_ref().map(|message| div().py_2().text_sm().child(message.clone())))
+            .children(self.local_error.as_ref().map(|error| div().py_2().text_sm().text_color(rgb(palette.error)).child(error.clone())))
+            .children(self.local.warnings.iter().map(|warning| div().text_sm().text_color(rgb(palette.error)).child(warning.clone())))
+            .children((0..2).map(|index| self.row(index, palette)))
     }
 }

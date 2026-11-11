@@ -12,21 +12,14 @@ use std::time::Duration;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
     Appearance,
-    Backups,
     Storage,
     Logging,
 }
 impl Section {
-    const ALL: [Self; 4] = [
-        Self::Appearance,
-        Self::Backups,
-        Self::Storage,
-        Self::Logging,
-    ];
+    const ALL: [Self; 3] = [Self::Appearance, Self::Storage, Self::Logging];
     fn label(self) -> &'static str {
         match self {
             Self::Appearance => "Appearance",
-            Self::Backups => "Backups",
             Self::Storage => "Storage",
             Self::Logging => "Logging",
         }
@@ -59,7 +52,6 @@ pub struct SettingsWindow {
     modal: Option<Confirmation>,
     modal_focus: [FocusHandle; 2],
     busy: bool,
-    choosing_folder: bool,
     log_save_tasks: [Option<gpui::Task<()>>; 4],
     log_errors: [Option<String>; 4],
 }
@@ -154,7 +146,6 @@ impl SettingsWindow {
             modal: None,
             modal_focus: std::array::from_fn(|_| cx.focus_handle()),
             busy: false,
-            choosing_folder: false,
             log_save_tasks: std::array::from_fn(|_| None),
             log_errors: std::array::from_fn(|_| None),
         }
@@ -297,48 +288,6 @@ impl SettingsWindow {
         // Do not replace input values: edits must preserve selection, caret, and focus.
         cx.notify();
     }
-    fn choose_download_folder(&mut self, cx: &mut Context<Self>) {
-        if self.choosing_folder {
-            return;
-        }
-        self.choosing_folder = true;
-        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Choose download folder".into()),
-        });
-        cx.spawn(async move |view, cx| {
-            let result = prompt.await;
-            let _ = view.update(cx, |view, cx| {
-                view.choosing_folder = false;
-                match result {
-                    Ok(Ok(Some(paths))) => {
-                        if let Some(directory) = paths.into_iter().next() {
-                            let mut settings = view.model.read(cx).value.clone();
-                            settings.download_directory = Some(directory);
-                            view.save(settings, cx);
-                        }
-                    }
-                    Ok(Ok(None)) => {}
-                    Ok(Err(error)) => {
-                        view.message =
-                            Some((true, format!("Could not open folder picker: {error:#}")))
-                    }
-                    Err(_) => {
-                        view.message = Some((
-                            true,
-                            "The folder picker closed unexpectedly. Try again.".into(),
-                        ))
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
     fn save_storage(&mut self, cx: &mut Context<Self>) {
         let values: [String; 5] = std::array::from_fn(|index| self.storage[index].read(cx).value());
         let config = StorageConfig {
@@ -462,66 +411,6 @@ impl SettingsWindow {
                         })
                     }),
                 )),
-            );
-        }
-        if self.matches(
-            "Download folder",
-            "Open this folder by default when choosing where to save each backup.",
-            Section::Backups,
-            cx,
-        ) {
-            let directory = self
-                .model
-                .read(cx)
-                .value
-                .backup_directory()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "Choose a folder before downloading.".into());
-            let tooltip = directory.clone();
-            rows.push(
-                setting_row(
-                    "Download folder",
-                    "Open this folder by default when choosing where to save each backup.",
-                    palette,
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .w(px(280.))
-                        .flex_shrink_0()
-                        .child(
-                            div()
-                                .id("download-folder-path")
-                                .text_sm()
-                                .text_color(rgb(palette.text_muted))
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .child(directory)
-                                .tooltip(move |_, cx| {
-                                    cx.new(|_| FolderTooltip(tooltip.clone(), palette)).into()
-                                }),
-                        )
-                        .child(
-                            div().flex().child(
-                                button(
-                                    "choose-download-folder",
-                                    if self.choosing_folder {
-                                        "Choosing…"
-                                    } else {
-                                        "Choose folder…"
-                                    },
-                                    palette,
-                                    cx,
-                                    |view, _, cx| view.choose_download_folder(cx),
-                                )
-                                .border_color(rgb(palette.border))
-                                .bg(rgb(palette.element_background))
-                                .when(self.choosing_folder, |el| el.opacity(0.5)),
-                            ),
-                        ),
-                ),
             );
         }
         let mut storage_visible = false;
@@ -819,22 +708,6 @@ impl Render for SettingsWindow {
             .when(self.modal.is_some(), |el| el.child(self.render_modal(palette, cx)))
     }
 }
-struct FolderTooltip(String, Palette);
-impl Render for FolderTooltip {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .max_w(px(500.))
-            .p_2()
-            .rounded_sm()
-            .text_sm()
-            .bg(rgb(self.1.panel_background))
-            .text_color(rgb(self.1.text))
-            .border_1()
-            .border_color(rgb(self.1.border))
-            .child(self.0.clone())
-    }
-}
-
 fn logging_edit(current: &Settings, index: usize, value: &str) -> anyhow::Result<Settings> {
     let mut settings = current.clone();
     let value = value.trim();

@@ -155,58 +155,6 @@ pub async fn latest_backup(client: &Client, bucket: &str, prefix: &str) -> Resul
     Ok(latest)
 }
 
-/// Suggest a destination for Save As without touching existing files.
-pub async fn prepare_destination(directory: &Path, name: &str) -> Result<PathBuf> {
-    anyhow::ensure!(
-        directory.is_absolute(),
-        "Choose a download folder in Settings → Backups."
-    );
-    anyhow::ensure!(
-        !name.is_empty()
-            && !matches!(name, "." | "..")
-            && !name.contains(['/', '\\'])
-            && Path::new(name).file_name().is_some_and(|file| file == name),
-        "The backup has an invalid file name"
-    );
-    anyhow::ensure!(
-        fs::metadata(directory)
-            .await
-            .context("Download folder is unavailable. Choose a folder in Settings → Backups.")?
-            .is_dir(),
-        "Download folder is not a directory. Choose a folder in Settings → Backups."
-    );
-    let destination = directory.join(name);
-    if !destination_exists(&destination).await? {
-        return Ok(destination);
-    }
-    let name = Path::new(name);
-    let stem = name
-        .file_stem()
-        .context("The backup has an invalid file name")?
-        .to_string_lossy();
-    let extension = name
-        .extension()
-        .map(|ext| format!(".{}", ext.to_string_lossy()))
-        .unwrap_or_default();
-    let mut copy = 1u64;
-    loop {
-        let suggested = directory.join(format!("{stem} ({copy}){extension}"));
-        if !destination_exists(&suggested).await? {
-            return Ok(suggested);
-        }
-        copy = copy
-            .checked_add(1)
-            .context("Too many files with the same name")?;
-    }
-}
-async fn destination_exists(path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(path).await {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).context("Could not inspect the download destination"),
-    }
-}
-
 #[derive(Debug)]
 pub enum DownloadError {
     Cancelled,
@@ -240,7 +188,7 @@ pub async fn download(
     let mut temporary_created = false;
     let transfer = async {
         if fs::try_exists(destination).await? {
-            bail!("The destination already exists. Choose a different file name.");
+            bail!("The download destination already exists.");
         }
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -319,9 +267,7 @@ pub async fn download(
     let published = fs::hard_link(&temporary, destination).await;
     let _ = fs::remove_file(&temporary).await;
     published.map_err(|error| {
-        DownloadError::Failed(format!(
-            "Could not save the backup: {error}. Choose another file name and retry."
-        ))
+        DownloadError::Failed(format!("Could not publish the downloaded backup: {error}."))
     })?;
     Ok(destination.to_owned())
 }
@@ -345,75 +291,6 @@ pub fn format_size(bytes: u64) -> String {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn default_destination_is_direct_and_collisions_suggest_a_free_name() -> Result<()> {
-        let directory =
-            std::env::temp_dir().join(format!("sandbox-destination-{}", std::process::id()));
-        fs::create_dir_all(&directory).await?;
-        let original = directory.join("backup.sql.zst");
-        assert_eq!(
-            prepare_destination(&directory, "backup.sql.zst").await?,
-            original.clone()
-        );
-        fs::write(&original, b"keep original").await?;
-        fs::write(directory.join("backup.sql (1).zst"), b"keep copy").await?;
-        assert_eq!(
-            prepare_destination(&directory, "backup.sql.zst").await?,
-            directory.join("backup.sql (2).zst")
-        );
-        assert_eq!(fs::read(original).await?, b"keep original");
-        fs::remove_dir_all(directory).await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn invalid_names_and_unavailable_download_folders_are_rejected() -> Result<()> {
-        let directory = std::env::temp_dir().join(format!(
-            "sandbox-destination-invalid-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&directory).await?;
-        for name in [
-            "",
-            ".",
-            "..",
-            "../backup.sql",
-            "dir/backup.sql",
-            "dir\\backup.sql",
-        ] {
-            assert!(prepare_destination(&directory, name).await.is_err());
-        }
-        assert!(
-            prepare_destination(&directory.join("missing"), "backup.sql")
-                .await
-                .is_err()
-        );
-        let file = directory.join("file");
-        fs::write(&file, b"not a directory").await?;
-        assert!(prepare_destination(&file, "backup.sql").await.is_err());
-        fs::remove_dir_all(directory).await?;
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn dangling_symlinks_also_require_a_different_destination() -> Result<()> {
-        let directory =
-            std::env::temp_dir().join(format!("sandbox-destination-link-{}", std::process::id()));
-        fs::create_dir_all(&directory).await?;
-        std::os::unix::fs::symlink(directory.join("missing"), directory.join("backup.sql"))?;
-        assert_eq!(
-            prepare_destination(&directory, "backup.sql").await?,
-            directory.join("backup (1).sql")
-        );
-        assert!(
-            fs::symlink_metadata(directory.join("backup.sql"))
-                .await?
-                .is_symlink()
-        );
-        fs::remove_dir_all(directory).await?;
-        Ok(())
-    }
     use std::env;
 
     fn object(key: &str, seconds: i64) -> Object {
