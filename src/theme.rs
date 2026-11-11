@@ -79,7 +79,7 @@ impl Palette {
         element_selected: 0xcfd0d2,
         error: 0xef7271,
         log_debug: 0x656a70,
-        log_info: 0x517255,
+        log_info: 0x6f9283,
         log_warning: 0x92602f,
         log_error: 0xa15353,
     };
