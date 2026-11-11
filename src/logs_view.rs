@@ -279,6 +279,8 @@ impl LogsView {
     fn selector(&self, kind: FilterKind, palette: Palette, cx: &mut Context<Self>) -> Div {
         let bounds = self.selector_bounds[kind.index()].clone();
         let open = self.open_filter == Some(kind);
+        let selected = self.selected_filter(kind);
+        let label = kind.options()[selected];
         div()
             .relative()
             .min_w_0()
@@ -323,7 +325,11 @@ impl LogsView {
                             .min_w_0()
                             .overflow_hidden()
                             .text_ellipsis()
-                            .child(kind.options()[self.selected_filter(kind)]),
+                            .when(kind == FilterKind::Level && selected != 0, |el| {
+                                el.font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(palette.log_level_color(label)))
+                            })
+                            .child(label),
                     )
                     .child(Icon::ChevronDown.render(palette.icon_muted).size(px(12.))),
             )
@@ -426,7 +432,14 @@ impl LogsView {
                     .on_click(cx.listener(move |view, _, window, cx| {
                         view.choose_filter(kind, index, window, cx)
                     }))
-                    .child(*label)
+                    .child(
+                        div()
+                            .when(kind == FilterKind::Level && index != 0, |el| {
+                                el.font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(palette.log_level_color(label)))
+                            })
+                            .child(*label),
+                    )
                     .when(selected, |el| {
                         el.child(Icon::Check.render(palette.icon_accent).size(px(14.)))
                     })
@@ -528,6 +541,7 @@ impl LogsView {
                             .child(
                                 div()
                                     .flex_shrink_0()
+                                    .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(rgb(palette.log_level_color(&entry.level)))
                                     .child(entry.level.clone()),
                             )
