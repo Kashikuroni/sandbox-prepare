@@ -1,6 +1,7 @@
 use crate::{
     backup_cache::{self, Cache, Progress, SOURCES, Snapshot},
     backups::{self, Backup, DownloadError, StorageConfig, format_size},
+    icons::Icon,
     theme::{Palette, ThemeMode},
 };
 use gpui::{Context, Div, Render, Window, div, prelude::*, px, rgb};
@@ -21,6 +22,7 @@ enum Transfer {
     Verified,
 }
 struct Row {
+    expanded: bool,
     loading: bool,
     remote: Option<Backup>,
     error: Option<String>,
@@ -82,6 +84,7 @@ impl BackupsView {
             theme,
             events,
             rows: std::array::from_fn(|_| Row {
+                expanded: false,
                 loading: false,
                 remote: None,
                 error: None,
@@ -301,91 +304,208 @@ impl BackupsView {
             }
         }
     }
-    fn row(&self, index: usize, palette: Palette) -> Div {
+    fn row_status(&self, index: usize) -> &str {
         let row = &self.rows[index];
+        match row.transfer {
+            Transfer::Running { .. } => return "Downloading…",
+            Transfer::Verifying => return "Verifying archive…",
+            Transfer::Verified => return "Verified · waiting for pair",
+            Transfer::Idle => {}
+        }
+        if self.local_loading {
+            "Checking local copy…"
+        } else if row.loading {
+            "Checking S3…"
+        } else if row.error.is_some() {
+            "S3 unavailable · freshness unknown"
+        } else if self.local_error.is_some() {
+            "Local check failed"
+        } else if self.local.pair.is_some() && !self.local.valid[index] {
+            "Local copy failed verification"
+        } else if !self.local.valid[index] {
+            "Not downloaded"
+        } else if row.remote.is_none() {
+            "No backup in S3"
+        } else if self.local.pair.as_ref().is_some_and(|pair| {
+            pair.origin == backup_cache::Origin::new(&self.config)
+                && row
+                    .remote
+                    .as_ref()
+                    .is_some_and(|remote| pair.records[index].matches(remote))
+        }) {
+            "Up to date"
+        } else {
+            "Update available"
+        }
+    }
+
+    fn row(&self, index: usize, palette: Palette, cx: &Context<Self>) -> Div {
+        let row = &self.rows[index];
+        let local = self.local.pair.as_ref().map(|pair| &pair.records[index]);
+        let local_summary = if self.local_loading {
+            "Checking…".into()
+        } else if self.local_error.is_some() {
+            "Unavailable".into()
+        } else if let Some(record) = local.filter(|_| self.local.valid[index]) {
+            compact_metadata(&record.modified, record.size)
+        } else if local.is_some() {
+            "Invalid".into()
+        } else {
+            "Missing".into()
+        };
+        let remote_summary = if row.loading {
+            "Checking…".into()
+        } else if row.error.is_some() {
+            "Unavailable".into()
+        } else if let Some(remote) = &row.remote {
+            compact_metadata(&remote.modified.to_string(), remote.size)
+        } else {
+            "Missing".into()
+        };
+        let status_error = row.error.is_some()
+            || self.local_error.is_some()
+            || (!self.local_loading && local.is_some() && !self.local.valid[index]);
+        let summary = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap_x_3()
+                    .gap_y_1()
+                    .child(SOURCES[index].0)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(if status_error {
+                                palette.error
+                            } else {
+                                palette.text_muted
+                            }))
+                            .child(self.row_status(index).to_owned()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_x_4()
+                    .gap_y_1()
+                    .text_sm()
+                    .text_color(rgb(palette.text_muted))
+                    .child(div().child(format!("Local: {local_summary}")))
+                    .child(div().child(format!("S3: {remote_summary}"))),
+            );
         let mut content = div()
             .flex()
             .flex_col()
             .min_w_0()
-            .gap_3()
-            .py_5()
+            .py_2()
+            .gap_2()
             .border_b_1()
             .border_color(rgb(palette.border))
-            .child(SOURCES[index].0)
             .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(palette.text_muted))
-                    .child(format!("{}/{}", self.config.bucket, SOURCES[index].1)),
+                control(
+                    ("backup-details", index),
+                    "",
+                    palette,
+                    true,
+                    cx,
+                    move |view, _, cx| {
+                        view.rows[index].expanded = !view.rows[index].expanded;
+                        cx.notify();
+                    },
+                )
+                .w_full()
+                .h_auto()
+                .min_w_0()
+                .px_2()
+                .py_2()
+                .gap_2()
+                .justify_start()
+                .bg(gpui::transparent_black())
+                .border_color(gpui::transparent_black())
+                .child(summary)
+                .child(
+                    Icon::ChevronDown
+                        .render(palette.icon_muted)
+                        .with_transformation(gpui::Transformation::rotate(gpui::radians(
+                            if row.expanded {
+                                0.
+                            } else {
+                                -std::f32::consts::FRAC_PI_2
+                            },
+                        ))),
+                ),
             );
-        if row.loading {
-            content = content.child(div().text_sm().child("Checking S3…"));
-        }
         if let Some(error) = &row.error {
             content = content.child(
                 div()
+                    .px_2()
                     .text_sm()
                     .text_color(rgb(palette.error))
                     .child(error.clone()),
             );
-        } else if let Some(remote) = &row.remote {
-            content = content
-                .child(
-                    div()
-                        .text_sm()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .child(remote.file_name().to_owned()),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(palette.text_muted))
-                        .child(format!(
-                            "{} · {} UTC",
-                            format_size(remote.size),
-                            remote.modified
-                        )),
-                );
-        } else if !row.loading {
-            content = content.child(div().text_sm().child("No backup found in S3."));
         }
-        if self.local_loading {
-            content = content.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(palette.text_muted))
-                    .child("Checking local copy…"),
-            );
-        } else if self.local.valid[index] {
-            if let Some(pair) = &self.local.pair {
-                let record = &pair.records[index];
-                let status = if row.loading || row.error.is_some() {
-                    "Local copy available; freshness unknown"
-                } else if pair.origin == backup_cache::Origin::new(&self.config)
-                    && row
-                        .remote
-                        .as_ref()
-                        .is_some_and(|remote| record.matches(remote))
-                {
-                    "Local copy is up to date"
-                } else {
-                    "Update available"
-                };
-                content = content.child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(palette.text_muted))
-                        .child(format!("{status} · {}", record.key)),
-                );
+        if row.expanded {
+            let mut details = div()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .px_2()
+                .pb_1()
+                .gap_1()
+                .text_sm()
+                .text_color(rgb(palette.text_muted))
+                .child(detail(
+                    index,
+                    "Source",
+                    format!(
+                        "{}/{}/{}",
+                        self.config.endpoint.trim_end_matches('/'),
+                        self.config.bucket,
+                        SOURCES[index].1
+                    ),
+                ));
+            if let Some(remote) = &row.remote {
+                details = details
+                    .child(detail(index, "S3 file", remote.file_name().to_owned()))
+                    .child(detail(
+                        index,
+                        "S3 modified",
+                        exact_date(&remote.modified.to_string()),
+                    ));
             }
-        } else {
-            content = content.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(palette.text_muted))
-                    .child("Local copy is missing or failed verification."),
-            );
+            if let Some(record) = local {
+                details = details
+                    .child(detail(index, "Local source file", record.key.clone()))
+                    .child(detail(
+                        index,
+                        "Local modified",
+                        exact_date(&record.modified),
+                    ));
+                if let Some(pair) = &self.local.pair
+                    && let Ok(database) = crate::database::database_path()
+                    && let Some(parent) = database.parent()
+                {
+                    details = details.child(detail(
+                        index,
+                        "Local path",
+                        parent
+                            .join("backups")
+                            .join(&pair.generation)
+                            .join(backup_cache::FILES[index])
+                            .display()
+                            .to_string(),
+                    ));
+                }
+            }
+            content = content.child(details);
         }
         match &row.transfer {
             Transfer::Running { bytes, speed, .. } => {
@@ -398,7 +518,7 @@ impl BackupsView {
                 content = content
                     .child(
                         div()
-                            .h(px(4.))
+                            .h(px(2.))
                             .w_full()
                             .bg(rgb(palette.element_background))
                             .child(
@@ -416,30 +536,22 @@ impl BackupsView {
                             .gap_2()
                             .text_sm()
                             .text_color(rgb(palette.text_muted))
-                            .child(progress_value(48., format!("{:.0}%", fraction * 100.)))
+                            .child(progress_value(44., format!("{:.0}%", fraction * 100.)))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
                                     .gap_1()
                                     .flex_shrink_0()
-                                    .child(progress_value(100., format_size(*bytes)))
+                                    .child(progress_value(80., format_size(*bytes)))
                                     .child("/")
-                                    .child(progress_value(100., format_size(total))),
+                                    .child(progress_value(80., format_size(total))),
                             )
-                            .child(progress_value(120., format!("{}/s", format_size(*speed)))),
+                            .child(progress_value(104., format!("{}/s", format_size(*speed)))),
                     );
             }
-            Transfer::Verifying => {
-                content = content.child(div().text_sm().child("Verifying archive integrity…"))
-            }
-            Transfer::Verified => {
-                content = content.child(
-                    div()
-                        .text_sm()
-                        .child("New file verified; waiting for the complete pair."),
-                )
-            }
+            Transfer::Verifying => {}
+            Transfer::Verified => {}
             Transfer::Idle => {}
         }
         content
@@ -486,7 +598,7 @@ fn control(
         .items_center()
         .justify_center()
         .px_3()
-        .h(px(32.0))
+        .h(px(28.0))
         .flex_shrink_0()
         .rounded_sm()
         .border_1()
@@ -544,14 +656,126 @@ impl Render for BackupsView {
         } else {
             self.actionable()
         };
-        div().id("backups-content").flex().flex_col().flex_1().min_h_0().min_w_0().overflow_y_scroll().p_6().text_color(rgb(palette.text)).bg(rgb(palette.editor_background))
-            .child(div().flex().items_center().flex_wrap().gap_2().pb_2().child(div().text_lg().child("Latest backups")).child(div().flex_1())
-                .child(control("check-backups", "Refresh", palette, !self.busy(), cx, |view, _, cx| view.check(cx)))
-                .child(control("download-backups", label, palette, enabled, cx, |view, _, cx| { if view.cancel.is_some() { view.cancel(cx); } else { view.download(cx); } })))
-            .child(div().text_sm().text_color(rgb(palette.text_muted)).child("One local copy per database. Download and update always replace both backups together."))
-            .children(self.message.as_ref().map(|message| div().py_2().text_sm().child(message.clone())))
-            .children(self.local_error.as_ref().map(|error| div().py_2().text_sm().text_color(rgb(palette.error)).child(error.clone())))
-            .children(self.local.warnings.iter().map(|warning| div().text_sm().text_color(rgb(palette.error)).child(warning.clone())))
-            .children((0..2).map(|index| self.row(index, palette)))
+        div()
+            .id("backups-content")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_y_scroll()
+            .p_4()
+            .text_color(rgb(palette.text))
+            .bg(rgb(palette.editor_background))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap_2()
+                    .pb_2()
+                    .child(div().text_lg().child("Backups"))
+                    .child(div().flex_1())
+                    .child(
+                        control(
+                            "check-backups",
+                            "",
+                            palette,
+                            !self.busy(),
+                            cx,
+                            |view, _, cx| view.check(cx),
+                        )
+                        .w(px(28.))
+                        .h(px(28.))
+                        .p_0()
+                        .bg(gpui::transparent_black())
+                        .border_color(gpui::transparent_black())
+                        .child(Icon::Refresh.render(if self.busy() {
+                            palette.icon_muted
+                        } else {
+                            palette.icon
+                        }))
+                        .tooltip(move |_, cx| cx.new(|_| RefreshTooltip(palette)).into()),
+                    )
+                    .child(control(
+                        "download-backups",
+                        label,
+                        palette,
+                        enabled,
+                        cx,
+                        |view, _, cx| {
+                            if view.cancel.is_some() {
+                                view.cancel(cx);
+                            } else {
+                                view.download(cx);
+                            }
+                        },
+                    )),
+            )
+            .children(
+                self.message
+                    .as_ref()
+                    .map(|message| div().py_2().text_sm().child(message.clone())),
+            )
+            .children(self.local_error.as_ref().map(|error| {
+                div()
+                    .py_2()
+                    .text_sm()
+                    .text_color(rgb(palette.error))
+                    .child(error.clone())
+            }))
+            .children(self.local.warnings.iter().map(|warning| {
+                div()
+                    .text_sm()
+                    .text_color(rgb(palette.error))
+                    .child(warning.clone())
+            }))
+            .children((0..2).map(|index| self.row(index, palette, cx)))
+    }
+}
+
+fn compact_metadata(timestamp: &str, size: u64) -> String {
+    let date = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|date| {
+            date.with_timezone(&chrono::Local)
+                .format("%d.%m.%Y")
+                .to_string()
+        })
+        .unwrap_or_else(|_| "Unknown date".into());
+    format!("{date} · {}", format_size(size))
+}
+
+fn exact_date(timestamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|date| {
+            date.with_timezone(&chrono::Local)
+                .format("%d.%m.%Y %H:%M:%S %:z")
+                .to_string()
+        })
+        .unwrap_or_else(|_| timestamp.into())
+}
+
+fn detail(index: usize, label: &'static str, value: String) -> gpui::Stateful<Div> {
+    // Keep long object keys and paths available without widening the page.
+    div()
+        .id((label, index))
+        .w_full()
+        .min_w_0()
+        .overflow_x_scroll()
+        .whitespace_nowrap()
+        .child(format!("{label}: {value}"))
+}
+
+struct RefreshTooltip(Palette);
+impl Render for RefreshTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .text_xs()
+            .rounded_sm()
+            .bg(rgb(self.0.panel_background))
+            .text_color(rgb(self.0.text))
+            .child("Check for backup updates")
     }
 }
