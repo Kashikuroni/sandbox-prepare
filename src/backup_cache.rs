@@ -36,6 +36,29 @@ pub struct Record {
     pub modified: String,
     pub etag: Option<String>,
     pub sha256: String,
+    #[serde(default)]
+    pub local_modified: Option<FileTime>,
+    #[serde(default)]
+    pub verification_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileTime {
+    seconds: u64,
+    nanos: u32,
+}
+fn file_time(path: &Path, expected_size: u64) -> Result<FileTime> {
+    let metadata = fs::symlink_metadata(path).context("Local file is missing")?;
+    ensure!(
+        metadata.file_type().is_file(),
+        "Local copy is not a regular file"
+    );
+    ensure!(metadata.len() == expected_size, "Local file size changed");
+    let modified = metadata.modified()?.duration_since(UNIX_EPOCH)?;
+    Ok(FileTime {
+        seconds: modified.as_secs(),
+        nanos: modified.subsec_nanos(),
+    })
 }
 impl Record {
     pub fn matches(&self, remote: &Backup) -> bool {
@@ -129,21 +152,33 @@ impl Cache {
         }
         Ok(pair)
     }
+    fn store_pair(&self, pair: &Pair) -> Result<()> {
+        self.connection()?.execute("INSERT INTO backup_pair(id,manifest) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET manifest=excluded.manifest", params![serde_json::to_string(pair)?])?;
+        Ok(())
+    }
     pub fn load(&self) -> Result<Snapshot> {
         let _lock = self.lock()?;
-        let pair = self.read_pair()?;
-        let (_, cancel) = watch::channel(false);
+        let mut pair = self.read_pair()?;
         let mut valid = [false; 2];
-        if let Some(pair) = &pair {
+        let mut migrated = false;
+        if let Some(pair) = &mut pair {
             let directory = self.root.join(&pair.generation);
             if fs::symlink_metadata(&directory).is_ok_and(|m| m.file_type().is_dir()) {
-                for (index, record) in pair.records.iter().enumerate() {
-                    let path = directory.join(FILES[index]);
-                    valid[index] = fs::symlink_metadata(&path)
-                        .is_ok_and(|m| m.file_type().is_file() && m.len() == record.size)
-                        && archive_check::digest(&path, &cancel)
-                            .is_ok_and(|digest| digest == record.sha256);
+                for (index, record) in pair.records.iter_mut().enumerate() {
+                    if let Ok(modified) = file_time(&directory.join(FILES[index]), record.size) {
+                        // Older manifests already hold a digest from the original full check.
+                        // Record a stat baseline once, without rereading gigabytes on upgrade.
+                        if record.local_modified.is_none() && record.verification_error.is_none() {
+                            record.local_modified = Some(modified.clone());
+                            migrated = true;
+                        }
+                        valid[index] = record.local_modified.as_ref() == Some(&modified)
+                            && record.verification_error.is_none();
+                    }
                 }
+            }
+            if migrated {
+                self.store_pair(pair)?;
             }
         }
         let warnings = self.cleanup(pair.as_ref().map(|pair| pair.generation.as_str()));
@@ -221,7 +256,7 @@ impl Pending {
         fs::rename(&self.directory, &ready)?;
         self.directory = ready;
         sync_directory(&self.cache.root)?;
-        self.cache.connection()?.execute("INSERT INTO backup_pair(id,manifest) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET manifest=excluded.manifest", params![serde_json::to_string(&pair)?])?;
+        self.cache.store_pair(&pair)?;
         self.published = true;
         let warnings = self.cache.cleanup(Some(&pair.generation));
         Ok(Snapshot {
@@ -310,6 +345,8 @@ pub enum Progress {
     Started(usize),
     Bytes(usize, u64),
     Verifying(usize),
+    VerificationBytes(usize, u64, u64),
+    VerificationFailed(usize),
     Verified(usize),
     Publishing,
 }
@@ -344,16 +381,38 @@ pub async fn update(
             })?;
             progress(Progress::Verifying(index));
             let check_cancel = cancel.clone();
-            let digest = tokio::task::spawn_blocking(move || {
-                archive_check::verify(&path, index, &check_cancel)
-            })
-            .await??;
+            let size = backup.size;
+            let (verification_events, mut verification_receiver) =
+                tokio::sync::mpsc::unbounded_channel();
+            // Forward throttled verification updates while the blocking worker runs.
+            let verification =
+                tokio::task::spawn_blocking(move || -> Result<(String, FileTime)> {
+                    let before = file_time(&path, size)?;
+                    let digest = archive_check::verify_with_progress(
+                        &path,
+                        index,
+                        &check_cancel,
+                        |bytes| {
+                            let _ = verification_events
+                                .send(Progress::VerificationBytes(index, bytes, size));
+                        },
+                    )?;
+                    let after = file_time(&path, size)?;
+                    ensure!(before == after, "File changed during verification");
+                    Ok((digest, after))
+                });
+            while let Some(event) = verification_receiver.recv().await {
+                progress(event);
+            }
+            let (digest, local_modified) = verification.await??;
             records.push(Record {
                 key: backup.key.clone(),
                 size: backup.size,
                 modified: backup.modified.to_string(),
                 etag: backup.etag.clone(),
                 sha256: digest,
+                local_modified: Some(local_modified),
+                verification_error: None,
             });
             progress(Progress::Verified(index));
         }
@@ -371,6 +430,71 @@ pub async fn update(
     }
     .await;
     result.map_err(|error: anyhow::Error| {
+        if control.cancelled() {
+            DownloadError::Cancelled
+        } else {
+            DownloadError::Failed(format!("{error:#}"))
+        }
+    })
+}
+
+// Read-only archive checks; only verification metadata is updated after completion.
+pub fn verify_local(
+    cache: Cache,
+    control: UpdateControl,
+    mut progress: impl FnMut(Progress),
+) -> std::result::Result<Snapshot, DownloadError> {
+    let cancel = control.sender.subscribe();
+    let result = (|| -> Result<Snapshot> {
+        let _lock = cache.lock()?;
+        let mut pair = cache.read_pair()?.context("No local backups to verify")?;
+        let directory = cache.root.join(&pair.generation);
+        ensure!(
+            fs::symlink_metadata(&directory)?.file_type().is_dir(),
+            "Local backup directory is missing or invalid"
+        );
+        let mut valid = [false; 2];
+        for (index, record) in pair.records.iter_mut().enumerate() {
+            ensure!(!*cancel.borrow(), "Verification cancelled");
+            progress(Progress::Verifying(index));
+            let path = directory.join(FILES[index]);
+            let check = (|| -> Result<FileTime> {
+                let before = file_time(&path, record.size)?;
+                let digest = archive_check::verify_with_progress(&path, index, &cancel, |bytes| {
+                    progress(Progress::VerificationBytes(index, bytes, record.size));
+                })?;
+                ensure!(
+                    digest == record.sha256,
+                    "SHA-256 differs from the downloaded backup"
+                );
+                let after = file_time(&path, record.size)?;
+                ensure!(before == after, "File changed during verification");
+                Ok(after)
+            })();
+            ensure!(!*cancel.borrow(), "Verification cancelled");
+            match check {
+                Ok(modified) => {
+                    valid[index] = true;
+                    record.local_modified = Some(modified);
+                    record.verification_error = None;
+                    progress(Progress::Verified(index));
+                }
+                Err(error) => {
+                    record.verification_error = Some(format!("{error:#}"));
+                    progress(Progress::VerificationFailed(index));
+                }
+            }
+        }
+        control.begin_publish()?;
+        progress(Progress::Publishing);
+        cache.store_pair(&pair)?;
+        Ok(Snapshot {
+            pair: Some(pair),
+            valid,
+            warnings: Vec::new(),
+        })
+    })();
+    result.map_err(|error| {
         if control.cancelled() {
             DownloadError::Cancelled
         } else {
@@ -412,6 +536,8 @@ mod tests {
                 modified: "2026-01-01T00:00:00Z".into(),
                 etag: Some("old".into()),
                 sha256: archive_check::verify(&path, index, &cancel)?,
+                local_modified: Some(file_time(&path, bytes.len() as u64)?),
+                verification_error: None,
             });
         }
         let pair = Pair {
@@ -443,6 +569,108 @@ mod tests {
         assert!(snapshot.valid[0]);
         assert!(!snapshot.valid[1]);
         assert!(snapshot.missing());
+        fs::remove_dir_all(cache.database.parent().unwrap())?;
+        Ok(())
+    }
+
+    #[test]
+    fn quick_check_uses_metadata_and_explicit_verification_persists_corruption() -> Result<()> {
+        let cache = cache("quick-check");
+        let pair = install(&cache, &StorageConfig::default())?.pair.unwrap();
+        let path = cache.root.join(&pair.generation).join(FILES[0]);
+        let modified = fs::metadata(&path)?.modified()?;
+        let mut bytes = fs::read(&path)?;
+        bytes[0] ^= 1;
+        fs::write(&path, bytes)?;
+        // Same size and mtime intentionally evade stat checks: load must not hash.
+        File::open(&path)?.set_times(fs::FileTimes::new().set_modified(modified))?;
+        assert!(!cache.load()?.missing());
+        let mut checked = Vec::new();
+        let snapshot = verify_local(cache.clone(), UpdateControl::new(), |event| {
+            if let Progress::Verifying(index) = event {
+                checked.push(index);
+            }
+        })
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        assert_eq!(checked, vec![0, 1]);
+        assert_eq!(snapshot.valid, [false, true]);
+        assert!(
+            snapshot.pair.unwrap().records[0]
+                .verification_error
+                .is_some()
+        );
+        assert_eq!(cache.load()?.valid, [false, true]);
+        assert!(path.exists()); // Verification never removes local files.
+        fs::remove_dir_all(cache.database.parent().unwrap())?;
+        Ok(())
+    }
+
+    #[test]
+    fn changed_mtime_requires_verification_and_success_refreshes_the_baseline() -> Result<()> {
+        let cache = cache("mtime");
+        let pair = install(&cache, &StorageConfig::default())?.pair.unwrap();
+        let path = cache.root.join(&pair.generation).join(FILES[1]);
+        let modified = fs::metadata(&path)?.modified()? + std::time::Duration::from_secs(2);
+        File::open(&path)?.set_times(fs::FileTimes::new().set_modified(modified))?;
+        assert_eq!(cache.load()?.valid, [true, false]);
+        let mut progress = [0; 2];
+        let snapshot = verify_local(cache.clone(), UpdateControl::new(), |event| {
+            if let Progress::VerificationBytes(index, bytes, total) = event {
+                assert!(bytes <= total);
+                assert!(bytes >= progress[index]);
+                progress[index] = bytes;
+            }
+        })
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        assert!(!snapshot.missing());
+        assert_eq!(progress, pair.records.map(|record| record.size));
+        assert!(!cache.load()?.missing());
+        fs::remove_dir_all(cache.database.parent().unwrap())?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_manifest_gains_a_metadata_baseline_without_losing_source_identity() -> Result<()> {
+        let cache = cache("legacy-metadata");
+        let pair = install(&cache, &StorageConfig::default())?.pair.unwrap();
+        let mut legacy = serde_json::to_value(&pair)?;
+        for record in legacy["records"].as_array_mut().unwrap() {
+            record.as_object_mut().unwrap().remove("local_modified");
+            record.as_object_mut().unwrap().remove("verification_error");
+        }
+        cache.connection()?.execute(
+            "UPDATE backup_pair SET manifest=?1",
+            params![legacy.to_string()],
+        )?;
+        let snapshot = cache.load()?;
+        assert!(!snapshot.missing());
+        let migrated = cache.read_pair()?.unwrap();
+        assert_eq!(migrated.generation, pair.generation);
+        for (index, record) in migrated.records.iter().enumerate() {
+            assert!(record.local_modified.is_some());
+            assert_eq!(record.sha256, pair.records[index].sha256);
+            assert_eq!(record.key, pair.records[index].key);
+        }
+        fs::remove_dir_all(cache.database.parent().unwrap())?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_manual_verification_preserves_manifest_and_files() -> Result<()> {
+        let cache = cache("verify-cancel");
+        let pair = install(&cache, &StorageConfig::default())?.pair.unwrap();
+        let before = serde_json::to_value(&cache.read_pair()?)?;
+        let control = UpdateControl::new();
+        let action = control.clone();
+        let result = verify_local(cache.clone(), control, |event| {
+            if matches!(event, Progress::Verified(0)) {
+                assert!(action.cancel());
+            }
+        });
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+        assert_eq!(serde_json::to_value(cache.read_pair()?)?, before);
+        assert!(!cache.load()?.missing());
+        assert!(cache.root.join(pair.generation).join(FILES[0]).exists());
         fs::remove_dir_all(cache.database.parent().unwrap())?;
         Ok(())
     }

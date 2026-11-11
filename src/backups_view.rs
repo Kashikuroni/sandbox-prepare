@@ -18,7 +18,11 @@ enum Transfer {
         speed: u64,
         started: Instant,
     },
-    Verifying,
+    Verifying {
+        bytes: u64,
+        total: u64,
+    },
+    VerificationFailed,
     Verified,
 }
 struct Row {
@@ -33,6 +37,7 @@ enum Event {
     Listed(usize, Result<Option<Backup>, String>),
     Progress(Progress),
     Finished(Result<Snapshot, DownloadError>),
+    IntegrityFinished(Result<Snapshot, DownloadError>),
 }
 pub struct BackupsView {
     config: StorageConfig,
@@ -45,6 +50,7 @@ pub struct BackupsView {
     local_loading: bool,
     local_error: Option<String>,
     cancel: Option<backup_cache::UpdateControl>,
+    integrity_check: bool,
     cancelling: bool,
     publishing: bool,
     message: Option<String>,
@@ -95,6 +101,7 @@ impl BackupsView {
             local_loading: false,
             local_error,
             cancel: None,
+            integrity_check: false,
             cancelling: false,
             publishing: false,
             message: None,
@@ -213,6 +220,31 @@ impl BackupsView {
         });
         cx.notify();
     }
+    fn verify_integrity(&mut self, cx: &mut Context<Self>) {
+        if self.busy() || self.local.pair.is_none() {
+            return;
+        }
+        let Some(cache) = self.cache.clone() else {
+            return;
+        };
+        let control = backup_cache::UpdateControl::new();
+        self.cancel = Some(control.clone());
+        self.integrity_check = true;
+        self.cancelling = false;
+        self.publishing = false;
+        self.message = None;
+        for row in &mut self.rows {
+            row.transfer = Transfer::Idle;
+        }
+        let events = self.events.clone();
+        self.runtime.spawn_blocking(move || {
+            let result = backup_cache::verify_local(cache, control, |progress| {
+                let _ = events.send(Event::Progress(progress));
+            });
+            let _ = events.send(Event::IntegrityFinished(result));
+        });
+        cx.notify();
+    }
     fn cancel(&mut self, cx: &mut Context<Self>) {
         if !self.publishing
             && let Some(cancel) = &self.cancel
@@ -269,12 +301,67 @@ impl BackupsView {
                     }
                 }
                 Progress::Verifying(index) => {
-                    self.rows[index].transfer = Transfer::Verifying;
+                    let total = if self.integrity_check {
+                        self.local
+                            .pair
+                            .as_ref()
+                            .map_or(0, |pair| pair.records[index].size)
+                    } else {
+                        self.rows[index]
+                            .remote
+                            .as_ref()
+                            .map_or(0, |remote| remote.size)
+                    };
+                    self.rows[index].transfer = Transfer::Verifying { bytes: 0, total };
                     tracing::info!(target:"app::download",source=SOURCES[index].0,"Verifying backup archive");
+                }
+                Progress::VerificationBytes(index, bytes, total) => {
+                    self.rows[index].transfer = Transfer::Verifying { bytes, total };
+                }
+                Progress::VerificationFailed(index) => {
+                    self.rows[index].transfer = Transfer::VerificationFailed
                 }
                 Progress::Verified(index) => self.rows[index].transfer = Transfer::Verified,
                 Progress::Publishing => self.publishing = true,
             },
+            Event::IntegrityFinished(result) => {
+                self.cancel = None;
+                self.integrity_check = false;
+                self.cancelling = false;
+                self.publishing = false;
+                for row in &mut self.rows {
+                    row.transfer = Transfer::Idle;
+                }
+                match result {
+                    Ok(local) => {
+                        let valid = !local.missing();
+                        self.local = local;
+                        self.local_error = None;
+                        self.message = Some(
+                            if valid {
+                                "Both local backups passed integrity verification."
+                            } else {
+                                "Integrity verification failed. Download the backups again."
+                            }
+                            .into(),
+                        );
+                        if valid {
+                            tracing::info!(target:"app::download", "Local backup integrity verified");
+                        } else {
+                            tracing::error!(target:"app::download", "Local backup integrity verification failed");
+                        }
+                    }
+                    Err(DownloadError::Cancelled) => {
+                        self.message =
+                            Some("Verification cancelled. Local files are unchanged.".into());
+                        tracing::info!(target:"app::download", "Local verification cancelled");
+                    }
+                    Err(DownloadError::Failed(error)) => {
+                        self.local_error = Some(format!("Could not verify local backups: {error}"));
+                        tracing::error!(target:"app::download", %error, "Could not verify local backups");
+                    }
+                }
+            }
             Event::Finished(result) => {
                 self.cancel = None;
                 self.cancelling = false;
@@ -308,8 +395,15 @@ impl BackupsView {
         let row = &self.rows[index];
         match row.transfer {
             Transfer::Running { .. } => return "Downloading…",
-            Transfer::Verifying => return "Verifying archive…",
-            Transfer::Verified => return "Verified · waiting for pair",
+            Transfer::Verifying { .. } => return "Verifying archive…",
+            Transfer::VerificationFailed => return "Verification failed",
+            Transfer::Verified => {
+                return if self.integrity_check {
+                    "Verified"
+                } else {
+                    "Verified · waiting for pair"
+                };
+            }
             Transfer::Idle => {}
         }
         if self.local_loading {
@@ -321,7 +415,7 @@ impl BackupsView {
         } else if self.local_error.is_some() {
             "Local check failed"
         } else if self.local.pair.is_some() && !self.local.valid[index] {
-            "Local copy failed verification"
+            "Local file changed · verify or download"
         } else if !self.local.valid[index] {
             "Not downloaded"
         } else if row.remote.is_none() {
@@ -362,7 +456,8 @@ impl BackupsView {
         } else {
             "Missing".into()
         };
-        let status_error = row.error.is_some()
+        let status_error = matches!(row.transfer, Transfer::VerificationFailed)
+            || row.error.is_some()
             || self.local_error.is_some()
             || (!self.local_loading && local.is_some() && !self.local.valid[index]);
         let summary = div()
@@ -452,6 +547,15 @@ impl BackupsView {
                     .child(error.clone()),
             );
         }
+        if let Some(error) = local.and_then(|record| record.verification_error.as_ref()) {
+            content = content.child(
+                div()
+                    .px_2()
+                    .text_sm()
+                    .text_color(rgb(palette.error))
+                    .child(format!("Local verification: {error}")),
+            );
+        }
         if row.expanded {
             let mut details = div()
                 .flex()
@@ -507,52 +611,59 @@ impl BackupsView {
             }
             content = content.child(details);
         }
-        match &row.transfer {
-            Transfer::Running { bytes, speed, .. } => {
-                let total = row.remote.as_ref().map_or(0, |backup| backup.size);
-                let fraction = if total == 0 {
-                    0.
-                } else {
-                    (*bytes as f64 / total as f64).clamp(0., 1.)
-                };
-                content = content
-                    .child(
-                        div()
-                            .h(px(2.))
-                            .w_full()
-                            .bg(rgb(palette.element_background))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(gpui::relative(fraction as f32))
-                                    .bg(rgb(palette.icon)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .flex_wrap()
-                            .gap_2()
-                            .text_sm()
-                            .text_color(rgb(palette.text_muted))
-                            .child(progress_value(44., format!("{:.0}%", fraction * 100.)))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .flex_shrink_0()
-                                    .child(progress_value(80., format_size(*bytes)))
-                                    .child("/")
-                                    .child(progress_value(80., format_size(total))),
-                            )
-                            .child(progress_value(104., format!("{}/s", format_size(*speed)))),
-                    );
-            }
-            Transfer::Verifying => {}
-            Transfer::Verified => {}
-            Transfer::Idle => {}
+        let progress = match row.transfer {
+            Transfer::Running { bytes, speed, .. } => Some((
+                bytes,
+                row.remote.as_ref().map_or(0, |backup| backup.size),
+                Some(speed),
+            )),
+            Transfer::Verifying { bytes, total } => Some((bytes, total, None)),
+            _ => None,
+        };
+        if let Some((bytes, total, speed)) = progress {
+            // Compressed input may be buffered ahead of decompression; verification
+            // reaches 100% only after structural checks and the digest succeed.
+            let fraction = if total == 0 {
+                0.
+            } else {
+                (bytes as f64 / total as f64).clamp(0., if speed.is_some() { 1. } else { 0.99 })
+            };
+            content = content
+                .child(
+                    div()
+                        .h(px(2.))
+                        .w_full()
+                        .bg(rgb(palette.element_background))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(fraction as f32))
+                                .bg(rgb(palette.icon)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_2()
+                        .text_sm()
+                        .text_color(rgb(palette.text_muted))
+                        .child(progress_value(44., format!("{:.0}%", fraction * 100.)))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .flex_shrink_0()
+                                .child(progress_value(80., format_size(bytes)))
+                                .child("/")
+                                .child(progress_value(80., format_size(total))),
+                        )
+                        .children(speed.map(|speed| {
+                            progress_value(104., format!("{}/s", format_size(speed)))
+                        })),
+                );
         }
         content
     }
@@ -676,6 +787,14 @@ impl Render for BackupsView {
                     .pb_2()
                     .child(div().text_lg().child("Backups"))
                     .child(div().flex_1())
+                    .child(control(
+                        "verify-backups",
+                        "Verify integrity",
+                        palette,
+                        !self.busy() && self.cache.is_some() && self.local.pair.is_some(),
+                        cx,
+                        |view, _, cx| view.verify_integrity(cx),
+                    ))
                     .child(
                         control(
                             "check-backups",

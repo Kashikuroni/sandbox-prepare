@@ -4,8 +4,9 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::Read,
+    io::{self, Read},
     path::{Component, Path},
+    time::{Duration, Instant},
 };
 use tokio::sync::watch;
 
@@ -13,32 +14,60 @@ fn cancelled(cancel: &watch::Receiver<bool>) -> Result<()> {
     ensure!(!*cancel.borrow(), "Backup verification cancelled");
     Ok(())
 }
-pub fn digest(path: &Path, cancel: &watch::Receiver<bool>) -> Result<String> {
-    let mut file = File::open(path)?;
-    let mut hash = Sha256::new();
-    let mut buf = [0u8; 128 * 1024];
-    loop {
-        cancelled(cancel)?;
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
+// Hash the compressed stream as the decoder reads it: no second disk pass.
+struct CheckedReader<R, F> {
+    inner: R,
+    hash: Sha256,
+    bytes: u64,
+    reported: Instant,
+    progress: F,
 }
+impl<R: Read, F: FnMut(u64)> Read for CheckedReader<R, F> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buffer)?;
+        self.hash.update(&buffer[..n]);
+        self.bytes += n as u64;
+        if self.reported.elapsed() >= Duration::from_secs(1) {
+            (self.progress)(self.bytes);
+            self.reported = Instant::now();
+        }
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
 pub fn verify(path: &Path, index: usize, cancel: &watch::Receiver<bool>) -> Result<String> {
+    verify_with_progress(path, index, cancel, |_| {})
+}
+
+pub fn verify_with_progress(
+    path: &Path,
+    index: usize,
+    cancel: &watch::Receiver<bool>,
+    mut progress: impl FnMut(u64),
+) -> Result<String> {
     cancelled(cancel)?;
-    let mut reader =
-        zstd::stream::read::Decoder::new(File::open(path)?).context("Invalid zstd backup")?;
+    progress(0);
+    let input = CheckedReader {
+        inner: File::open(path)?,
+        hash: Sha256::new(),
+        bytes: 0,
+        reported: Instant::now(),
+        progress,
+    };
+    let mut reader = zstd::stream::read::Decoder::new(input).context("Invalid zstd backup")?;
     if index == 0 {
         check_tar(&mut reader, cancel)?;
     } else {
         check_xbstream(&mut reader, cancel)?;
     }
-    // Consume remaining compressed frames and their checksums, including archive padding.
+    // Consume every compressed frame and checksum, including archive padding.
     drain(&mut reader, u64::MAX, None, cancel)?;
-    digest(path, cancel)
+    cancelled(cancel)?;
+    let mut input = reader.finish().into_inner();
+    (input.progress)(input.bytes);
+    cancelled(cancel)?;
+    Ok(format!("{:x}", input.hash.finalize()))
 }
 fn safe_path(bytes: &[u8]) -> Result<String> {
     let text = std::str::from_utf8(bytes).context("Invalid archive path")?;
@@ -292,6 +321,26 @@ pub(crate) mod fixtures {
         assert!(verify(&path, 0, &cancel).is_err());
         let (sender, cancel) = watch::channel(true);
         let _sender = sender;
+        assert!(verify(&path, 0, &cancel).is_err());
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn one_pass_hash_covers_all_compressed_frames_and_reports_input_bytes() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("sandbox-stream-hash-{}.zst", std::process::id()));
+        let (_, cancel) = watch::channel(false);
+        // A second valid zstd frame must also be included in the file digest.
+        let bytes = [compress(&tar_bytes()), compress(&[0; 8192])].concat();
+        std::fs::write(&path, &bytes)?;
+        let mut progress = Vec::new();
+        let digest = verify_with_progress(&path, 0, &cancel, |bytes| progress.push(bytes))?;
+        assert_eq!(digest, format!("{:x}", Sha256::digest(&bytes)));
+        assert_eq!(progress.first(), Some(&0));
+        assert_eq!(progress.last(), Some(&(bytes.len() as u64)));
+        assert!(progress.windows(2).all(|p| p[0] <= p[1]));
+        std::fs::write(&path, &bytes[..bytes.len() - 1])?;
         assert!(verify(&path, 0, &cancel).is_err());
         std::fs::remove_file(path)?;
         Ok(())
