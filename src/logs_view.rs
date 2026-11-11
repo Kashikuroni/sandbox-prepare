@@ -538,14 +538,14 @@ impl LogsView {
                             .min_w_0()
                             .text_xs()
                             .text_color(rgb(palette.text_muted))
+                            .child(display_timestamp(&entry.timestamp))
                             .child(
                                 div()
                                     .flex_shrink_0()
                                     .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(rgb(palette.log_level_color(&entry.level)))
                                     .child(entry.level.clone()),
-                            )
-                            .child(display_timestamp(&entry.timestamp)),
+                            ),
                     )
                     .child(div().flex_1())
                     .child(button(
