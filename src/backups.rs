@@ -155,15 +155,8 @@ pub async fn latest_backup(client: &Client, bucket: &str, prefix: &str) -> Resul
     Ok(latest)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum DownloadDestination {
-    Direct(PathBuf),
-    ChooseName(PathBuf),
-}
-
-/// Inspect the destination before starting a network transfer. Existing names,
-/// including directories and dangling symlinks, must go through Save As.
-pub async fn prepare_destination(directory: &Path, name: &str) -> Result<DownloadDestination> {
+/// Suggest a destination for Save As without touching existing files.
+pub async fn prepare_destination(directory: &Path, name: &str) -> Result<PathBuf> {
     anyhow::ensure!(
         directory.is_absolute(),
         "Choose a download folder in Settings → Backups."
@@ -184,7 +177,7 @@ pub async fn prepare_destination(directory: &Path, name: &str) -> Result<Downloa
     );
     let destination = directory.join(name);
     if !destination_exists(&destination).await? {
-        return Ok(DownloadDestination::Direct(destination));
+        return Ok(destination);
     }
     let name = Path::new(name);
     let stem = name
@@ -199,7 +192,7 @@ pub async fn prepare_destination(directory: &Path, name: &str) -> Result<Downloa
     loop {
         let suggested = directory.join(format!("{stem} ({copy}){extension}"));
         if !destination_exists(&suggested).await? {
-            return Ok(DownloadDestination::ChooseName(suggested));
+            return Ok(suggested);
         }
         copy = copy
             .checked_add(1)
@@ -290,7 +283,7 @@ pub async fn download(
                 .await
                 .context("Could not write the backup (check free disk space)")?;
             downloaded += chunk.len() as u64;
-            if last_progress.elapsed() >= Duration::from_millis(100) {
+            if last_progress.elapsed() >= Duration::from_secs(1) {
                 progress(downloaded);
                 last_progress = Instant::now();
             }
@@ -360,13 +353,13 @@ mod tests {
         let original = directory.join("backup.sql.zst");
         assert_eq!(
             prepare_destination(&directory, "backup.sql.zst").await?,
-            DownloadDestination::Direct(original.clone())
+            original.clone()
         );
         fs::write(&original, b"keep original").await?;
         fs::write(directory.join("backup.sql (1).zst"), b"keep copy").await?;
         assert_eq!(
             prepare_destination(&directory, "backup.sql.zst").await?,
-            DownloadDestination::ChooseName(directory.join("backup.sql (2).zst"))
+            directory.join("backup.sql (2).zst")
         );
         assert_eq!(fs::read(original).await?, b"keep original");
         fs::remove_dir_all(directory).await?;
@@ -411,7 +404,7 @@ mod tests {
         std::os::unix::fs::symlink(directory.join("missing"), directory.join("backup.sql"))?;
         assert_eq!(
             prepare_destination(&directory, "backup.sql").await?,
-            DownloadDestination::ChooseName(directory.join("backup (1).sql"))
+            directory.join("backup (1).sql")
         );
         assert!(
             fs::symlink_metadata(directory.join("backup.sql"))

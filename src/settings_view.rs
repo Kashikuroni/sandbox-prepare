@@ -466,7 +466,7 @@ impl SettingsWindow {
         }
         if self.matches(
             "Download folder",
-            "Save backups here automatically. Choose another name when a file already exists.",
+            "Open this folder by default when choosing where to save each backup.",
             Section::Backups,
             cx,
         ) {
@@ -478,13 +478,51 @@ impl SettingsWindow {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "Choose a folder before downloading.".into());
             let tooltip = directory.clone();
-            rows.push(setting_row("Download folder", "Save backups here automatically. Choose another name when a file already exists.", palette).child(
-                div().flex().flex_col().gap_2().w(px(280.)).flex_shrink_0()
-                    .child(div().id("download-folder-path").text_sm().text_color(rgb(palette.text_muted)).overflow_hidden().text_ellipsis().child(directory)
-                        .tooltip(move |_, cx| cx.new(|_| FolderTooltip(tooltip.clone(), palette)).into()))
-                    .child(div().flex().child(button("choose-download-folder", if self.choosing_folder { "Choosing…" } else { "Choose folder…" }, palette, cx, |view, _, cx| view.choose_download_folder(cx))
-                        .border_color(rgb(palette.border)).bg(rgb(palette.element_background)).when(self.choosing_folder, |el| el.opacity(0.5))))
-            ));
+            rows.push(
+                setting_row(
+                    "Download folder",
+                    "Open this folder by default when choosing where to save each backup.",
+                    palette,
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .w(px(280.))
+                        .flex_shrink_0()
+                        .child(
+                            div()
+                                .id("download-folder-path")
+                                .text_sm()
+                                .text_color(rgb(palette.text_muted))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(directory)
+                                .tooltip(move |_, cx| {
+                                    cx.new(|_| FolderTooltip(tooltip.clone(), palette)).into()
+                                }),
+                        )
+                        .child(
+                            div().flex().child(
+                                button(
+                                    "choose-download-folder",
+                                    if self.choosing_folder {
+                                        "Choosing…"
+                                    } else {
+                                        "Choose folder…"
+                                    },
+                                    palette,
+                                    cx,
+                                    |view, _, cx| view.choose_download_folder(cx),
+                                )
+                                .border_color(rgb(palette.border))
+                                .bg(rgb(palette.element_background))
+                                .when(self.choosing_folder, |el| el.opacity(0.5)),
+                            ),
+                        ),
+                ),
+            );
         }
         let mut storage_visible = false;
         for (index, (title, description)) in [

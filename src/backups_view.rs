@@ -23,6 +23,7 @@ enum DownloadState {
     Choosing,
     Running {
         bytes: u64,
+        speed: u64,
         started: Instant,
         cancel: watch::Sender<bool>,
     },
@@ -53,7 +54,7 @@ impl BackupRow {
 
 enum Event {
     Listed(usize, Result<Option<Backup>, String>),
-    Prepared(usize, Backup, Result<backups::DownloadDestination, String>),
+    Prepared(usize, Backup, Result<PathBuf, String>),
     Progress(usize, u64),
     Finished(usize, Result<PathBuf, DownloadError>),
 }
@@ -154,12 +155,7 @@ impl BackupsView {
     fn handle_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::Prepared(index, backup, result) => match result {
-                Ok(backups::DownloadDestination::Direct(path)) => {
-                    self.start_download(index, backup, path)
-                }
-                Ok(backups::DownloadDestination::ChooseName(path)) => {
-                    self.choose_destination(index, backup, path, cx)
-                }
+                Ok(path) => self.choose_destination(index, backup, path, cx),
                 Err(error) => {
                     tracing::error!(target:"app::download",source=SOURCES[index].0,%error,"Could not prepare download");
                     self.rows[index].download = DownloadState::Failed(error);
@@ -181,10 +177,14 @@ impl BackupsView {
             }
             Event::Progress(index, bytes) => {
                 if let DownloadState::Running {
-                    bytes: downloaded, ..
+                    bytes: downloaded,
+                    speed,
+                    started,
+                    ..
                 } = &mut self.rows[index].download
                 {
                     *downloaded = bytes;
+                    *speed = (bytes as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
                 }
             }
             Event::Finished(index, result) => {
@@ -294,6 +294,7 @@ impl BackupsView {
         let (cancel, receiver) = watch::channel(false);
         self.rows[index].download = DownloadState::Running {
             bytes: 0,
+            speed: 0,
             started: Instant::now(),
             cancel,
         };
@@ -403,14 +404,13 @@ impl BackupsView {
             );
         }
         match &row.download {
-            DownloadState::Running { bytes, started, .. } => {
+            DownloadState::Running { bytes, speed, .. } => {
                 let total = row.backup.as_ref().map_or(0, |backup| backup.size);
                 let fraction = if total == 0 {
                     0.0
                 } else {
                     (*bytes as f64 / total as f64).clamp(0.0, 1.0)
                 };
-                let speed = (*bytes as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
                 content = content
                     .child(
                         div()
@@ -428,17 +428,23 @@ impl BackupsView {
                         div()
                             .flex()
                             .items_center()
-                            .justify_between()
+                            .flex_wrap()
                             .gap_2()
-                            .child(div().text_sm().text_color(rgb(palette.text_muted)).child(
-                                format!(
-                                    "{:.0}% · {} / {} · {}/s",
-                                    fraction * 100.0,
-                                    format_size(*bytes),
-                                    format_size(total),
-                                    format_size(speed)
-                                ),
-                            ))
+                            .text_sm()
+                            .text_color(rgb(palette.text_muted))
+                            .child(progress_value(48., format!("{:.0}%", fraction * 100.)))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .flex_shrink_0()
+                                    .child(progress_value(100., format_size(*bytes)))
+                                    .child("/")
+                                    .child(progress_value(100., format_size(total))),
+                            )
+                            .child(progress_value(120., format!("{}/s", format_size(*speed))))
+                            .child(div().flex_1())
                             .child(control(
                                 ("cancel", index),
                                 "Cancel",
@@ -505,6 +511,24 @@ impl Drop for BackupsView {
             }
         }
     }
+}
+
+fn progress_value(width: f32, text: String) -> Div {
+    let mut value = div()
+        .w(px(width))
+        .flex_shrink_0()
+        .text_right()
+        .overflow_hidden()
+        .text_ellipsis()
+        .child(text);
+    value
+        .text_style()
+        .get_or_insert_with(Default::default)
+        .font_features = Some(gpui::FontFeatures(std::sync::Arc::new(vec![(
+        "tnum".into(),
+        1,
+    )])));
+    value
 }
 
 fn control(
