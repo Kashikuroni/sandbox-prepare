@@ -168,7 +168,26 @@ impl Workspace {
             .as_ref()
             .and_then(|record| application.manager(&record.id).ok());
         let backups = cx.new(|cx| backups_view::BackupsView::new(service, settings.theme, cx));
-        let sandbox = cx.new(|cx| sandboxes_view::SandboxesView::new(manager, &settings, cx));
+        let sandbox = cx.new(|cx| {
+            sandboxes_view::SandboxesView::new(application.clone(), manager, &settings, cx)
+        });
+        cx.subscribe(
+            &sandbox,
+            |this, _, _: &sandboxes_view::ConfigureLaunch, cx| {
+                this.active_section = Section::Projects;
+                this.projects.update(cx, |view, cx| view.show_launch(cx));
+                cx.notify();
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &sandbox,
+            |this, _, _: &sandboxes_view::ViewProcesses, cx| {
+                this.active_section = Section::Processes;
+                cx.notify();
+            },
+        )
+        .detach();
         let project_id = project.id.clone();
         let sandbox_id = record.as_ref().map(|record| record.id.clone());
         let projects = cx.new(|cx| {
@@ -218,6 +237,22 @@ impl Workspace {
                         {
                             choices = std::time::Instant::now();
                             workspace.refresh_choices(cx);
+                            #[cfg(debug_assertions)]
+                            if std::env::var_os("SANDBOX_PREPARE_TEST_DATA_DIR").is_some()
+                                && std::env::var_os("SANDBOX_PREPARE_UI_PREVIEW").is_some()
+                            {
+                                match std::env::var("SANDBOX_PREPARE_UI_PREVIEW_SCREEN").as_deref()
+                                {
+                                    Ok("launch") => {
+                                        workspace.active_section = Section::Projects;
+                                        workspace
+                                            .projects
+                                            .update(cx, |view, cx| view.show_launch(cx));
+                                    }
+                                    Ok("sandbox") => workspace.active_section = Section::Sandboxes,
+                                    _ => {}
+                                }
+                            }
                         }
                         if workspace.application.exit_ready() {
                             cx.quit();
@@ -263,6 +298,22 @@ impl Workspace {
         workspace.configure_context_actions(cx);
         workspace.bind_context_pickers(cx);
         workspace.refresh_choices(cx);
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SANDBOX_PREPARE_TEST_DATA_DIR").is_some()
+            && std::env::var_os("SANDBOX_PREPARE_UI_PREVIEW").is_some()
+        {
+            match std::env::var("SANDBOX_PREPARE_UI_PREVIEW_SCREEN").as_deref() {
+                Ok("launch") => {
+                    workspace.active_section = Section::Projects;
+                    workspace
+                        .projects
+                        .update(cx, |view, cx| view.show_launch(cx));
+                }
+                Ok("sandbox") => workspace.active_section = Section::Sandboxes,
+                _ => {}
+            }
+        }
+
         #[cfg(debug_assertions)]
         if std::env::var_os("SANDBOX_PREPARE_TEST_DATA_DIR").is_some()
             && std::env::var_os("SANDBOX_PREPARE_UI_PREVIEW").is_some()
@@ -325,6 +376,22 @@ impl Workspace {
         })();
         self.context_error = result.err().map(|e| e.to_string());
         self.refresh_choices(cx);
+        cx.notify();
+    }
+    fn run_current_sandbox(&mut self, cx: &mut Context<Self>) {
+        self.active_section = Section::Sandboxes;
+        if let Some(id) = &self.sandbox_id {
+            self.context_error = self
+                .application
+                .run_sandbox(id, false)
+                .err()
+                .map(|e| logging::redact(&format!("{e:#}")));
+        } else {
+            self.context_bar
+                .run_after_source
+                .insert(self.project_id.clone());
+            self.open_current_for_run(cx);
+        }
         cx.notify();
     }
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -446,6 +513,12 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let launch_busy = self
+            .sandbox_id
+            .as_ref()
+            .and_then(|id| self.application.sandbox_status(id))
+            .is_some_and(|s| s.busy || s.shutting_down)
+            || self.application.is_stopping();
         let palette = self.settings.theme.palette(window.appearance());
         let navigation_visible = self.sidebar_open
             && (!self.logs_open || f32::from(window.viewport_size().width) >= 1000.);
@@ -529,6 +602,42 @@ impl Render for Workspace {
                                     window.start_window_move();
                                 }
                             }),
+                    )
+                    .child(
+                        div()
+                            .id("run-current-sandbox")
+                            .border_1()
+                            .border_color(gpui::transparent_black())
+                            .focus(|d| d.border_color(rgb(palette.border_focused)))
+                            .w(px(110.))
+                            .justify_center()
+                            .when(launch_busy, |d| d.opacity(0.5))
+                            .tab_index(30)
+                            .h(px(titlebar::BUTTON_HEIGHT))
+                            .px(px(6.))
+                            .flex()
+                            .items_center()
+                            .rounded_sm()
+                            .text_size(px(12.))
+                            .font_family(titlebar::FONT_FAMILY)
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgb(palette.element_hover)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !launch_busy {
+                                    this.run_current_sandbox(cx)
+                                }
+                            }))
+                            .on_key_down(cx.listener(
+                                move |this, event: &gpui::KeyDownEvent, _, cx| {
+                                    if !launch_busy
+                                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                    {
+                                        this.run_current_sandbox(cx);
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            ))
+                            .child("Start sandbox"),
                     )
                     .child(
                         div()

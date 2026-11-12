@@ -35,6 +35,8 @@ pub(super) struct ContextBar {
     errors: BTreeMap<ProjectId, String>,
     source_jobs: BTreeMap<ProjectId, Arc<Operation>>,
     source_errors: BTreeMap<ProjectId, String>,
+    pub run_after_source: BTreeSet<ProjectId>,
+    pending_runs: BTreeSet<SandboxId>,
     pub last_sandbox: BTreeMap<ProjectId, Option<SandboxId>>,
     sender: mpsc::Sender<NavigationEvent>,
     receiver: mpsc::Receiver<NavigationEvent>,
@@ -53,6 +55,8 @@ impl Default for ContextBar {
             source_jobs: BTreeMap::new(),
             source_errors: BTreeMap::new(),
             last_sandbox: BTreeMap::new(),
+            run_after_source: BTreeSet::new(),
+            pending_runs: BTreeSet::new(),
             sender,
             receiver,
         }
@@ -398,6 +402,9 @@ impl Workspace {
             )
         });
     }
+    pub(super) fn open_current_for_run(&mut self, cx: &mut Context<Self>) {
+        self.open_working_copy(SourceMode::CurrentCheckout, false, cx);
+    }
     fn open_working_copy(&mut self, mode: SourceMode, new_branch: bool, cx: &mut Context<Self>) {
         if self.context_bar.source_jobs.contains_key(&self.project_id) {
             return;
@@ -568,6 +575,10 @@ impl Workspace {
                     self.context_bar.source_jobs.remove(&project);
                     match result {
                         Ok(id) => {
+                            let run = self.context_bar.run_after_source.remove(&project);
+                            if run {
+                                self.context_bar.pending_runs.insert(id.clone());
+                            }
                             self.context_bar.source_errors.remove(&project);
                             self.context_bar.invalidate_git(&project);
                             self.context_bar
@@ -575,11 +586,16 @@ impl Workspace {
                                 .insert(project.clone(), Some(id.clone()));
                             if self.project_id == project && self.sandbox_id == previous {
                                 self.select_context(project, Some(id), cx);
-                                self.active_section = Section::Projects;
-                                self.projects.update(cx, |view, cx| view.show_launch(cx));
+                                if run {
+                                    self.active_section = Section::Sandboxes;
+                                } else {
+                                    self.active_section = Section::Projects;
+                                    self.projects.update(cx, |view, cx| view.show_launch(cx));
+                                }
                             }
                         }
                         Err(error) => {
+                            self.context_bar.run_after_source.remove(&project);
                             let message = logging::redact(&format!("{error:#}"));
                             if self.project_id == project {
                                 self.context_error = Some(message.clone());
@@ -608,6 +624,26 @@ impl Workspace {
                         cx.notify();
                     }
                 },
+            }
+        }
+        if self.application.is_stopping() {
+            self.context_bar.pending_runs.clear();
+            return;
+        }
+        let ready: Vec<_> = self
+            .context_bar
+            .pending_runs
+            .iter()
+            .filter(|id| self.application.sandbox_status(id).is_none_or(|s| !s.busy))
+            .cloned()
+            .collect();
+        for id in ready {
+            self.context_bar.pending_runs.remove(&id);
+            if let Err(error) = self.application.run_sandbox(&id, false) {
+                if self.sandbox_id.as_ref() == Some(&id) {
+                    self.context_error = Some(logging::redact(&format!("{error:#}")));
+                }
+                tracing::error!(target:"app::sandbox",sandbox=%id,%error,"Queued sandbox launch failed");
             }
         }
     }

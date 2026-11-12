@@ -18,7 +18,12 @@ enum Confirmation {
     Recreate,
     Delete,
 }
+pub struct ConfigureLaunch;
+pub struct ViewProcesses;
+impl gpui::EventEmitter<ViewProcesses> for SandboxesView {}
+impl gpui::EventEmitter<ConfigureLaunch> for SandboxesView {}
 pub struct SandboxesView {
+    application: Arc<sandbox_runtime::Runtime>,
     manager: Option<Arc<Manager>>,
     error: Option<String>,
     theme: ThemeMode,
@@ -40,6 +45,7 @@ pub struct SandboxesView {
 }
 impl SandboxesView {
     pub fn new(
+        application: Arc<sandbox_runtime::Runtime>,
         manager: Option<Arc<Manager>>,
         settings: &crate::settings::Settings,
         cx: &mut Context<Self>,
@@ -90,6 +96,7 @@ impl SandboxesView {
         })
         .detach();
         Self {
+            application,
             manager,
             error,
             theme,
@@ -205,6 +212,18 @@ impl SandboxesView {
         }
         self.lines = lines;
     }
+    fn run_sandbox(&mut self, replace: bool, cx: &mut Context<Self>) {
+        let result = self
+            .manager
+            .as_ref()
+            .and_then(|m| m.store.scope.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("Choose a working copy first"))
+            .and_then(|(_, id, _)| self.application.run_sandbox(id, replace));
+        self.error = result
+            .err()
+            .map(|e| crate::logging::redact(&format!("{e:#}")));
+        cx.notify();
+    }
     fn act(&mut self, action: Action, cx: &mut Context<Self>) {
         if let Some(manager) = &self.manager {
             manager.launch(action);
@@ -269,34 +288,28 @@ impl SandboxesView {
                     )
                     .child(div().flex_1())
                     .child(button(
-                        "sandbox-create",
-                        if active.is_some() {
-                            "Recreate"
-                        } else {
-                            "Create from backups"
-                        },
+                        "sandbox-run",
+                        "Start sandbox",
                         palette,
-                        !busy && state.docker_ready,
+                        !busy && self.manager.is_some(),
                         cx,
-                        move |view, window, cx| {
-                            if view
-                                .manager
-                                .as_ref()
-                                .is_some_and(|m| m.snapshot().active.is_some())
-                            {
-                                view.confirm(Confirmation::Recreate, window, cx);
-                            } else {
-                                view.act(Action::Create, cx);
-                            }
-                        },
+                        |view, _, cx| view.run_sandbox(false, cx),
                     ))
                     .child(button(
-                        "sandbox-start",
-                        "Start",
+                        "sandbox-create",
+                        "Update databases…",
                         palette,
-                        !busy && active.is_some() && state.running != [true; 2],
+                        !busy && active.is_some(),
                         cx,
-                        |view, _, cx| view.act(Action::Start, cx),
+                        |view, window, cx| view.confirm(Confirmation::Recreate, window, cx),
+                    ))
+                    .child(button(
+                        "configure-launch",
+                        "Configure…",
+                        palette,
+                        !busy,
+                        cx,
+                        |_, _, cx| cx.emit(ConfigureLaunch),
                     ))
                     .child(button(
                         "sandbox-stop",
@@ -316,7 +329,13 @@ impl SandboxesView {
                     )),
             )
             .child(div().text_sm().text_color(rgb(palette.text_muted)).child(
-                if state.stage.is_empty() {
+                if !state.busy
+                    && state.error.is_none()
+                    && state.active.is_none()
+                    && state.docker_ready
+                {
+                    "Not started".into()
+                } else if state.stage.is_empty() {
                     "Checking Docker…".into()
                 } else {
                     state.stage.clone()
@@ -357,6 +376,46 @@ impl SandboxesView {
                         )
                     )),
             );
+        }
+        if let Some(fraction) = state.progress {
+            page = page.child(
+                div()
+                    .w_full()
+                    .h(px(2.))
+                    .bg(rgb(palette.element_selected))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(gpui::relative(fraction.clamp(0., 1.)))
+                            .bg(rgb(palette.icon_accent)),
+                    ),
+            );
+        }
+        if state.application_running {
+            page = page.child(div().text_sm().child(if state.application_ready {
+                "Application ready"
+            } else {
+                "Application running — readiness is not confirmed"
+            }));
+            for endpoint in &state.endpoints {
+                page = page.child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(palette.text_muted))
+                        .child(endpoint.clone()),
+                );
+            }
+            page = page.child(button(
+                "application-logs",
+                "View process logs",
+                palette,
+                true,
+                cx,
+                |view, _, cx| {
+                    let _ = view;
+                    cx.emit(ViewProcesses);
+                },
+            ));
         }
         if let Some(instance) = active {
             for (index, title, version, endpoint) in [
@@ -447,7 +506,7 @@ impl SandboxesView {
                 },
             )));
         } else {
-            page=page.child(div().py_4().text_sm().child("Create MySQL and ClickHouse from the current local backup pair. Download both backups on the Backups page first."));
+            page=page.child(div().py_4().text_sm().child("Start sandbox prepares current backups, restores missing databases and launches the project. Existing database changes are kept."));
         }
         page.child(div().text_sm().text_color(rgb(palette.text_muted)).child("Databases stop when Sandbox Prepare closes. Stopping preserves data; Delete removes database volumes and private application data."))
     }
@@ -523,7 +582,7 @@ impl SandboxesView {
                 .child(div().text_sm().child(if recreate{"Both databases will be restored into new volumes. After validation succeeds, the previous databases and their local changes will be deleted."}else{"Database volumes and private application data will be permanently deleted. Downloaded backups and Git sources are preserved."}))
                 .child(div().flex().justify_end().gap_2()
                     .child(button("cancel-sandbox-confirmation","Cancel",palette,true,cx,|view,_,cx|{view.confirmation=None;cx.notify();}).track_focus(&self.modal_focus[0]))
-                    .child(button("confirm-sandbox-action",if recreate{"Recreate"}else{"Delete"},palette,true,cx,move|view,_,cx|{view.confirmation=None;view.act(if recreate{Action::Create}else{Action::Delete},cx);}).track_focus(&self.modal_focus[1]).text_color(rgb(palette.error)))))
+                    .child(button("confirm-sandbox-action",if recreate{"Update databases"}else{"Delete"},palette,true,cx,move|view,_,cx|{view.confirmation=None;if recreate{view.run_sandbox(true,cx);}else{view.act(Action::Delete,cx);}}).track_focus(&self.modal_focus[1]).text_color(rgb(palette.error)))))
     }
 }
 impl Render for SandboxesView {

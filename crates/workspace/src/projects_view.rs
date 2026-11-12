@@ -19,8 +19,12 @@ pub struct Changed {
 enum Event {
     Created(ProjectId, Option<SandboxId>),
     Discovered(Vec<compose::Candidate>),
-    Inspected(serde_json::Value),
+    Inspected(
+        serde_json::Value,
+        std::collections::BTreeMap<String, MountRole>,
+    ),
     Saved(String),
+    Configured(ComposeLaunchSpec),
 }
 #[derive(Clone)]
 struct Mount {
@@ -35,7 +39,7 @@ struct LaunchDraft {
     profiles: Vec<String>,
     services: Vec<String>,
     mounts: Vec<Mount>,
-    inputs: [Entity<TextInput>; 5],
+    inputs: [Entity<TextInput>; 10],
     selects: [Entity<Select>; 4],
 }
 pub struct ProjectsView {
@@ -51,6 +55,12 @@ pub struct ProjectsView {
     profiles: Vec<String>,
     services: Vec<String>,
     mounts: Vec<Mount>,
+    mysql_database: Entity<TextInput>,
+    ch_database: Entity<TextInput>,
+    probe_service: Entity<TextInput>,
+    probe_port: Entity<TextInput>,
+    probe_path: Entity<TextInput>,
+    advanced: bool,
     mysql: Entity<TextInput>,
     clickhouse: Entity<TextInput>,
     env_path: Entity<TextInput>,
@@ -99,7 +109,7 @@ impl ProjectsView {
                                 Err(e) => {
                                     let message =
                                         Some(sandbox_telemetry::logging::redact(&format!("{e:#}")));
-                                    if action.as_deref() == Some("Save Compose launch settings") {
+                                    if action.as_deref() == Some("Save project launch profile") {
                                         view.save_error = message;
                                     } else {
                                         view.error = message;
@@ -154,6 +164,12 @@ impl ProjectsView {
             profiles: vec![],
             services: vec![],
             mounts: vec![],
+            mysql_database: input("", cx),
+            ch_database: input("", cx),
+            probe_service: input("", cx),
+            probe_port: input("", cx),
+            probe_path: input("", cx),
+            advanced: false,
             mysql: input("mysql", cx),
             clickhouse: input("clickhouse", cx),
             env_path: input("", cx),
@@ -231,6 +247,20 @@ impl ProjectsView {
         self.load(cx);
         cx.notify();
     }
+    fn fill_database_names(&self, cx: &mut Context<Self>) {
+        if let Ok(env) = self.app.catalog.environment(&self.project, "*") {
+            for (key, field) in [
+                ("DB_NAME", &self.mysql_database),
+                ("CLICKHOUSE_DATABASE", &self.ch_database),
+            ] {
+                if field.read(cx).value().trim().is_empty() {
+                    if let Some(value) = env.get(key) {
+                        field.update(cx, |field, cx| field.set_value(value.clone(), cx));
+                    }
+                }
+            }
+        }
+    }
     fn save_draft(&mut self) {
         if let Some(id) = &self.sandbox {
             if self.app.catalog.sandbox(id).is_err() {
@@ -251,6 +281,11 @@ impl ProjectsView {
                         self.env_path.clone(),
                         self.variable.clone(),
                         self.database_name.clone(),
+                        self.mysql_database.clone(),
+                        self.ch_database.clone(),
+                        self.probe_service.clone(),
+                        self.probe_port.clone(),
+                        self.probe_path.clone(),
                     ],
                     selects: [
                         self.env_service.clone(),
@@ -292,6 +327,11 @@ impl ProjectsView {
         let input = |value: &str, cx: &mut Context<Self>| {
             cx.new(|cx| TextInput::new(value.into(), false, self.theme, cx))
         };
+        self.mysql_database = input("", cx);
+        self.ch_database = input("", cx);
+        self.probe_service = input("", cx);
+        self.probe_port = input("", cx);
+        self.probe_path = input("", cx);
         self.mysql = input("mysql", cx);
         self.clickhouse = input("clickhouse", cx);
         self.env_path = input("", cx);
@@ -343,6 +383,31 @@ impl ProjectsView {
             .and_then(|id| self.app.catalog.sandbox(id).ok())
             .and_then(|s| s.compose)
             .unwrap_or_default();
+        if self.spec.files.is_empty() {
+            self.spec = self
+                .app
+                .catalog
+                .launch_profile(&self.project)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+        }
+        if let Some(names) = &self.spec.automatic_connections {
+            self.mysql_database
+                .update(cx, |field, cx| field.set_value(names.mysql.clone(), cx));
+            self.ch_database.update(cx, |field, cx| {
+                field.set_value(names.clickhouse.clone(), cx)
+            });
+        }
+        if let Some(probe) = &self.spec.readiness_probe {
+            self.probe_service
+                .update(cx, |field, cx| field.set_value(probe.service.clone(), cx));
+            self.probe_port
+                .update(cx, |field, cx| field.set_value(probe.port.to_string(), cx));
+            self.probe_path
+                .update(cx, |field, cx| field.set_value(probe.path.clone(), cx));
+        }
+        self.fill_database_names(cx);
         for (role, field) in [("mysql", &self.mysql), ("clickhouse", &self.clickhouse)] {
             let name = self
                 .spec
@@ -370,6 +435,11 @@ impl ProjectsView {
                 self.env_path,
                 self.variable,
                 self.database_name,
+                self.mysql_database,
+                self.ch_database,
+                self.probe_service,
+                self.probe_port,
+                self.probe_path,
             ] = draft.inputs;
             [
                 self.env_service,
@@ -380,6 +450,13 @@ impl ProjectsView {
             self.set_theme(self.theme, cx);
         } else if !self.spec.files.is_empty() {
             self.inspect(cx);
+        } else if self
+            .sandbox
+            .as_ref()
+            .and_then(|id| self.app.catalog.sandbox(id).ok())
+            .is_some_and(|s| s.source.is_some())
+        {
+            self.discover(cx);
         }
     }
     pub fn set_theme(&mut self, theme: ThemeMode, cx: &mut Context<Self>) {
@@ -388,6 +465,11 @@ impl ProjectsView {
             &self.project_name,
             &self.location,
             &self.mysql,
+            &self.mysql_database,
+            &self.ch_database,
+            &self.probe_service,
+            &self.probe_port,
+            &self.probe_path,
             &self.clickhouse,
             &self.env_path,
             &self.variable,
@@ -478,7 +560,7 @@ impl ProjectsView {
                     "Select files in merge order, then inspect the combined configuration.".into(),
                 );
             }
-            Event::Inspected(document) => {
+            Event::Inspected(document, inferred_mounts) => {
                 self.services = compose::service_names(&document);
                 self.profiles = compose::profile_names(&document);
                 let options = || {
@@ -519,7 +601,12 @@ impl ProjectsView {
                                     Some(MountRole::Source) => "source",
                                     Some(MountRole::Configuration) => "config",
                                     Some(MountRole::Data) => "data",
-                                    None => default,
+                                    None => match inferred_mounts.get(&key) {
+                                        Some(MountRole::Source) => "source",
+                                        Some(MountRole::Configuration) => "config",
+                                        Some(MountRole::Data) => "data",
+                                        None => default,
+                                    },
                                 };
                                 let role = cx.new(|cx| {
                                     let mut s = Select::new("Mount role", self.theme, cx);
@@ -554,9 +641,30 @@ impl ProjectsView {
                         }
                     }
                 }
-                self.notice=Some("Configuration inspected. Import any env files, review mounts and database bindings, then save.".into());
+                self.notice=Some("Configuration inspected. Import application settings, confirm database names, then save the project profile.".into());
             }
-            Event::Saved(message) => self.notice = Some(message),
+            Event::Saved(message) => {
+                self.notice = Some(message);
+                self.fill_database_names(cx);
+            }
+            Event::Configured(spec) => {
+                if let Some(names) = &spec.automatic_connections {
+                    if self.mysql_database.read(cx).value().is_empty() {
+                        self.mysql_database
+                            .update(cx, |field, cx| field.set_value(names.mysql.clone(), cx));
+                    }
+                    if self.ch_database.read(cx).value().is_empty() {
+                        self.ch_database.update(cx, |field, cx| {
+                            field.set_value(names.clickhouse.clone(), cx)
+                        });
+                    }
+                }
+                self.spec = spec;
+                self.notice = Some(
+                    "Project profile saved. Start sandbox prepares everything automatically."
+                        .into(),
+                );
+            }
         }
     }
     fn create_project(&mut self, cx: &mut Context<Self>) {
@@ -598,13 +706,13 @@ impl ProjectsView {
                     .source
                     .ok_or_else(|| anyhow::anyhow!("Select a source first"))?;
                 let env = app.catalog.environment(&sandbox.project_id, "*")?;
-                Ok(Event::Inspected(compose::inspect(
+                let document = compose::inspect(&source.directory, &spec, &env, &cancel, false)?;
+                let mounts = sandbox_projects::launch_profile::infer_mounts(
                     &source.directory,
-                    &spec,
-                    &env,
+                    &document,
                     &cancel,
-                    false,
-                )?))
+                )?;
+                Ok(Event::Inspected(document, mounts))
             },
             cx,
         );
@@ -614,6 +722,25 @@ impl ProjectsView {
             return;
         };
         let mut spec = self.spec.clone();
+        spec.automatic_connections = Some(DatabaseNames {
+            mysql: self.mysql_database.read(cx).value().trim().to_owned(),
+            clickhouse: self.ch_database.read(cx).value().trim().to_owned(),
+        });
+        let service = self.probe_service.read(cx).value().trim().to_owned();
+        spec.readiness_probe = if service.is_empty() {
+            None
+        } else {
+            let Ok(port) = self.probe_port.read(cx).value().trim().parse::<u16>() else {
+                self.save_error = Some("Enter a valid HTTP readiness container port".into());
+                cx.notify();
+                return;
+            };
+            Some(ReadinessProbe {
+                service,
+                port,
+                path: self.probe_path.read(cx).value().trim().to_owned(),
+            })
+        };
         spec.databases.clear();
         for (role, input) in [("mysql", &self.mysql), ("clickhouse", &self.clickhouse)] {
             let name = input.read(cx).value();
@@ -646,11 +773,10 @@ impl ProjectsView {
         }
         self.spec = spec.clone();
         self.run(
-            "Save Compose launch settings",
-            move |app, _| {
-                app.configure_sandbox(&id, spec)?;
-                Ok(Event::Saved(
-                    "Saved. These settings apply when the sandbox is created or recreated.".into(),
+            "Save project launch profile",
+            move |app, cancel| {
+                Ok(Event::Configured(
+                    app.save_launch_profile(&id, spec, &cancel)?,
                 ))
             },
             cx,
@@ -948,7 +1074,7 @@ impl Render for ProjectsView {
             && let Some(sandbox) = sandbox
         {
             page = page
-                .child(heading("Launch configuration", p))
+                .child(heading("Project launch profile", p))
                 .child(div().child(sandbox.name));
             if self.remove_confirmation {
                 page=page.child(div().text_sm().text_color(rgb(p.error)).child("Remove this sandbox and all of its database/application data? Clean app-owned worktrees will be removed; user directories and branches are kept."))
@@ -1037,138 +1163,146 @@ impl Render for ProjectsView {
                                 .join(" → ")
                         )));
                 }
-                page = page.child(div().text_sm().child("Profiles"));
-                for (index, profile) in self.profiles.iter().enumerate() {
-                    let value = profile.clone();
-                    page = page.child(button(
-                        ("profile", index),
-                        format!(
-                            "{}{}",
-                            if self.spec.profiles.contains(profile) {
-                                "Selected · "
-                            } else {
-                                ""
-                            },
-                            profile
-                        ),
-                        ready,
-                        p,
-                        cx,
-                        move |this, _, cx| {
-                            toggle(&mut this.spec.profiles, &value);
-                            cx.notify();
-                        },
-                    ));
-                }
-                page = page.child(
-                    div()
-                        .text_sm()
-                        .child("Services (empty selection uses enabled profiles)"),
-                );
-                for (index, service) in self.services.iter().enumerate() {
-                    let value = service.clone();
-                    page = page.child(button(
-                        ("service", index),
-                        format!(
-                            "{}{}",
-                            if self.spec.services.contains(service) {
-                                "Selected · "
-                            } else {
-                                ""
-                            },
-                            service
-                        ),
-                        ready,
-                        p,
-                        cx,
-                        move |this, _, cx| {
-                            toggle(&mut this.spec.services, &value);
-                            cx.notify();
-                        },
-                    ));
-                }
-                page = page
-                    .child(row("MySQL service to replace", self.mysql.clone(), p))
-                    .child(row(
-                        "ClickHouse service to replace",
-                        self.clickhouse.clone(),
-                        p,
-                    ))
-                    .child(heading("Environment", p))
-                    .child(row("Env file path to import", self.env_path.clone(), p))
-                    .child(row("Import for", self.env_service.clone(), p))
-                    .child(div().flex().child(button(
-                        "import-env",
-                        "Import into application storage",
-                        ready,
-                        p,
-                        cx,
-                        |this, _, cx| this.import(cx),
-                    )))
-                    .child(heading("Database bindings", p));
-                for (index, binding) in self.spec.bindings.iter().enumerate() {
-                    page = page.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(div().min_w_0().text_sm().child(format!(
-                                "{} · {} ← {} {:?}",
-                                binding.service,
-                                binding.variable,
-                                binding.database,
-                                binding.parameter
-                            )))
-                            .child(button(
-                                ("remove-binding", index),
-                                "Remove",
-                                ready,
-                                p,
-                                cx,
-                                move |this, _, cx| {
-                                    this.spec.bindings.remove(index);
-                                    cx.notify();
+                page=page.child(heading("Environment",p))
+                    .child(div().text_sm().text_color(rgb(p.text_muted)).child("Import application settings once. Sandbox connections override DB_* and CLICKHOUSE_* automatically."))
+                    .child(row("Env file to import",self.env_path.clone(),p))
+                    .child(div().flex().child(button("import-env","Import into application storage",ready,p,cx,|this,_,cx|this.import(cx))))
+                    .child(heading("Databases",p))
+                    .child(row("MySQL database (DB_NAME)",self.mysql_database.clone(),p))
+                    .child(row("ClickHouse database",self.ch_database.clone(),p))
+                    .child(div().text_sm().text_color(rgb(p.text_muted)).child("Names are inferred from imported settings when available. Hosts, ports, logins and passwords are managed by the sandbox."))
+                    .child(button("advanced-launch",if self.advanced{"Hide advanced settings"}else{"Advanced settings…"},ready,p,cx,|this,_,cx|{this.advanced=!this.advanced;cx.notify();}));
+                if self.advanced {
+                    page = page
+                        .child(row("Import environment for", self.env_service.clone(), p))
+                        .child(heading("Optional HTTP readiness check", p))
+                        .child(row("Application service", self.probe_service.clone(), p))
+                        .child(row("Published container port", self.probe_port.clone(), p))
+                        .child(row(
+                            "HTTP path (for example /health)",
+                            self.probe_path.clone(),
+                            p,
+                        ));
+                    page = page.child(div().text_sm().child("Profiles"));
+                    for (index, profile) in self.profiles.iter().enumerate() {
+                        let value = profile.clone();
+                        page = page.child(button(
+                            ("profile", index),
+                            format!(
+                                "{}{}",
+                                if self.spec.profiles.contains(profile) {
+                                    "Selected · "
+                                } else {
+                                    ""
                                 },
-                            )),
-                    );
-                }
-                page = page
-                    .child(row("Service", self.binding_service.clone(), p))
-                    .child(row("Environment variable", self.variable.clone(), p))
-                    .child(row("Database", self.binding_db.clone(), p))
-                    .child(row("Value", self.binding_parameter.clone(), p))
-                    .child(row(
-                        "Database name (for Database / URL)",
-                        self.database_name.clone(),
-                        p,
-                    ))
-                    .child(div().flex().child(button(
-                        "add-binding",
-                        "Add binding",
-                        ready,
-                        p,
-                        cx,
-                        |this, _, cx| this.binding(cx),
-                    )));
-                if let Some(error) = &self.binding_error {
+                                profile
+                            ),
+                            ready,
+                            p,
+                            cx,
+                            move |this, _, cx| {
+                                toggle(&mut this.spec.profiles, &value);
+                                cx.notify();
+                            },
+                        ));
+                    }
                     page = page.child(
                         div()
                             .text_sm()
-                            .text_color(rgb(p.error))
-                            .child(error.clone()),
+                            .child("Services (empty selection uses enabled profiles)"),
                     );
-                }
-                if !self.mounts.is_empty() {
-                    page = page.child(heading("Bind mounts", p));
-                    for mount in &self.mounts {
-                        page = page
-                            .child(row(mount.key.clone(), mount.role.clone(), p))
-                            .child(row("Source / configuration path", mount.path.clone(), p));
+                    for (index, service) in self.services.iter().enumerate() {
+                        let value = service.clone();
+                        page = page.child(button(
+                            ("service", index),
+                            format!(
+                                "{}{}",
+                                if self.spec.services.contains(service) {
+                                    "Selected · "
+                                } else {
+                                    ""
+                                },
+                                service
+                            ),
+                            ready,
+                            p,
+                            cx,
+                            move |this, _, cx| {
+                                toggle(&mut this.spec.services, &value);
+                                cx.notify();
+                            },
+                        ));
                     }
-                }
-                page = page
-                    .child(div().flex().child(button(
+                    page = page
+                        .child(row("MySQL service to replace", self.mysql.clone(), p))
+                        .child(row(
+                            "ClickHouse service to replace",
+                            self.clickhouse.clone(),
+                            p,
+                        ))
+                        .child(heading("Database bindings", p));
+                    for (index, binding) in self.spec.bindings.iter().enumerate() {
+                        page = page.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(div().min_w_0().text_sm().child(format!(
+                                    "{} · {} ← {} {:?}",
+                                    binding.service,
+                                    binding.variable,
+                                    binding.database,
+                                    binding.parameter
+                                )))
+                                .child(button(
+                                    ("remove-binding", index),
+                                    "Remove",
+                                    ready,
+                                    p,
+                                    cx,
+                                    move |this, _, cx| {
+                                        this.spec.bindings.remove(index);
+                                        cx.notify();
+                                    },
+                                )),
+                        );
+                    }
+                    page = page
+                        .child(row("Service", self.binding_service.clone(), p))
+                        .child(row("Environment variable", self.variable.clone(), p))
+                        .child(row("Database", self.binding_db.clone(), p))
+                        .child(row("Value", self.binding_parameter.clone(), p))
+                        .child(row(
+                            "Database name (for Database / URL)",
+                            self.database_name.clone(),
+                            p,
+                        ))
+                        .child(div().flex().child(button(
+                            "add-binding",
+                            "Add binding",
+                            ready,
+                            p,
+                            cx,
+                            |this, _, cx| this.binding(cx),
+                        )));
+                    if let Some(error) = &self.binding_error {
+                        page = page.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(p.error))
+                                .child(error.clone()),
+                        );
+                    }
+                    if !self.mounts.is_empty() {
+                        page = page.child(heading("Bind mounts", p));
+                        for mount in &self.mounts {
+                            page = page
+                                .child(row(mount.key.clone(), mount.role.clone(), p))
+                                .child(row("Source / configuration path", mount.path.clone(), p));
+                        }
+                    }
+                    page = page.child(div().flex().child(button(
                         "external-resources",
                         if self.spec.private_external_resources {
                             "Private replacements for external resources: enabled"
@@ -1183,13 +1317,15 @@ impl Render for ProjectsView {
                                 !this.spec.private_external_resources;
                             cx.notify();
                         },
-                    )))
+                    )));
+                }
+                page = page
                     .when_some(self.save_error.clone(), |d, error| {
                         d.child(div().text_sm().text_color(rgb(p.error)).child(error))
                     })
                     .child(div().flex().child(button(
                         "save-compose",
-                        "Save launch configuration",
+                        "Save project profile",
                         ready,
                         p,
                         cx,
