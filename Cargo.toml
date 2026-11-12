@@ -39,3 +39,4 @@ sandbox_workspace = { path = "crates/workspace" }
 sandbox_runtime = { path = "crates/runtime" }
 sandbox_projects = { path = "crates/projects" }
 dotenvy = "0.15.7"
+libc = "0.2"

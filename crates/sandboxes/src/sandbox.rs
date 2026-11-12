@@ -51,6 +51,7 @@ pub enum Action {
     Start,
     Stop,
     Delete,
+    Remove,
 }
 pub struct Watchdog {
     input: Option<ChildStdin>,
@@ -268,6 +269,7 @@ impl Manager {
                 Action::Start => manager.start(),
                 Action::Stop => manager.stop(),
                 Action::Delete => manager.delete(),
+                Action::Remove => manager.remove(),
             }))
             .unwrap_or_else(|_| {
                 Err(anyhow::anyhow!(
@@ -292,13 +294,17 @@ impl Manager {
             outcome
         };
         if let Some(operations) = &self.operations {
+            let logs = self.logs.clone();
             if let Err(error) = operations.spawn_blocking(
                 self.scope.clone(),
                 "Sandbox operation",
                 self.cancel.clone(),
                 move |job| {
                     job.running();
-                    work()
+                    logs.set_operation(Some(job.id.clone()));
+                    let result = work();
+                    logs.set_operation(None);
+                    result
                 },
             ) {
                 self.change(|state| {
@@ -350,7 +356,14 @@ impl Manager {
     }
     fn compose_command(&self, instance: &Instance, args: &[String]) -> Result<String> {
         self.store.validate(instance)?;
-        let mut command = strings(&["compose", "--project-name", &instance.project, "--file"]);
+        let mut command = strings(&[
+            "compose",
+            "--env-file",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+            "--project-name",
+            &instance.project,
+            "--file",
+        ]);
         command.push(self.store.compose(instance)?.display().to_string());
         command.extend_from_slice(args);
         let environment = self
@@ -990,6 +1003,25 @@ impl Manager {
             s.active = None;
             s.running = [false; 2];
         });
+        Ok(())
+    }
+    fn remove(&self) -> Result<()> {
+        self.delete()?;
+        if let Some((catalog, id, project)) = &self.store.scope {
+            let sandbox = catalog.sandbox(id)?;
+            if sandbox.source.as_ref().is_some_and(|source| source.owned) {
+                ensure!(
+                    sandbox_projects::git::Git::default().remove_owned(
+                        catalog,
+                        &catalog.project(project)?,
+                        &sandbox,
+                        &self.cancel
+                    )?,
+                    "Database data was deleted, but the owned worktree is dirty or locked. The sandbox was kept. Commit or save your changes and retry removal."
+                );
+            }
+            catalog.remove_sandbox(id)?;
+        }
         Ok(())
     }
     fn remove_instance(&self, instance: &Instance) -> Result<()> {

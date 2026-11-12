@@ -72,64 +72,24 @@ fn compose_is_pinned_separated_labelled_and_contains_no_credentials() -> Result<
     Ok(())
 }
 
-// All resources in this test have a fresh random owner and are removed on failure too.
-struct Cleanup {
-    manager: Arc<Manager>,
-    instances: Vec<Instance>,
-    root: std::path::PathBuf,
-}
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        self.manager.cancel.store(false, Ordering::Release);
-        self.manager.stop_followers();
-        if let Ok(saved) = self.manager.store.load() {
-            for instance in saved
-                .active
-                .iter()
-                .chain(saved.pending.iter())
-                .chain(saved.retired.iter())
-            {
-                let _ = self.manager.remove_instance(instance);
-            }
-        }
-        for instance in &self.instances {
-            let _ = self.manager.remove_instance(instance);
-        }
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-#[test]
-#[ignore = "Creates isolated Docker fixtures, restores real physical backups, and removes its own resources"]
-fn docker_restores_both_databases_preserves_old_on_failure_and_restarts() -> Result<()> {
-    let (manager, root) = fixture()?;
-    ensure!(
-        manager.snapshot().docker_ready,
-        "Docker preflight failed: {:?}",
-        manager.snapshot().error
-    );
-    let source = instance(&manager)?;
-    let _cleanup = Cleanup {
-        manager: manager.clone(),
-        instances: vec![source.clone()],
-        root: root.clone(),
-    };
+fn prepare_backups(manager: &Manager, source: &Instance, root: &std::path::Path) -> Result<()> {
     manager.pull()?;
-    manager.write_config(&source, None)?;
-    manager.compose(&source, &["create", "--pull", "never"])?;
-    let mut initialize = manager.probe_args(&source, "-u");
+    manager.write_config(source, None)?;
+    manager.compose(source, &["create", "--pull", "never"])?;
+    let mut initialize = manager.probe_args(source, "-u");
     let image_position = initialize.iter().position(|s| s == MYSQL_IMAGE).unwrap();
     initialize.truncate(image_position - 2); // remove --entrypoint id; retain owned labels
-    initialize.extend(strings(&["--user","0:0","--mount",&format!("type=volume,source={},target=/var/lib/mysql",manager.store.volume(&source,0)),"--entrypoint","/bin/bash",MYSQL_IMAGE,"-ec","chown mysql:mysql /var/lib/mysql; mysqld --initialize-insecure --user=mysql --datadir=/var/lib/mysql"]));
+    initialize.extend(strings(&["--user","0:0","--mount",&format!("type=volume,source={},target=/var/lib/mysql",manager.store.volume(source,0)),"--entrypoint","/bin/bash",MYSQL_IMAGE,"-ec","chown mysql:mysql /var/lib/mysql; mysqld --initialize-insecure --user=mysql --datadir=/var/lib/mysql"]));
     manager.run(
         &initialize,
         None,
         "Fixture initialize",
         Duration::from_secs(180),
     )?;
-    manager.compose(&source, &["up", "-d", "--no-build", "--pull", "never"])?;
-    manager.wait_ready(&source)?;
-    manager.sql(&source,true,"CREATE DATABASE fixture; CREATE TABLE fixture.numbers (id INT PRIMARY KEY); INSERT INTO fixture.numbers VALUES (1),(2),(3);")?;
-    manager.sql(&source,false,"CREATE DATABASE fixture; CREATE TABLE fixture.numbers (id UInt64) ENGINE=MergeTree ORDER BY id; INSERT INTO fixture.numbers VALUES (1),(2),(3); BACKUP DATABASE fixture TO Disk('backups','clickhouse.tar.zst');")?;
+    manager.compose(source, &["up", "-d", "--no-build", "--pull", "never"])?;
+    manager.wait_ready(source)?;
+    manager.sql(source,true,"CREATE DATABASE fixture; CREATE TABLE fixture.numbers (id INT PRIMARY KEY); INSERT INTO fixture.numbers VALUES (1),(2),(3);")?;
+    manager.sql(source,false,"CREATE DATABASE fixture; CREATE TABLE fixture.numbers (id UInt64) ENGINE=MergeTree ORDER BY id; INSERT INTO fixture.numbers VALUES (1),(2),(3); BACKUP DATABASE fixture TO Disk('backups','clickhouse.tar.zst');")?;
     let backups = root.join("backups");
     let generation = "pair-123456-1-0";
     let directory = backups.join(generation);
@@ -139,13 +99,13 @@ fn docker_restores_both_databases_preserves_old_on_failure_and_restarts() -> Res
             "cp",
             &format!(
                 "{}:/backups/clickhouse.tar.zst",
-                manager.store.container(&source, "clickhouse")
+                manager.store.container(source, "clickhouse")
             ),
             &directory.join(FILES[0]).display().to_string(),
         ]),
         SHORT,
     )?;
-    let config_dir = manager.store.directory(&source)?;
+    let config_dir = manager.store.directory(source)?;
     service_file(
         &config_dir,
         "root-client.cnf",
@@ -158,19 +118,19 @@ fn docker_restores_both_databases_preserves_old_on_failure_and_restarts() -> Res
         "run",
         "--rm",
         "--name",
-        &manager.store.container(&source, "fixture-backup"),
+        &manager.store.container(source, "fixture-backup"),
         "--label",
         &format!("{OWNER_LABEL}={}", manager.store.owner),
         "--label",
         &format!("{INSTANCE_LABEL}={}", source.id),
         "--network",
-        &format!("container:{}", manager.store.container(&source, "mysql")),
+        &format!("container:{}", manager.store.container(source, "mysql")),
         "--user",
         "0:0",
         "--mount",
         &format!(
             "type=volume,source={},target=/var/lib/mysql,readonly",
-            manager.store.volume(&source, 0)
+            manager.store.volume(source, 0)
         ),
         "--mount",
         &format!(
@@ -233,7 +193,60 @@ fn docker_restores_both_databases_preserves_old_on_failure_and_restarts() -> Res
         params![serde_json::to_string(&pair)?],
     )?;
     manager.stop_followers();
-    manager.remove_instance(&source)?;
+    manager.remove_instance(source)?;
+    Ok(())
+}
+
+// All resources in this test have a fresh random owner and are removed on failure too.
+struct Cleanup {
+    manager: Arc<Manager>,
+    instances: Vec<Instance>,
+    root: std::path::PathBuf,
+}
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        self.manager.cancel.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while self.manager.snapshot().busy && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+        }
+        self.manager.stop_followers();
+        self.manager.cancel.store(false, Ordering::Release);
+        let _ = self.manager.delete();
+        if let Ok(saved) = self.manager.store.load() {
+            for instance in saved
+                .active
+                .iter()
+                .chain(saved.pending.iter())
+                .chain(saved.retired.iter())
+            {
+                let _ = self.manager.remove_instance(instance);
+            }
+        }
+        for instance in &self.instances {
+            let _ = self.manager.remove_instance(instance);
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+#[test]
+#[ignore = "Creates isolated Docker fixtures, restores real physical backups, and removes its own resources"]
+fn docker_restores_both_databases_preserves_old_on_failure_and_restarts() -> Result<()> {
+    let (manager, root) = fixture()?;
+    ensure!(
+        manager.snapshot().docker_ready,
+        "Docker preflight failed: {:?}",
+        manager.snapshot().error
+    );
+    let source = instance(&manager)?;
+    let _cleanup = Cleanup {
+        manager: manager.clone(),
+        instances: vec![source.clone()],
+        root: root.clone(),
+    };
+    prepare_backups(&manager, &source, &root)?;
+    let generation = "pair-123456-1-0";
+    let directory = root.join("backups").join(generation);
     eprintln!("Fixtures prepared; restoring both databases");
     manager.restore().with_context(|| {
         format!(
@@ -393,6 +406,185 @@ fn watchdog_stops_only_its_session_when_parent_pipe_closes() -> Result<()> {
             )?
             .trim(),
         "true"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "Restores two scoped sandboxes concurrently from disposable physical backups"]
+fn two_sandboxes_share_archives_but_not_databases_or_project_processes() -> Result<()> {
+    use sandbox_core::models::{
+        ComposeLaunchSpec, DatabaseBinding, DatabaseId, DatabaseParameter, SourceMode,
+        SourceSelection,
+    };
+    let (fixture, root) = fixture()?;
+    let source = instance(&fixture)?;
+    let _fixture_cleanup = Cleanup {
+        manager: fixture.clone(),
+        instances: vec![source.clone()],
+        root: root.clone(),
+    };
+    prepare_backups(&fixture, &source, &root)?;
+    let catalog = Catalog::open(root.join("application.sqlite3"))?;
+    let project = catalog.projects()?.remove(0);
+    let executor = tokio::runtime::Runtime::new()?;
+    let operations = Operations::new(executor.handle().clone());
+    let limit = RestoreLimit::new(2);
+    let memory = Arc::new(sandbox_telemetry::process_log::Memory::default());
+    let session = crate::docker::nonce()?;
+    let directory = root.join("fixture-project");
+    fs::create_dir_all(&directory)?;
+    fs::write(
+        directory.join("compose.json"),
+        serde_json::to_vec(
+            &json!({"services":{"api":{"image":MYSQL_IMAGE,"entrypoint":["/bin/bash","-c"],"command":["echo project-started; exec sleep 600"],"depends_on":{"db":{"condition":"service_healthy"}},"volumes":["app-data:/app-data"]},"db":{"image":MYSQL_IMAGE}},"volumes":{"app-data":{}}}),
+        )?,
+    )?;
+    let mut managers = vec![];
+    let mut cleanup = vec![];
+    for index in 0..2 {
+        let mut sandbox =
+            catalog.create_sandbox(project.id.clone(), format!("Parallel {index}"))?;
+        sandbox.source = Some(SourceSelection {
+            directory: directory.clone(),
+            mode: SourceMode::CurrentCheckout,
+            owned: false,
+            revision: "fixture".into(),
+        });
+        let mut spec = ComposeLaunchSpec {
+            files: vec!["compose.json".into()],
+            services: vec!["api".into()],
+            ..Default::default()
+        };
+        spec.databases.insert(
+            "db".into(),
+            DatabaseId::try_from("mysql".to_owned()).unwrap(),
+        );
+        spec.bindings.push(DatabaseBinding {
+            service: "api".into(),
+            variable: "DB_HOST".into(),
+            database: DatabaseId::try_from("mysql".to_owned()).unwrap(),
+            parameter: DatabaseParameter::Host,
+            database_name: String::new(),
+        });
+        sandbox.compose = Some(spec);
+        catalog.save_sandbox(&sandbox)?;
+        let manager = Manager::scoped(
+            catalog.clone(),
+            sandbox,
+            operations.clone(),
+            limit.clone(),
+            session.clone(),
+            memory.clone(),
+        )?;
+        wait(&manager, Duration::from_secs(60))?;
+        cleanup.push(Cleanup {
+            manager: manager.clone(),
+            instances: vec![],
+            root: root.join(format!("unused-cleanup-{index}")),
+        });
+        managers.push(manager);
+    }
+    for manager in &managers {
+        manager.launch(Action::Create);
+    }
+    for manager in &managers {
+        wait(manager, Duration::from_secs(600))?;
+    }
+    let first = managers[0]
+        .snapshot()
+        .active
+        .context("First sandbox did not restore")?;
+    let second = managers[1]
+        .snapshot()
+        .active
+        .context("Second sandbox did not restore")?;
+    assert_ne!(first.ports, second.ports);
+    assert_ne!(managers[0].store.password, managers[1].store.password);
+    managers[0].sql(&first, true, "INSERT INTO fixture.numbers VALUES (99);")?;
+    assert_eq!(
+        managers[1]
+            .sql(&second, true, "SELECT COUNT(*) FROM fixture.numbers;")?
+            .trim(),
+        "3"
+    );
+    for (manager, instance) in managers.iter().zip([&first, &second]) {
+        assert_eq!(
+            manager
+                .sql(instance, false, "SELECT sum(id) FROM fixture.numbers")?
+                .trim(),
+            "6"
+        );
+        let app = format!("{}-app-api", instance.project);
+        assert_eq!(
+            manager
+                .docker
+                .output(
+                    &strings(&["inspect", "--format", "{{.State.Running}}", &app]),
+                    SHORT
+                )?
+                .trim(),
+            "true"
+        );
+        let environment = manager.docker.output(
+            &strings(&["inspect", "--format", "{{json .Config.Env}}", &app]),
+            SHORT,
+        )?;
+        assert!(environment.contains("DB_HOST=db"));
+    }
+    managers[0].stop()?;
+    assert_eq!(
+        managers[1]
+            .sql(&second, true, "SELECT COUNT(*) FROM fixture.numbers;")?
+            .trim(),
+        "3"
+    );
+    assert_eq!(
+        managers[1]
+            .docker
+            .output(
+                &strings(&[
+                    "inspect",
+                    "--format",
+                    "{{.State.Running}}",
+                    &format!("{}-app-api", second.project)
+                ]),
+                SHORT
+            )?
+            .trim(),
+        "true"
+    );
+    operations.stop();
+    executor.block_on(operations.join());
+    for manager in &managers {
+        manager.shutdown_blocking()?;
+        assert!(manager.owned_containers()?.iter().all(|id| {
+            manager
+                .docker
+                .output(
+                    &strings(&["inspect", "--format", "{{.State.Running}}", id]),
+                    SHORT,
+                )
+                .is_ok_and(|s| s.trim() == "false")
+        }));
+    }
+    drop(cleanup);
+    Ok(())
+}
+fn wait(manager: &Manager, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    while manager.snapshot().busy {
+        ensure!(
+            started.elapsed() < timeout,
+            "Sandbox timed out: {}",
+            manager.snapshot().stage
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    ensure!(
+        manager.snapshot().error.is_none(),
+        "Sandbox failed: {}",
+        manager.snapshot().error.unwrap_or_default()
     );
     Ok(())
 }

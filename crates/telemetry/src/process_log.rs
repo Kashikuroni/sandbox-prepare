@@ -40,6 +40,7 @@ pub struct ProcessLog {
     files: Mutex<LogFiles>,
     pub revision: Arc<AtomicU64>,
     secrets: Vec<String>,
+    operation: Mutex<Option<sandbox_core::models::OperationId>>,
 }
 impl ProcessLog {
     pub fn new(directory: PathBuf, secrets: Vec<String>) -> Self {
@@ -71,6 +72,7 @@ impl ProcessLog {
                 LogSettings::default(),
             )),
             secrets,
+            operation: Mutex::new(None),
         }
     }
     pub fn configure(&self, limit: usize, policy: LogSettings) {
@@ -82,18 +84,23 @@ impl ProcessLog {
         self.files.lock().unwrap().configure(policy);
         self.revision.fetch_add(1, Ordering::Release);
     }
+    pub fn set_operation(&self, id: Option<sandbox_core::models::OperationId>) {
+        *self.operation.lock().unwrap() = id;
+    }
     pub fn append(&self, process: &str, mut text: String) {
         text = crate::logging::redact(&text);
         for secret in &self.secrets {
             text = text.replace(secret, "[redacted]");
         }
         let mut lines = self.memory.lines.lock().unwrap();
+        let mut scope = self.scope.clone();
+        scope.operation = self.operation.lock().unwrap().clone();
         let line = Line {
             seq: self.memory.sequence.fetch_add(1, Ordering::Relaxed),
             time: chrono::Local::now().format("%d.%m.%Y %H:%M:%S").to_string(),
             process: process.into(),
             text,
-            scope: self.scope.clone(),
+            scope,
         };
         let mut bytes = serde_json::to_vec(&line).unwrap_or_default();
         bytes.push(b'\n');
@@ -131,6 +138,33 @@ impl ProcessLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_memory_has_one_global_limit_and_keeps_contexts_separate() -> anyhow::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sandbox-process-scopes-{}",
+            crate::docker::nonce()?
+        ));
+        let memory = Arc::new(Memory::default());
+        let scope = |id: &str| sandbox_core::models::Scope {
+            project: Some(sandbox_core::models::ProjectId::try_from("project".to_owned()).unwrap()),
+            sandbox: Some(sandbox_core::models::SandboxId::try_from(id.to_owned()).unwrap()),
+            operation: None,
+        };
+        let first = ProcessLog::scoped(root.join("first"), vec![], scope("first"), memory.clone());
+        let second = ProcessLog::scoped(root.join("second"), vec![], scope("second"), memory);
+        first.configure(2, Default::default());
+        first.append("mysql", "old".into());
+        second.append("api", "other".into());
+        first.append("mysql", "new".into());
+        assert_eq!(first.snapshot().len(), 1);
+        assert_eq!(second.snapshot().len(), 1);
+        assert_eq!(first.snapshot()[0].text, "new");
+        assert_ne!(first.snapshot()[0].seq, second.snapshot()[0].seq);
+        first.flush();
+        second.flush();
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
     #[test]
     fn container_secrets_are_redacted_before_memory_and_file() -> anyhow::Result<()> {
         let root =

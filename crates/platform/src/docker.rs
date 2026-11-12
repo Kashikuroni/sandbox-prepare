@@ -32,6 +32,11 @@ impl Docker {
     }
     pub fn command(&self, args: &[String]) -> Command {
         let mut command = Command::new(&self.binary);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         command
             .args(args)
             .stdin(Stdio::null())
@@ -115,7 +120,7 @@ impl Docker {
             }
             let status = loop {
                 if cancel.load(Ordering::Acquire) || started.elapsed() > timeout {
-                    let _ = child.kill();
+                    kill_group(&mut child);
                     let _ = child.wait();
                     break None;
                 }
@@ -123,7 +128,7 @@ impl Docker {
                     Ok(Some(status)) => break Some(status),
                     Ok(None) => thread::sleep(Duration::from_millis(75)),
                     Err(error) => {
-                        let _ = child.kill();
+                        kill_group(&mut child);
                         let _ = child.wait();
                         return Err(error.into());
                     }
@@ -188,14 +193,14 @@ impl Docker {
             let err = scope.spawn(move || read(Box::new(stderr)));
             let status = loop {
                 if cancel.load(Ordering::Acquire) || started.elapsed() > timeout {
-                    let _ = child.kill();
+                    kill_group(&mut child);
                     break child.wait()?;
                 }
                 match child.try_wait() {
                     Ok(Some(status)) => break status,
                     Ok(None) => thread::sleep(Duration::from_millis(50)),
                     Err(error) => {
-                        let _ = child.kill();
+                        kill_group(&mut child);
                         let _ = child.wait();
                         return Err(error.into());
                     }
@@ -225,6 +230,16 @@ impl Docker {
         self.output(&strings(&["compose", "version"]), Duration::from_secs(10))?;
         Ok(())
     }
+}
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Every command starts its own process group; never signal the caller's group.
+        unsafe {
+            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
 }
 pub fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|s| (*s).into()).collect()
@@ -256,6 +271,31 @@ pub fn nonce() -> Result<String> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_reaps_descendants_holding_output_pipes() {
+        let cli = Docker {
+            binary: "/bin/sh".into(),
+        };
+        let flag = Arc::new(AtomicBool::new(false));
+        let cancel = flag.clone();
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        assert!(
+            cli.capture(
+                &strings(&["-c", "sleep 3 & wait"]),
+                &std::collections::BTreeMap::new(),
+                &flag,
+                Duration::from_secs(5)
+            )
+            .is_err()
+        );
+        trigger.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
     #[test]
     fn cancellation_reaps_the_cli_child() {
         let docker = Docker {

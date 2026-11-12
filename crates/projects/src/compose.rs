@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+#[derive(Clone)]
 pub struct Candidate {
     pub path: PathBuf,
     pub services: Vec<String>,

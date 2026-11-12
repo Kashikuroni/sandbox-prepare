@@ -47,7 +47,11 @@ pub struct Runtime {
 }
 impl Runtime {
     pub fn open(handle: tokio::runtime::Handle, settings: &Settings) -> Result<Arc<Self>> {
-        Self::at(database_path()?, handle, settings, true)
+        // Native previews use disposable data and no helper sharing the app bundle identity.
+        let preview = cfg!(debug_assertions)
+            && std::env::var_os("SANDBOX_PREPARE_TEST_DATA_DIR").is_some()
+            && std::env::var_os("SANDBOX_PREPARE_UI_PREVIEW").is_some();
+        Self::at(database_path()?, handle, settings, !preview)
     }
     pub fn at(
         database: PathBuf,
@@ -164,6 +168,26 @@ impl Runtime {
         }
         self.manager(&sandbox.id)?;
         Ok(sandbox)
+    }
+    pub fn remove_sandbox(&self, id: &SandboxId, cancel: &AtomicBool) -> Result<()> {
+        ensure!(!self.is_stopping(), "Application is shutting down");
+        let manager = self.manager(id)?;
+        ensure!(
+            !manager.snapshot().busy,
+            "Wait for the current sandbox operation"
+        );
+        manager.launch(sandbox_sandboxes::sandbox::Action::Remove);
+        while manager.snapshot().busy {
+            if cancel.load(Ordering::Acquire) {
+                manager.cancel();
+            }
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if let Some(error) = manager.snapshot().error {
+            anyhow::bail!(error);
+        }
+        self.controllers.lock().unwrap().remove(id);
+        Ok(())
     }
     pub fn configure_sandbox(&self, id: &SandboxId, spec: ComposeLaunchSpec) -> Result<()> {
         ensure!(!self.is_stopping(), "Application is shutting down");
@@ -333,6 +357,7 @@ impl Runtime {
             .map(|e| format!("{e:#}"))
             .collect();
         ensure!(errors.is_empty(), "{}", errors.join("; "));
+        sandbox_telemetry::logging::flush_if_initialized()?;
         if let Some(watchdog) = self.watchdog.lock().unwrap().take() {
             watchdog.disarm();
         }
@@ -371,6 +396,140 @@ mod tests {
         );
         drop(app);
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod docker_tests {
+    use super::*;
+    use sandbox_sandboxes::{
+        sandbox::MYSQL_IMAGE,
+        sandbox_store::{Instance, Saved},
+    };
+    use std::time::{Duration, Instant};
+    struct Cleanup {
+        docker: Docker,
+        names: Vec<String>,
+        root: PathBuf,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for name in &self.names {
+                let _ = self.docker.output(
+                    &docker::strings(&["rm", "-f", "-v", name]),
+                    Duration::from_secs(30),
+                );
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+    #[test]
+    #[ignore = "Requires Docker; starts only disposable sleeping containers, no database data"]
+    fn global_shutdown_stops_all_owned_services_and_keeps_an_unowned_generation() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("sandbox-runtime-docker-{}", docker::nonce()?));
+        let executor = tokio::runtime::Runtime::new()?;
+        let app = Runtime::at(
+            root.join("application.sqlite3"),
+            executor.handle().clone(),
+            &Settings::default(),
+            false,
+        )?;
+        let project = app.catalog.projects()?.remove(0);
+        let docker = Docker::discover();
+        let mut cleanup = Cleanup {
+            docker: docker.clone(),
+            names: vec![],
+            root: root.clone(),
+        };
+        for index in 0..2 {
+            let record = app
+                .catalog
+                .create_sandbox(project.id.clone(), format!("Fixture {index}"))?;
+            let manager = app.manager(&record.id)?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while manager.snapshot().busy {
+                ensure!(Instant::now() < deadline, "Preflight timed out");
+                thread::sleep(Duration::from_millis(50));
+            }
+            let id = docker::nonce()?;
+            let instance = Instance {
+                id: id.clone(),
+                project: format!("sp-{}-{}", &app.catalog.owner[..12], &id[..12]),
+                ports: [0; 3],
+                backups: Default::default(),
+                created: String::new(),
+                tables: [0; 2],
+            };
+            manager.store.save(&Saved {
+                active: Some(instance.clone()),
+                ..Default::default()
+            })?;
+            for service in ["mysql", "clickhouse", "app-api"] {
+                let name = manager.store.container(&instance, service);
+                cleanup.names.push(name.clone());
+                docker.output(
+                    &docker::strings(&[
+                        "run",
+                        "-d",
+                        "--name",
+                        &name,
+                        "--network",
+                        "none",
+                        "--label",
+                        &format!(
+                            "ru.mentormarketplace.sandbox-prepare.owner={}",
+                            app.catalog.owner
+                        ),
+                        "--label",
+                        &format!("ru.mentormarketplace.sandbox-prepare.instance={id}"),
+                        "--entrypoint",
+                        "sleep",
+                        MYSQL_IMAGE,
+                        "120",
+                    ]),
+                    Duration::from_secs(30),
+                )?;
+            }
+        }
+        let foreign = format!("sp-foreign-{}", &docker::nonce()?[..12]);
+        cleanup.names.push(foreign.clone());
+        docker.output(
+            &docker::strings(&[
+                "run",
+                "-d",
+                "--name",
+                &foreign,
+                "--network",
+                "none",
+                "--label",
+                &format!(
+                    "ru.mentormarketplace.sandbox-prepare.owner={}",
+                    app.catalog.owner
+                ),
+                "--label",
+                "ru.mentormarketplace.sandbox-prepare.instance=unowned",
+                "--entrypoint",
+                "sleep",
+                MYSQL_IMAGE,
+                "120",
+            ]),
+            Duration::from_secs(30),
+        )?;
+        app.shutdown_blocking()?;
+        for name in &cleanup.names {
+            let running = docker.output(
+                &docker::strings(&["inspect", "--format", "{{.State.Running}}", name]),
+                Duration::from_secs(10),
+            )?;
+            assert_eq!(
+                running.trim(),
+                if *name == foreign { "true" } else { "false" }
+            );
+        }
+        drop(app);
+        drop(cleanup);
         Ok(())
     }
 }

@@ -6,6 +6,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,6 +16,7 @@ pub struct Catalog {
     pub database: PathBuf,
     pub root: PathBuf,
     pub owner: String,
+    connection: Arc<Mutex<Connection>>,
 }
 
 fn table(db: &Connection, name: &str) -> Result<bool> {
@@ -182,13 +184,13 @@ impl Catalog {
             database,
             root,
             owner,
+            connection: Arc::new(Mutex::new(db)),
         })
     }
-    fn db(&self) -> Result<Connection> {
-        let db = Connection::open(&self.database)?;
-        db.busy_timeout(std::time::Duration::from_secs(3))?;
-        db.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
-        Ok(db)
+    fn db(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Application catalog lock was poisoned"))
     }
     fn all<T: DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>> {
         let db = self.db()?;
@@ -382,6 +384,44 @@ fn private(path: &Path, directory: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn concurrent_metadata_writers_share_one_connection() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sandbox-catalog-concurrent-{}",
+            crate::docker::nonce()?
+        ));
+        let catalog = Catalog::open(root.join("application.sqlite3"))?;
+        let project = catalog.projects()?.remove(0);
+        std::thread::scope(|scope| -> Result<()> {
+            let jobs: Vec<_> = (0..4)
+                .map(|worker| {
+                    let catalog = catalog.clone();
+                    let project = project.id.clone();
+                    scope.spawn(move || -> Result<()> {
+                        for index in 0..10 {
+                            let sandbox = catalog
+                                .create_sandbox(project.clone(), format!("{worker}-{index}"))?;
+                            catalog.save_sandbox_state(
+                                &sandbox.id,
+                                &serde_json::json!({"worker":worker}),
+                            )?;
+                            let state: serde_json::Value = catalog.sandbox_state(&sandbox.id)?;
+                            assert_eq!(state["worker"], worker);
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for job in jobs {
+                job.join().unwrap()?;
+            }
+            Ok(())
+        })?;
+        assert_eq!(catalog.sandboxes()?.len(), 40);
+        drop(catalog);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
     #[test]
     fn legacy_migration_preserves_paths_identity_credentials_and_generations() -> Result<()> {
         let root =

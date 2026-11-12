@@ -277,6 +277,12 @@ impl Drop for LogStore {
         }
     }
 }
+pub fn flush_if_initialized() -> Result<()> {
+    if let Some(store) = STORE.get() {
+        store.flush()?;
+    }
+    Ok(())
+}
 pub fn store() -> Arc<LogStore> {
     STORE
         .get()

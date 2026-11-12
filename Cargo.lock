@@ -5508,6 +5508,7 @@ name = "sandbox_platform"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "rusqlite",
  "sandbox_core",
  "serde",
