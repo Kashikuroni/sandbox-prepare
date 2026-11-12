@@ -50,8 +50,27 @@ impl Docker {
         timeout: Duration,
         log: impl Fn(String) + Send + Sync,
     ) -> Result<String> {
+        self.run_with_env(
+            args,
+            input,
+            cancel,
+            timeout,
+            &std::collections::BTreeMap::new(),
+            log,
+        )
+    }
+    pub fn run_with_env(
+        &self,
+        args: &[String],
+        input: Option<Box<dyn Read + Send>>,
+        cancel: &AtomicBool,
+        timeout: Duration,
+        environment: &std::collections::BTreeMap<String, String>,
+        log: impl Fn(String) + Send + Sync,
+    ) -> Result<String> {
         ensure!(!cancel.load(Ordering::Acquire), "Operation cancelled");
         let mut command = self.command(args);
+        command.envs(environment);
         if input.is_some() {
             command.stdin(Stdio::piped());
         }
@@ -140,6 +159,62 @@ impl Docker {
                     Ok(output)
                 }
             }
+        })
+    }
+    /// Capture structured CLI output without mixing stderr or truncating JSON.
+    pub fn capture(
+        &self,
+        args: &[String],
+        environment: &std::collections::BTreeMap<String, String>,
+        cancel: &AtomicBool,
+        timeout: Duration,
+    ) -> Result<String> {
+        ensure!(!cancel.load(Ordering::Acquire), "Operation cancelled");
+        let mut child = self
+            .command(args)
+            .envs(environment)
+            .spawn()
+            .with_context(|| format!("Could not start {}", self.binary.display()))?;
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let started = Instant::now();
+        thread::scope(|scope| -> Result<String> {
+            let read = |pipe: Box<dyn Read + Send>| -> std::io::Result<Vec<u8>> {
+                let mut bytes = Vec::new();
+                pipe.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+                Ok(bytes)
+            };
+            let out = scope.spawn(move || read(Box::new(stdout)));
+            let err = scope.spawn(move || read(Box::new(stderr)));
+            let status = loop {
+                if cancel.load(Ordering::Acquire) || started.elapsed() > timeout {
+                    let _ = child.kill();
+                    break child.wait()?;
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => thread::sleep(Duration::from_millis(50)),
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error.into());
+                    }
+                }
+            };
+            let stdout = out
+                .join()
+                .map_err(|_| anyhow::anyhow!("Output reader failed"))??;
+            let stderr = err
+                .join()
+                .map_err(|_| anyhow::anyhow!("Error reader failed"))??;
+            ensure!(!cancel.load(Ordering::Acquire), "Operation cancelled");
+            ensure!(started.elapsed() <= timeout, "Command timed out");
+            ensure!(
+                stdout.len() <= 16 * 1024 * 1024 && stderr.len() <= 16 * 1024 * 1024,
+                "Command output exceeds 16 MiB"
+            );
+            ensure!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+            Ok(String::from_utf8(stdout)?)
         })
     }
     pub fn check(&self) -> Result<()> {

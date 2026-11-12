@@ -1877,6 +1877,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dotenvy"
+version = "0.15.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
+
+[[package]]
 name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5494,6 +5500,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5509,6 +5516,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandbox_projects"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dotenvy",
+ "sandbox_core",
+ "sandbox_platform",
+ "sandbox_telemetry",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "sandbox_runtime"
 version = "0.1.0"
 dependencies = [
@@ -5516,6 +5537,7 @@ dependencies = [
  "sandbox_backups",
  "sandbox_core",
  "sandbox_platform",
+ "sandbox_projects",
  "sandbox_sandboxes",
  "sandbox_settings",
  "sandbox_telemetry",
@@ -5533,6 +5555,7 @@ dependencies = [
  "sandbox_backups",
  "sandbox_core",
  "sandbox_platform",
+ "sandbox_projects",
  "sandbox_telemetry",
  "serde",
  "serde_json",
@@ -5590,6 +5613,7 @@ dependencies = [
  "sandbox_backups",
  "sandbox_core",
  "sandbox_platform",
+ "sandbox_projects",
  "sandbox_runtime",
  "sandbox_sandboxes",
  "sandbox_settings",

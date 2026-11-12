@@ -94,6 +94,7 @@ pub struct Manager {
     reconciled: AtomicBool,
     shutdown: AtomicBool,
     followers: Mutex<Vec<(Arc<AtomicBool>, thread::JoinHandle<()>)>>,
+    followed: Mutex<Option<String>>,
     watchdog: Mutex<Option<Watchdog>>,
     _lock: File,
     operations: Option<Arc<Operations>>,
@@ -107,6 +108,7 @@ impl Manager {
         operations: Arc<Operations>,
         limit: Arc<RestoreLimit>,
         session: String,
+        memory: Arc<sandbox_telemetry::process_log::Memory>,
     ) -> Result<Arc<Self>> {
         let scope = Scope {
             project: Some(sandbox.project_id.clone()),
@@ -125,9 +127,11 @@ impl Manager {
             .context("Sandbox is already managed by another controller")?;
         let store = Store::scoped(catalog, sandbox)?;
         let active = store.load()?.active;
-        let logs = Arc::new(ProcessLog::new(
+        let logs = Arc::new(ProcessLog::scoped(
             store.root.join("process-logs"),
             vec![store.password.clone(), store.root_password.clone()],
+            scope.clone(),
+            memory,
         ));
         let manager = Arc::new(Self {
             store,
@@ -144,6 +148,7 @@ impl Manager {
             reconciled: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             followers: Mutex::new(vec![]),
+            followed: Mutex::new(None),
             watchdog: Mutex::new(None),
             _lock: lock,
             operations: Some(operations),
@@ -186,6 +191,7 @@ impl Manager {
             reconciled: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             followers: Mutex::new(vec![]),
+            followed: Mutex::new(None),
             watchdog: Mutex::new(None),
             _lock: lock,
             operations: None,
@@ -200,6 +206,36 @@ impl Manager {
     }
     pub fn snapshot(&self) -> State {
         self.state.lock().unwrap().clone()
+    }
+    pub fn connection_environment(&self, instance: &Instance) -> Result<String> {
+        let plan = self.plan(instance)?;
+        let host = |role: &str| {
+            plan.as_ref()
+                .and_then(|p| p.managed_services.get(role))
+                .cloned()
+                .unwrap_or_else(|| role.to_owned())
+        };
+        let network = plan
+            .as_ref()
+            .and_then(|p| {
+                p.document["networks"]["default"]["name"]
+                    .as_str()
+                    .and_then(|key| key.strip_prefix("${").and_then(|s| s.strip_suffix('}')))
+                    .and_then(|key| p.environment.get(key))
+            })
+            .cloned()
+            .unwrap_or_else(|| format!("{}_default", instance.project));
+        Ok(format!(
+            "MYSQL_HOST=127.0.0.1\nMYSQL_PORT={}\nMYSQL_USER=sandbox\nMYSQL_PASSWORD={}\nCLICKHOUSE_HOST=127.0.0.1\nCLICKHOUSE_HTTP_PORT={}\nCLICKHOUSE_NATIVE_PORT={}\nCLICKHOUSE_USER=sandbox\nCLICKHOUSE_PASSWORD={}\nDOCKER_NETWORK={}\nDOCKER_MYSQL_HOST={}\nDOCKER_CLICKHOUSE_HOST={}\n",
+            instance.ports[0],
+            self.store.password,
+            instance.ports[1],
+            instance.ports[2],
+            self.store.password,
+            network,
+            host("mysql"),
+            host("clickhouse")
+        ))
     }
     fn change(&self, f: impl FnOnce(&mut State)) {
         f(&mut self.state.lock().unwrap());
@@ -292,12 +328,99 @@ impl Manager {
                 anyhow::anyhow!(message)
             })
     }
+    fn plan(&self, instance: &Instance) -> Result<Option<sandbox_projects::compose::Plan>> {
+        if let Some((catalog, id, _)) = &self.store.scope {
+            catalog.generation_plan(id, &instance.id)
+        } else {
+            Ok(None)
+        }
+    }
     fn compose(&self, instance: &Instance, args: &[&str]) -> Result<String> {
+        let plan = self.plan(instance)?;
+        let args: Vec<String> = args
+            .iter()
+            .map(|argument| {
+                plan.as_ref()
+                    .and_then(|p| p.managed_services.get(*argument))
+                    .cloned()
+                    .unwrap_or_else(|| argument.to_string())
+            })
+            .collect();
+        self.compose_command(instance, &args)
+    }
+    fn compose_command(&self, instance: &Instance, args: &[String]) -> Result<String> {
         self.store.validate(instance)?;
         let mut command = strings(&["compose", "--project-name", &instance.project, "--file"]);
         command.push(self.store.compose(instance)?.display().to_string());
-        command.extend(strings(args));
-        self.run(&command, None, "Compose", LONG)
+        command.extend_from_slice(args);
+        let environment = self
+            .plan(instance)?
+            .map(|plan| plan.environment)
+            .unwrap_or_default();
+        self.docker
+            .run_with_env(&command, None, &self.cancel, LONG, &environment, |line| {
+                self.logs.append("Compose", line)
+            })
+            .map_err(|error| anyhow::anyhow!("{}", crate::logging::redact(&format!("{error:#}"))))
+    }
+    fn stop_application(&self, instance: &Instance) -> Result<()> {
+        if let Some(plan) = self.plan(instance)?
+            && !plan.application_services.is_empty()
+        {
+            let mut args = strings(&["stop", "--timeout", "15"]);
+            args.extend(plan.application_services);
+            self.compose_command(instance, &args)?;
+        }
+        Ok(())
+    }
+    fn start_application(&self, instance: &Instance, build: bool) -> Result<()> {
+        let Some(plan) = self.plan(instance)? else {
+            return Ok(());
+        };
+        if plan.application_services.is_empty() {
+            return Ok(());
+        }
+        self.stage("Starting project services…");
+        let mut args = strings(&["up", "-d", if build { "--build" } else { "--no-build" }]);
+        args.extend(plan.application_services.clone());
+        self.compose_command(instance, &args)?;
+        self.follow(instance);
+        let started = Instant::now();
+        loop {
+            ensure!(!self.cancel.load(Ordering::Acquire), "Operation cancelled");
+            let mut ready = true;
+            for service in &plan.application_services {
+                let name = format!("{}-app-{service}", instance.project);
+                let output = self.docker.output(
+                    &strings(&["inspect", "--format", "{{json .State}}", &name]),
+                    SHORT,
+                )?;
+                let state: Value = serde_json::from_str(output.trim())?;
+                let status = state["Status"].as_str().unwrap_or("unknown");
+                ensure!(
+                    !matches!(status, "dead" | "exited") || state["ExitCode"] == 0,
+                    "Service {service} failed. See Processes for its log."
+                );
+                if status == "running" && state["Health"]["Status"] == "starting" {
+                    ready = false;
+                }
+                ensure!(
+                    state["Health"]["Status"] != "unhealthy",
+                    "Service {service} is unhealthy. See Processes."
+                );
+                if !matches!(status, "running" | "exited") {
+                    ready = false;
+                }
+            }
+            if ready {
+                return Ok(());
+            }
+            ensure!(
+                started.elapsed() < Duration::from_secs(180),
+                "Project services did not become ready"
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
     }
     fn owned_containers(&self) -> Result<Vec<String>> {
         if self.store.scope.is_some() {
@@ -390,8 +513,9 @@ impl Manager {
         self.docker.check()?;
         // Reconcile after a crash. Only our pending generation is disposable.
         let mut saved = self.store.load()?;
-        if !self.reconciled.swap(true, Ordering::AcqRel) {
+        if !self.reconciled.load(Ordering::Acquire) {
             self.stop_all()?;
+            self.reconciled.store(true, Ordering::Release);
         }
         if let Some(pending) = saved.pending.take() {
             self.remove_instance(&pending)?;
@@ -428,7 +552,11 @@ impl Manager {
                 running[index] = output.trim() == "true";
             }
             self.change(|s| s.running = running);
-            self.follow(&instance);
+            if running.iter().any(|running| *running) {
+                self.follow(&instance);
+            } else {
+                self.stop_followers();
+            }
         }
         Ok(())
     }
@@ -471,10 +599,10 @@ impl Manager {
             created: chrono::Utc::now().to_rfc3339(),
             tables: [0; 2],
         };
-        self.write_config(&instance, Some(&lease.directory.join(FILES[0])))?;
         saved.pending = Some(instance.clone());
         self.store.save(&saved)?;
         let restored = (|| -> Result<()> {
+            self.write_config(&instance, Some(&lease.directory.join(FILES[0])))?;
             self.stage("Creating isolated database volumes…");
             self.compose(
                 &instance,
@@ -556,6 +684,10 @@ impl Manager {
             )?;
             self.follow(&instance);
             self.wait_ready(&instance)?;
+            if let Some(old) = &saved.active {
+                self.stop_application(old)?;
+            }
+            self.start_application(&instance, true)?;
             ensure!(
                 !self.cancel.load(Ordering::Acquire),
                 "Restore cancelled before activation"
@@ -568,7 +700,21 @@ impl Manager {
                 saved.pending = None;
                 self.store.save(&saved)?;
             }
-            if let Some(old) = &saved.active {
+            if let Some(old) = &saved.active
+                && self
+                    .operations
+                    .as_ref()
+                    .is_none_or(|operations| !operations.is_stopping())
+            {
+                // Restore the old process plan even when cancellation stopped the candidate.
+                let cancelled = self.cancel.swap(false, Ordering::AcqRel);
+                if let Err(rollback) = self.start_application(old, false) {
+                    self.logs.append(
+                        "Lifecycle",
+                        format!("Old project restart failed: {rollback:#}"),
+                    );
+                }
+                self.cancel.store(cancelled, Ordering::Release);
                 self.follow(old);
             }
             return Err(error);
@@ -763,9 +909,24 @@ impl Manager {
         let instance = self.snapshot().active.context("Create a sandbox first")?;
         self.stage("Starting databases…");
         self.write_config(&instance, None)?;
-        self.compose(&instance, &["up", "-d", "--no-build", "--pull", "never"])?;
+        self.compose(
+            &instance,
+            &[
+                "up",
+                "-d",
+                "--no-build",
+                "--pull",
+                "never",
+                "mysql",
+                "clickhouse",
+            ],
+        )?;
         self.follow(&instance);
         if let Err(error) = self.wait_ready(&instance) {
+            let _ = self.stop_all();
+            return Err(error);
+        }
+        if let Err(error) = self.start_application(&instance, true) {
             let _ = self.stop_all();
             return Err(error);
         }
@@ -780,9 +941,49 @@ impl Manager {
         self.stage("Removing sandbox databases…");
         self.stop_followers();
         let mut saved = self.store.load()?;
-        if let Some(active) = saved.active.clone() {
-            self.remove_instance(&active)?;
-            saved.active = None;
+        for instance in saved
+            .active
+            .iter()
+            .chain(saved.pending.iter())
+            .chain(saved.retired.iter())
+        {
+            self.remove_instance(instance)?;
+        }
+        saved = Default::default();
+        if let Some((_, id, _)) = &self.store.scope {
+            let names = self.docker.output(
+                &strings(&[
+                    "volume",
+                    "ls",
+                    "--format",
+                    "{{.Name}}",
+                    "--filter",
+                    &format!("label={OWNER_LABEL}={}", self.store.owner),
+                    "--filter",
+                    &format!("label=ru.mentormarketplace.sandbox-prepare.sandbox={id}"),
+                ]),
+                SHORT,
+            )?;
+            for name in names.lines().filter(|name| !name.is_empty()) {
+                let value: Value = serde_json::from_str(
+                    &self
+                        .docker
+                        .output(&strings(&["volume", "inspect", name]), SHORT)?,
+                )?;
+                ensure!(
+                    value[0]["Labels"][OWNER_LABEL].as_str() == Some(&self.store.owner)
+                        && value[0]["Labels"]["ru.mentormarketplace.sandbox-prepare.sandbox"]
+                            .as_str()
+                            == Some(id.as_str()),
+                    "Refusing to remove foreign application data"
+                );
+                self.docker
+                    .output(&strings(&["volume", "rm", name]), SHORT)?;
+            }
+            let data = self.store.root.join("application-data");
+            if data.is_dir() {
+                fs::remove_dir_all(data)?;
+            }
         }
         self.store.save(&saved)?;
         self.change(|s| {
@@ -844,6 +1045,36 @@ impl Manager {
             self.docker
                 .output(&strings(&["network", "rm", &network]), SHORT)?;
         }
+        for kind in ["network", "volume"] {
+            let names = self.docker.output(
+                &strings(&[
+                    kind,
+                    "ls",
+                    "--format",
+                    "{{.Name}}",
+                    "--filter",
+                    &format!("label={OWNER_LABEL}={}", self.store.owner),
+                    "--filter",
+                    &format!("label={INSTANCE_LABEL}={}", instance.id),
+                ]),
+                SHORT,
+            )?;
+            for name in names.lines().filter(|name| !name.is_empty()) {
+                let inspected = self
+                    .docker
+                    .output(&strings(&[kind, "inspect", name]), SHORT)?;
+                let resource: Value = serde_json::from_str(&inspected)?;
+                ensure!(
+                    resource[0]["Labels"][OWNER_LABEL].as_str() == Some(&self.store.owner)
+                        && resource[0]["Labels"][INSTANCE_LABEL].as_str() == Some(&instance.id),
+                    "Refusing to remove a foreign resource"
+                );
+                self.docker.output(&strings(&[kind, "rm", name]), SHORT)?;
+            }
+        }
+        if let Some((catalog, id, _)) = &self.store.scope {
+            catalog.remove_generation_plan(id, &instance.id)?;
+        }
         let directory = self.store.directory(instance)?;
         if directory.exists() {
             fs::remove_dir_all(directory)?;
@@ -851,6 +1082,7 @@ impl Manager {
         Ok(())
     }
     fn stop_followers(&self) {
+        *self.followed.lock().unwrap() = None;
         let followers: Vec<_> = self.followers.lock().unwrap().drain(..).collect();
         for (cancel, _) in &followers {
             cancel.store(true, Ordering::Release);
@@ -860,20 +1092,43 @@ impl Manager {
         }
     }
     fn follow(&self, instance: &Instance) {
+        if self.followed.lock().unwrap().as_ref() == Some(&instance.id)
+            && self
+                .followers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, worker)| !worker.is_finished())
+        {
+            return;
+        }
         self.stop_followers();
-        for service in ["mysql", "clickhouse"] {
+        *self.followed.lock().unwrap() = Some(instance.id.clone());
+        let mut services = vec![
+            ("mysql".to_owned(), self.store.container(instance, "mysql")),
+            (
+                "clickhouse".to_owned(),
+                self.store.container(instance, "clickhouse"),
+            ),
+        ];
+        if let Ok(Some(plan)) = self.plan(instance) {
+            services.extend(plan.application_services.into_iter().map(|service| {
+                let name = format!("{}-app-{service}", instance.project);
+                (service, name)
+            }));
+        }
+        for (service, name) in services {
             let cancel = Arc::new(AtomicBool::new(false));
             let signal = cancel.clone();
             let docker = self.docker.clone();
             let logs = self.logs.clone();
-            let name = self.store.container(instance, service);
             let task = thread::spawn(move || {
                 let _ = docker.run(
                     &strings(&["logs", "--follow", "--timestamps", "--tail", "200", &name]),
                     None,
                     &cancel,
                     LONG,
-                    |line| logs.append(service, line),
+                    |line| logs.append(&service, line),
                 );
             });
             self.followers.lock().unwrap().push((signal, task));
@@ -996,7 +1251,31 @@ impl Manager {
             "ch-entry.sh",
             "set -eu\nmkdir -p /backups\nchown clickhouse:clickhouse /backups\ninstall -m 644 /run/sandbox/ch-config.xml /etc/clickhouse-server/config.d/sandbox.xml\ninstall -m 644 /run/sandbox/ch-users.xml /etc/clickhouse-server/users.d/sandbox.xml\ninstall -m 600 -o clickhouse -g clickhouse /run/sandbox/ch-client.xml /tmp/sandbox-client.xml\nexec /entrypoint.sh\n",
         )?;
-        let compose = compose_definition(&self.store, instance, archive, &self.session)?;
+        let base = compose_definition(&self.store, instance, archive, &self.session)?;
+        let compose = if let Some((catalog, id, project)) = &self.store.scope {
+            let mut plan = if let Some(plan) =
+                catalog.generation_plan::<sandbox_projects::compose::Plan>(id, &instance.id)?
+            {
+                plan
+            } else {
+                sandbox_projects::compose::build(
+                    catalog,
+                    &catalog.project(project)?,
+                    &catalog.sandbox(id)?,
+                    &instance.id,
+                    base,
+                    &self.cancel,
+                )?
+            };
+            if archive.is_none() {
+                plan.detach_backup()?;
+            }
+            catalog.save_generation_plan(id, &instance.id, &plan)?;
+            plan.document
+        } else {
+            base
+        };
+
         service_file(
             &directory,
             "compose.json",
@@ -1022,7 +1301,12 @@ fn compose_definition(
         .display()
         .to_string()
         .replace('$', "$$");
-    let labels = json!({OWNER_LABEL:store.owner,INSTANCE_LABEL:instance.id,SESSION_LABEL:session});
+    let mut labels =
+        json!({OWNER_LABEL:store.owner,INSTANCE_LABEL:instance.id,SESSION_LABEL:session});
+    if let Some((_, sandbox, project)) = &store.scope {
+        labels["ru.mentormarketplace.sandbox-prepare.sandbox"] = json!(sandbox.as_str());
+        labels["ru.mentormarketplace.sandbox-prepare.project"] = json!(project.as_str());
+    }
     let bind = json!({"type":"bind","source":directory,"target":"/run/sandbox","read_only":true});
     let mut ch_mounts = vec![
         bind.clone(),

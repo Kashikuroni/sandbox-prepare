@@ -5,7 +5,7 @@ use std::{
     collections::VecDeque,
     path::PathBuf,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -15,38 +15,67 @@ pub struct Line {
     pub time: String,
     pub process: String,
     pub text: String,
+    #[serde(default)]
+    pub scope: sandbox_core::models::Scope,
 }
-pub struct ProcessLog {
+pub struct Memory {
     lines: Mutex<VecDeque<Line>>,
-    files: Mutex<LogFiles>,
-    pub revision: AtomicU64,
     sequence: AtomicU64,
     limit: AtomicUsize,
+    pub revision: Arc<AtomicU64>,
+}
+impl Default for Memory {
+    fn default() -> Self {
+        Self {
+            lines: Mutex::new(VecDeque::new()),
+            sequence: AtomicU64::new(0),
+            limit: AtomicUsize::new(2000),
+            revision: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+pub struct ProcessLog {
+    memory: Arc<Memory>,
+    scope: sandbox_core::models::Scope,
+    files: Mutex<LogFiles>,
+    pub revision: Arc<AtomicU64>,
     secrets: Vec<String>,
 }
 impl ProcessLog {
     pub fn new(directory: PathBuf, secrets: Vec<String>) -> Self {
+        Self::scoped(
+            directory,
+            secrets,
+            Default::default(),
+            Arc::new(Memory::default()),
+        )
+    }
+    pub fn scoped(
+        directory: PathBuf,
+        secrets: Vec<String>,
+        scope: sandbox_core::models::Scope,
+        memory: Arc<Memory>,
+    ) -> Self {
         let session = format!(
             "{}-{}",
             chrono::Utc::now().timestamp_millis(),
             std::process::id()
         );
         Self {
-            lines: Mutex::new(VecDeque::new()),
+            revision: memory.revision.clone(),
+            memory,
+            scope,
             files: Mutex::new(LogFiles::new(
                 Some(directory),
                 session,
                 LogSettings::default(),
             )),
-            revision: AtomicU64::new(0),
-            sequence: AtomicU64::new(0),
-            limit: AtomicUsize::new(2000),
             secrets,
         }
     }
     pub fn configure(&self, limit: usize, policy: LogSettings) {
-        self.limit.store(limit.max(1), Ordering::Release);
-        let mut lines = self.lines.lock().unwrap();
+        self.memory.limit.store(limit.max(1), Ordering::Release);
+        let mut lines = self.memory.lines.lock().unwrap();
         while lines.len() > limit.max(1) {
             lines.pop_front();
         }
@@ -54,20 +83,22 @@ impl ProcessLog {
         self.revision.fetch_add(1, Ordering::Release);
     }
     pub fn append(&self, process: &str, mut text: String) {
+        text = crate::logging::redact(&text);
         for secret in &self.secrets {
             text = text.replace(secret, "[redacted]");
         }
-        let mut lines = self.lines.lock().unwrap();
+        let mut lines = self.memory.lines.lock().unwrap();
         let line = Line {
-            seq: self.sequence.fetch_add(1, Ordering::Relaxed),
+            seq: self.memory.sequence.fetch_add(1, Ordering::Relaxed),
             time: chrono::Local::now().format("%d.%m.%Y %H:%M:%S").to_string(),
             process: process.into(),
             text,
+            scope: self.scope.clone(),
         };
         let mut bytes = serde_json::to_vec(&line).unwrap_or_default();
         bytes.push(b'\n');
         lines.push_back(line);
-        while lines.len() > self.limit.load(Ordering::Acquire) {
+        while lines.len() > self.memory.limit.load(Ordering::Acquire) {
             lines.pop_front();
         }
         drop(lines);
@@ -81,7 +112,16 @@ impl ProcessLog {
         self.revision.fetch_add(1, Ordering::Release);
     }
     pub fn snapshot(&self) -> Vec<Line> {
-        self.lines.lock().unwrap().iter().cloned().collect()
+        self.memory
+            .lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| {
+                line.scope.project == self.scope.project && line.scope.sandbox == self.scope.sandbox
+            })
+            .cloned()
+            .collect()
     }
     pub fn flush(&self) {
         let _ = self.files.lock().unwrap().flush();

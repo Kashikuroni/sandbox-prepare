@@ -9,7 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
 #[derive(Clone)]
 pub struct Catalog {
     pub database: PathBuf,
@@ -41,19 +41,21 @@ impl Catalog {
             version <= VERSION,
             "Application database was created by a newer version"
         );
-        if version == 0 {
+        if version < VERSION {
             let populated: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')", [], |r|r.get(0))?;
             if populated {
                 let backups = root.join("migrations");
                 fs::create_dir_all(&backups)?;
                 let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-                let destination = backups.join(format!("before-v1-{stamp}.sqlite3"));
+                let destination = backups.join(format!("before-v{}-{stamp}.sqlite3", version + 1));
                 db.execute(
                     "VACUUM INTO ?1",
                     [destination.to_str().context("Invalid backup path")?],
                 )?;
                 private(&destination, false)?;
             }
+        }
+        if version == 0 {
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute_batch("CREATE TABLE installation(id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL);
                 CREATE TABLE projects(id TEXT PRIMARY KEY,json TEXT NOT NULL);
@@ -158,7 +160,14 @@ impl Catalog {
                     )?;
                 }
             }
-            tx.pragma_update(None, "user_version", VERSION)?;
+            tx.pragma_update(None, "user_version", 1)?;
+            tx.commit()?;
+        }
+        let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 2 {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute_batch("CREATE TABLE generation_plans(sandbox_id TEXT NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,generation TEXT NOT NULL,json TEXT NOT NULL,PRIMARY KEY(sandbox_id,generation));")?;
+            tx.pragma_update(None, "user_version", 2)?;
             tx.commit()?;
         }
         db.execute_batch(
@@ -285,6 +294,38 @@ impl Catalog {
     }
     pub fn save_backup_manifest(&self, id: &ProjectId, manifest: &str) -> Result<()> {
         self.db()?.execute("INSERT INTO project_backups VALUES(?1,?2) ON CONFLICT(project_id) DO UPDATE SET manifest=excluded.manifest",params![id.as_str(),manifest])?;
+        Ok(())
+    }
+    pub fn generation_plan<T: DeserializeOwned>(
+        &self,
+        id: &SandboxId,
+        generation: &str,
+    ) -> Result<Option<T>> {
+        let json: Option<String> = self
+            .db()?
+            .query_row(
+                "SELECT json FROM generation_plans WHERE sandbox_id=?1 AND generation=?2",
+                params![id.as_str(), generation],
+                |r| r.get(0),
+            )
+            .optional()?;
+        json.map(|value| Ok(serde_json::from_str(&value)?))
+            .transpose()
+    }
+    pub fn save_generation_plan(
+        &self,
+        id: &SandboxId,
+        generation: &str,
+        value: &impl Serialize,
+    ) -> Result<()> {
+        self.db()?.execute("INSERT INTO generation_plans VALUES(?1,?2,?3) ON CONFLICT(sandbox_id,generation) DO UPDATE SET json=excluded.json",params![id.as_str(),generation,serde_json::to_string(value)?])?;
+        Ok(())
+    }
+    pub fn remove_generation_plan(&self, id: &SandboxId, generation: &str) -> Result<()> {
+        self.db()?.execute(
+            "DELETE FROM generation_plans WHERE sandbox_id=?1 AND generation=?2",
+            params![id.as_str(), generation],
+        )?;
         Ok(())
     }
     pub fn environment(

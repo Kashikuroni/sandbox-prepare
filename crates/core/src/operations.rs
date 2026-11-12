@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 use tokio::{runtime::Handle, sync::watch, task::JoinHandle};
+use tracing::Instrument;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug)]
@@ -32,6 +33,9 @@ pub struct Operation {
     status: Mutex<Status>,
 }
 impl Operation {
+    fn span(&self) -> tracing::Span {
+        tracing::info_span!("operation", project_id=self.scope.project.as_ref().map(|v|v.as_str()).unwrap_or(""),sandbox_id=self.scope.sandbox.as_ref().map(|v|v.as_str()).unwrap_or(""),operation_id=%self.id)
+    }
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::Release);
         self.cancel.send_replace(true);
@@ -107,7 +111,10 @@ impl Operations {
         let job = operation.clone();
         job.running();
         let execution_job = job.clone();
-        let execution = self.handle.spawn(async move { work(execution_job).await });
+        let span = execution_job.span();
+        let execution = self
+            .handle
+            .spawn(async move { work(execution_job).await }.instrument(span));
         let worker = self.handle.spawn(async move {
             let result = execution
                 .await
@@ -131,6 +138,9 @@ impl Operations {
         let operation = self.register(scope, name, flag)?;
         let job = operation.clone();
         let worker = thread::Builder::new().name(name.into()).spawn(move || {
+            let span = job.span();
+            let _entered = span.enter();
+            job.running();
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(job.clone())))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("Background worker panicked")));
@@ -159,6 +169,9 @@ impl Operations {
     }
     pub fn snapshot(&self) -> Vec<Arc<Operation>> {
         self.jobs.lock().unwrap().values().cloned().collect()
+    }
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
     }
     pub fn stop(&self) {
         let jobs = self.jobs.lock().unwrap();

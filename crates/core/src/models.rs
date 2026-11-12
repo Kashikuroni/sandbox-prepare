@@ -136,6 +136,10 @@ pub struct ComposeLaunchSpec {
     pub databases: BTreeMap<String, DatabaseId>,
     pub bindings: Vec<DatabaseBinding>,
     pub mounts: BTreeMap<String, MountRole>,
+    #[serde(default)]
+    pub mount_paths: BTreeMap<String, PathBuf>,
+    #[serde(default)]
+    pub private_external_resources: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -289,6 +289,15 @@ pub fn register_credentials(access: &str, secret: &str) {
         store.register_secret(secret);
     }
 }
+pub fn redact(value: &str) -> String {
+    let mut value = value.to_owned();
+    if let Some(store) = STORE.get() {
+        for secret in &lock(&store.state).secrets {
+            value = value.replace(secret, "[redacted]");
+        }
+    }
+    value
+}
 fn sensitive(name: &str) -> bool {
     let name = name.to_lowercase();
     [
@@ -336,13 +345,34 @@ impl Visit for Fields {
     }
 }
 struct AppLayer(Arc<LogStore>);
-impl<S: Subscriber> Layer<S> for AppLayer {
-    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+impl<S: Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>> Layer<S>
+    for AppLayer
+{
+    fn on_new_span(
+        &self,
+        attributes: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        context: Context<'_, S>,
+    ) {
+        let mut fields = Fields::default();
+        attributes.record(&mut fields);
+        if let Some(span) = context.span(id) {
+            span.extensions_mut().insert(fields.fields);
+        }
+    }
+    fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
         let meta = event.metadata();
         if !meta.target().starts_with("app::") {
             return;
         }
         let mut fields = Fields::default();
+        if let Some(scope) = context.event_scope(event) {
+            for span in scope.from_root() {
+                if let Some(values) = span.extensions().get::<BTreeMap<String, String>>() {
+                    fields.fields.extend(values.clone());
+                }
+            }
+        }
         event.record(&mut fields);
         self.0.append(
             meta.level().as_str(),

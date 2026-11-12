@@ -127,7 +127,16 @@ impl Store {
     }
     pub fn load(&self) -> Result<Saved> {
         if let Some((catalog, id, _)) = &self.scope {
-            return catalog.sandbox_state(id);
+            let saved: Saved = catalog.sandbox_state(id)?;
+            for instance in saved
+                .active
+                .iter()
+                .chain(saved.pending.iter())
+                .chain(saved.retired.iter())
+            {
+                self.validate(instance)?;
+            }
+            return Ok(saved);
         }
         let json: Option<String> = self
             .db()?

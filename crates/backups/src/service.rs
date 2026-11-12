@@ -90,6 +90,25 @@ impl Service {
         self.revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
+    pub fn configure_prefixes(
+        &self,
+        databases: std::collections::BTreeMap<
+            sandbox_core::models::DatabaseId,
+            sandbox_core::models::DatabaseSpec,
+        >,
+    ) -> Result<()> {
+        let mut project = self.project.lock().unwrap();
+        ensure!(
+            self.activity.load(Ordering::Acquire) == 0 && self.update.lock().unwrap().is_none(),
+            "Wait for current backup operations before changing prefixes"
+        );
+        let mut next = project.clone();
+        next.databases = databases;
+        self.catalog.save_project(&next)?;
+        *project = next;
+        self.revision.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
     fn scope(project: &Project) -> Scope {
         Scope {
             project: Some(project.id.clone()),
