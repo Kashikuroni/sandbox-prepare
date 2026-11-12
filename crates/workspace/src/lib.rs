@@ -11,7 +11,7 @@ mod context_bar;
 mod logs_view;
 mod projects_view;
 use sandbox_core::models::{ProjectId, SandboxId};
-use sandbox_ui::context_picker::ContextPicker;
+use sandbox_ui::{context_picker::ContextPicker, titlebar_style as titlebar};
 use std::collections::BTreeMap;
 mod sandboxes_view;
 mod settings_view;
@@ -540,14 +540,16 @@ impl Render for Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .h(px(34.))
+                    .h(px(titlebar::TITLEBAR_HEIGHT))
                     .flex_shrink_0()
-                    .px_2()
-                    .child(
-                        div()
-                            .w(px(if window.is_fullscreen() { 0. } else { 76. }))
-                            .flex_shrink_0(),
-                    )
+                    .pl(px(
+                        if window.is_fullscreen() || !cfg!(target_os = "macos") {
+                            8.
+                        } else {
+                            titlebar::TRAFFIC_LIGHT_PADDING
+                        },
+                    ))
+                    .pr(px(8.))
                     .child(self.render_context_bar(window))
                     .child(
                         div()
@@ -570,7 +572,7 @@ impl Render for Workspace {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .size(px(24.))
+                            .size(px(titlebar::BUTTON_HEIGHT))
                             .rounded_sm()
                             .cursor_pointer()
                             .hover(|el| el.bg(rgb(palette.element_hover)))
@@ -581,7 +583,7 @@ impl Render for Workspace {
                                     cx.stop_propagation();
                                 }
                             }))
-                            .child(Icon::Settings.render(palette.icon)),
+                            .child(Icon::Settings.render(palette.icon).size(px(14.))),
                     ),
             )
             .children(self.application.shutdown_status().error.map(|error| {
@@ -766,6 +768,7 @@ pub fn run() {
     Application::new()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
+            titlebar::register_font(cx).expect("Register bundled Zed UI font");
             text_input::bind_keys(cx);
             cx.set_menus(vec![gpui::Menu {
                 name: "Sandbox Prepare".into(),
@@ -808,6 +811,7 @@ pub fn run() {
                         titlebar: Some(TitlebarOptions {
                             title: Some("Sandbox Prepare".into()),
                             appears_transparent: true,
+                            traffic_light_position: Some(gpui::point(px(9.), px(9.))),
                             ..Default::default()
                         }),
                         ..Default::default()

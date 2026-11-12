@@ -801,12 +801,14 @@ impl Workspace {
         let available = (f32::from(window.viewport_size().width)
             - if window.is_fullscreen() { 100. } else { 180. })
         .max(220.);
+        let palette = self.settings.theme.palette(window.appearance());
         div()
             .flex()
             .items_center()
             .min_w_0()
-            .gap(px(2.))
-            .text_size(px(13.))
+            .gap(px(2.)) // Zed title_bar: gap_0p5
+            .font_family(sandbox_ui::titlebar_style::FONT_FAMILY)
+            .text_size(px(sandbox_ui::titlebar_style::LABEL_SIZE))
             .child(
                 div()
                     .max_w(px((available * 0.30).min(210.)))
@@ -814,22 +816,26 @@ impl Workspace {
             )
             .child(
                 div()
-                    .max_w(px((available * 0.19).min(135.)))
-                    .child(self.worktree_picker.clone()),
-            )
-            .child(
-                div()
-                    .text_color(rgb(self
-                        .settings
-                        .theme
-                        .palette(window.appearance())
-                        .text_muted))
-                    .child("/"),
-            )
-            .child(
-                div()
-                    .max_w(px((available * 0.23).min(170.)))
-                    .child(self.branch_picker.clone()),
+                    .flex()
+                    .items_center()
+                    .min_w_0()
+                    .gap(px(1.)) // Zed Git context: gap_px
+                    .child(
+                        div()
+                            .max_w(px((available * 0.19).min(135.)))
+                            .child(self.worktree_picker.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(palette.text_muted))
+                            .opacity(0.25)
+                            .child("/"),
+                    )
+                    .child(
+                        div()
+                            .max_w(px((available * 0.23).min(170.)))
+                            .child(self.branch_picker.clone()),
+                    ),
             )
             .child(
                 div()

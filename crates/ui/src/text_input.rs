@@ -933,6 +933,9 @@ impl Render for TextInput {
                 el.flex_col().size_full().min_h_0().font_family("Menlo")
             })
             .text_size(px(if self.plain_search { 13. } else { 14. }))
+            .when(self.plain_search, |el| {
+                el.font_family(crate::titlebar_style::FONT_FAMILY)
+            })
             .when(self.compact && !self.plain_search, |el| {
                 el.child(Icon::Search.render(palette.icon_muted).size(px(14.)))
             })

@@ -1,4 +1,5 @@
 //! Borderless titlebar pickers with grouped, searchable GPUI menus.
+use crate::titlebar_style as titlebar;
 use crate::{
     icons::Icon,
     text_input::{Edited, TextInput},
@@ -433,23 +434,26 @@ impl Render for ContextPicker {
         div()
             .relative()
             .min_w_0()
-            .text_size(px(13.))
-            .text_color(rgb(p.text))
+            .font_family(titlebar::FONT_FAMILY)
+            .text_size(px(titlebar::LABEL_SIZE))
+            .text_color(rgb(if self.icon.is_some() {
+                p.text_muted
+            } else {
+                p.text
+            }))
             .child(
                 div()
                     .id("context-trigger")
                     .track_focus(&self.focus)
-                    .h(px(24.))
-                    .px_1()
+                    .h(px(titlebar::BUTTON_HEIGHT))
+                    .px(px(titlebar::BUTTON_PADDING))
                     .flex()
                     .items_center()
-                    .gap(px(2.))
+                    .gap(px(titlebar::ICON_GAP))
                     .min_w_0()
                     .rounded_sm()
                     .cursor_pointer()
-                    .border_1()
-                    .border_color(transparent_black())
-                    .focus(|d| d.border_color(rgb(p.border_focused)))
+                    .focus(|d| d.bg(rgb(p.element_hover)))
                     .when(self.open, |d| {
                         d.bg(rgb(p.border_focused)).text_color(rgb(p.icon_accent))
                     })
@@ -468,7 +472,7 @@ impl Render for ContextPicker {
                             } else {
                                 p.icon_muted
                             })
-                            .size(px(12.)),
+                            .size(px(titlebar::ICON_SIZE)),
                         )
                     })
                     .child(div().min_w_0().truncate().child(self.label.clone())),
@@ -486,7 +490,7 @@ impl Render for ContextPicker {
                     div().absolute().top_0().left_0().child(
                         deferred(
                             anchored()
-                                .offset(point(px(0.), px(28.)))
+                                .offset(point(px(0.), px(titlebar::BUTTON_HEIGHT + 4.)))
                                 .snap_to_window_with_margin(px(8.))
                                 .child(menu),
                         )
