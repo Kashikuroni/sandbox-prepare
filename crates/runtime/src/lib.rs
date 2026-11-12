@@ -46,6 +46,7 @@ pub struct Runtime {
     shutdown_gate: Mutex<()>,
     source_gate: Mutex<()>,
 }
+pub mod launch;
 impl Runtime {
     pub fn open(handle: tokio::runtime::Handle, settings: &Settings) -> Result<Arc<Self>> {
         // Native previews use disposable data and no helper sharing the app bundle identity.
@@ -287,6 +288,15 @@ impl Runtime {
                 return Err(error);
             }
         }
+        if let Some(source) = &sandbox.source {
+            if let Some(profile) = self.catalog.launch_profile(&sandbox.project_id)? {
+                sandbox.compose = Some(sandbox_projects::launch_profile::resolve_paths(
+                    profile,
+                    &source.directory,
+                ));
+                self.catalog.save_sandbox(&sandbox)?;
+            }
+        }
         self.manager(&sandbox.id)?;
         Ok(sandbox)
     }
@@ -319,7 +329,7 @@ impl Runtime {
         );
         let mut sandbox = self.catalog.sandbox(id)?;
         sandbox.compose = Some(spec);
-        self.catalog.save_sandbox(&sandbox)
+        manager.save_configuration(|| self.catalog.save_sandbox(&sandbox))
     }
     fn watch_docker(self: &Arc<Self>) -> Result<()> {
         let runtime = Arc::downgrade(self);
@@ -570,6 +580,17 @@ mod tests {
             assert_eq!(same.id, ids[0]);
             assert_eq!(same.name, "dev");
         }
+        let mut selected = app.catalog.sandbox(&ids[0])?;
+        let profile = ComposeLaunchSpec {
+            files: vec!["compose.yml".into()],
+            automatic_connections: Some(sandbox_core::models::DatabaseNames {
+                mysql: "app".into(),
+                clickhouse: "analytics".into(),
+            }),
+            ..Default::default()
+        };
+        selected.compose = Some(profile.clone());
+        app.catalog.save_launch_profile(&selected, &profile)?;
         let isolated = app.open_working_copy(
             &project.id,
             SourceMode::ManagedWorktree {
@@ -579,6 +600,18 @@ mod tests {
             &AtomicBool::new(false),
         )?;
         assert_ne!(isolated.id, ids[0]);
+        assert_eq!(isolated.compose.as_ref().unwrap().files, profile.files);
+        assert_eq!(
+            isolated
+                .compose
+                .as_ref()
+                .unwrap()
+                .automatic_connections
+                .as_ref()
+                .unwrap()
+                .clickhouse,
+            "analytics"
+        );
         assert!(isolated.source.as_ref().unwrap().owned);
         let reopened = app.open_working_copy(
             &project.id,
@@ -706,7 +739,9 @@ mod docker_tests {
                 id: id.clone(),
                 project: format!("sp-{}-{}", &app.catalog.owner[..12], &id[..12]),
                 ports: [0; 3],
+                dynamic_ports: false,
                 backups: Default::default(),
+                backup_set: None,
                 created: String::new(),
                 tables: [0; 2],
             };

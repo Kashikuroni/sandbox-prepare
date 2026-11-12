@@ -128,7 +128,23 @@ pub enum MountRole {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DatabaseNames {
+    pub mysql: String,
+    pub clickhouse: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadinessProbe {
+    pub service: String,
+    pub port: u16,
+    /// HTTP path checked through this sandbox's published localhost port.
+    pub path: String,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ComposeLaunchSpec {
+    #[serde(default)]
+    pub automatic_connections: Option<DatabaseNames>,
+    #[serde(default)]
+    pub readiness_probe: Option<ReadinessProbe>,
     pub files: Vec<PathBuf>,
     pub profiles: Vec<String>,
     pub services: Vec<String>,

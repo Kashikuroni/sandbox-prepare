@@ -10,7 +10,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const VERSION: i64 = 3;
+const VERSION: i64 = 4;
 #[derive(Clone)]
 pub struct Catalog {
     pub database: PathBuf,
@@ -178,6 +178,12 @@ impl Catalog {
             tx.pragma_update(None, "user_version", 3)?;
             tx.commit()?;
         }
+        if version < 4 {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute_batch("CREATE TABLE project_launch_profiles(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,json TEXT NOT NULL);")?;
+            tx.pragma_update(None, "user_version", 4)?;
+            tx.commit()?;
+        }
         db.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
         )?;
@@ -335,6 +341,35 @@ impl Catalog {
         json.map(|json| Ok(serde_json::from_str(&json)?))
             .transpose()
     }
+    pub fn launch_profile(&self, project: &ProjectId) -> Result<Option<ComposeLaunchSpec>> {
+        self.read_json(
+            "SELECT json FROM project_launch_profiles WHERE project_id=?1",
+            project.as_str(),
+        )
+    }
+    /// Publish the edited sandbox settings and the portable project defaults together.
+    pub fn save_launch_profile(
+        &self,
+        sandbox: &Sandbox,
+        profile: &ComposeLaunchSpec,
+    ) -> Result<()> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure!(
+            tx.execute(
+                "UPDATE sandboxes SET json=?1 WHERE id=?2 AND project_id=?3",
+                params![
+                    serde_json::to_string(sandbox)?,
+                    sandbox.id.as_str(),
+                    sandbox.project_id.as_str()
+                ]
+            )? == 1,
+            "Sandbox was removed while saving its profile"
+        );
+        tx.execute("INSERT INTO project_launch_profiles VALUES(?1,?2) ON CONFLICT(project_id) DO UPDATE SET json=excluded.json",params![sandbox.project_id.as_str(),serde_json::to_string(profile)?])?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn backup_manifest(&self, id: &ProjectId) -> Result<Option<String>> {
         Ok(self
             .db()?
@@ -436,6 +471,52 @@ fn private(path: &Path, directory: bool) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn launch_profile_upgrade_preserves_data_and_profile_save_is_atomic() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sandbox-launch-profile-{}",
+            crate::docker::nonce()?
+        ));
+        let path = root.join("application.sqlite3");
+        let catalog = Catalog::open(path.clone())?;
+        let project = catalog.projects()?.remove(0);
+        let mut sandbox = catalog.create_sandbox(project.id.clone(), "Legacy".into())?;
+        let password = sandbox.password.clone();
+        let owner = catalog.owner.clone();
+        drop(catalog);
+        let db = Connection::open(&path)?;
+        db.execute_batch("DROP TABLE project_launch_profiles; PRAGMA user_version=3;")?;
+        drop(db);
+        let catalog = Catalog::open(path)?;
+        assert_eq!(catalog.owner, owner);
+        assert_eq!(catalog.sandbox(&sandbox.id)?.password, password);
+        assert!(catalog.launch_profile(&project.id)?.is_none());
+        let profile = ComposeLaunchSpec {
+            files: vec!["compose.yml".into()],
+            automatic_connections: Some(DatabaseNames {
+                mysql: "app".into(),
+                clickhouse: "analytics".into(),
+            }),
+            ..Default::default()
+        };
+        sandbox.compose = Some(profile.clone());
+        catalog.save_launch_profile(&sandbox, &profile)?;
+        assert_eq!(
+            catalog.launch_profile(&project.id)?.unwrap().files,
+            profile.files
+        );
+        sandbox.id = SandboxId::try_from("removed".to_owned()).unwrap();
+        let mut failed = profile.clone();
+        failed.files = vec!["other.yml".into()];
+        assert!(catalog.save_launch_profile(&sandbox, &failed).is_err());
+        assert_eq!(
+            catalog.launch_profile(&project.id)?.unwrap().files,
+            profile.files
+        );
+        drop(catalog);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
     fn directory_binding_refuses_new_duplicates_and_preserves_legacy_records() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
             "sandbox-directory-binding-{}",
@@ -523,7 +604,7 @@ mod tests {
         let owner = catalog.owner.clone();
         drop(catalog);
         let db = Connection::open(&path)?;
-        db.execute_batch("DROP TABLE project_open_history; PRAGMA user_version=2;")?;
+        db.execute_batch("DROP TABLE project_open_history; DROP TABLE project_launch_profiles; PRAGMA user_version=2;")?;
         drop(db);
         let catalog = Catalog::open(path)?;
         assert_eq!(catalog.owner, owner);

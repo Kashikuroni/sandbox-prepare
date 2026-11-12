@@ -23,6 +23,7 @@ pub struct Service {
     activity: Arc<AtomicUsize>,
     pub revision: AtomicU64,
     update: Mutex<Option<UpdateControl>>,
+    preparation: Mutex<()>,
 }
 struct Activity(Arc<AtomicUsize>);
 impl Drop for Activity {
@@ -52,6 +53,7 @@ impl Service {
             activity: Arc::new(AtomicUsize::new(0)),
             revision: AtomicU64::new(0),
             update: Mutex::new(None),
+            preparation: Mutex::new(()),
         }))
     }
     pub fn project(&self) -> Project {
@@ -113,6 +115,128 @@ impl Service {
         Scope {
             project: Some(project.id.clone()),
             ..Default::default()
+        }
+    }
+    /// Shared project cache: serialize preparation, reuse manual updates, cancel only our own download.
+    pub fn ensure_latest(
+        self: &Arc<Self>,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: impl Fn(String, Option<f32>) + Send + Sync + 'static,
+    ) -> Result<()> {
+        use std::{
+            sync::{TryLockError, mpsc},
+            time::Duration,
+        };
+        let check = || -> Result<()> {
+            ensure!(!cancel.load(Ordering::Acquire), "Cancelled");
+            Ok(())
+        };
+        progress("Checking current backups…".into(), None);
+        let _gate = loop {
+            check()?;
+            match self.preparation.try_lock() {
+                Ok(guard) => break guard,
+                Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(100)),
+                Err(TryLockError::Poisoned(_)) => {
+                    anyhow::bail!("Backup preparation lock was poisoned")
+                }
+            }
+        };
+        let (project, _activity) = self.reserve();
+        while self.update.lock().unwrap().is_some() {
+            check()?;
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let prefix = |engine| {
+            project
+                .databases
+                .values()
+                .find(|db| db.engine == engine)
+                .map(|db| db.prefix.clone())
+                .context("Backup source is not configured")
+        };
+        let ch = prefix(DatabaseEngine::ClickHouse)?;
+        let mysql = prefix(DatabaseEngine::MySql)?;
+        let remote=self.operations.handle().block_on(async {
+            let request=async {
+                let client=project.storage.client().await?;
+                let (ch,mysql)=tokio::try_join!(backups::latest_backup(&client,&project.storage.bucket,&ch),backups::latest_backup(&client,&project.storage.bucket,&mysql))?;
+                Ok::<_,anyhow::Error>([ch.context("No ClickHouse backup found")?,mysql.context("No MySQL backup found")?])
+            };
+            tokio::select!{result=request=>result,_=async{while !cancel.load(Ordering::Acquire){tokio::time::sleep(Duration::from_millis(100)).await;}}=>Err(anyhow::anyhow!("Cancelled"))}
+        })?;
+        let totals = [remote[0].size, remote[1].size];
+        let progress = Arc::new(progress);
+        loop {
+            check()?;
+            if self.cache.load()?.current(&project.storage, &remote) {
+                return Ok(());
+            }
+            if self.update.lock().unwrap().is_some() {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            let (send, receive) = mpsc::channel();
+            let notify = progress.clone();
+            let bytes = Arc::new([
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+            ]);
+            let download = self.download(
+                remote.clone(),
+                move |event| {
+                    let title = |index| if index == 0 { "ClickHouse" } else { "MySQL" };
+                    match event {
+                        Progress::Started(i) => {
+                            notify(format!("Downloading {} backup…", title(i)), None)
+                        }
+                        Progress::Bytes(i, count) => {
+                            bytes[i].store(count, Ordering::Relaxed);
+                            let done = bytes.iter().map(|n| n.load(Ordering::Relaxed)).sum::<u64>();
+                            let total = totals.iter().sum::<u64>();
+                            notify(
+                                "Downloading backups…".into(),
+                                (total > 0).then(|| (done as f32 / total as f32).min(1.)),
+                            );
+                        }
+                        Progress::Verifying(i) => {
+                            notify(format!("Verifying {} backup…", title(i)), None)
+                        }
+                        Progress::VerificationBytes(i, done, total) => notify(
+                            format!("Verifying {} backup…", title(i)),
+                            (total > 0).then(|| (done as f32 / total as f32).min(0.99)),
+                        ),
+                        Progress::Publishing => notify("Publishing verified backups…".into(), None),
+                        _ => {}
+                    }
+                },
+                move |result| {
+                    let _ = send.send(result);
+                },
+            );
+            let control = match download {
+                Ok(control) => control,
+                Err(error) => {
+                    if self.update.lock().unwrap().is_some() {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            loop {
+                if cancel.load(Ordering::Acquire) {
+                    control.cancel();
+                }
+                match receive.recv_timeout(Duration::from_millis(100)) {
+                    Ok(result) => {
+                        result.map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                        check()?;
+                        return Ok(());
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
         }
     }
     pub fn check_local(
@@ -226,5 +350,53 @@ fn outcome(result: &std::result::Result<Snapshot, DownloadError>) -> Result<()> 
         Ok(_) => Ok(()),
         Err(DownloadError::Cancelled) => Err(anyhow::anyhow!("Cancelled")),
         Err(DownloadError::Failed(error)) => Err(anyhow::anyhow!("{error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cancelling_a_waiting_preparation_does_not_cancel_another_cache_operation() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sandbox-waiting-backups-{}",
+            sandbox_platform::docker::nonce()?
+        ));
+        let executor = tokio::runtime::Runtime::new()?;
+        let operations = Operations::new(executor.handle().clone());
+        let catalog = Catalog::open(root.join("application.sqlite3"))?;
+        let project = catalog.projects()?.remove(0);
+        let service = Service::new(catalog, project.id, operations.clone())?;
+        let guard = service.preparation.lock().unwrap();
+        let foreign = UpdateControl::new();
+        *service.update.lock().unwrap() = Some(foreign.clone());
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (send, receive) = std::sync::mpsc::channel();
+        let result = std::thread::scope(|scope| {
+            let worker = service.clone();
+            let signal = cancel.clone();
+            let job = scope.spawn(move || {
+                worker.ensure_latest(&signal, move |_, _| {
+                    let _ = send.send(());
+                })
+            });
+            receive.recv().unwrap();
+            cancel.store(true, Ordering::Release);
+            job.join().unwrap()
+        });
+        assert!(result.is_err());
+        assert!(
+            foreign.cancel(),
+            "Waiting subscriber must not cancel the owner of a shared cache update"
+        );
+        drop(guard);
+        executor.block_on(operations.join());
+        drop(service);
+        fs_cleanup(root)?;
+        Ok(())
+    }
+    fn fs_cleanup(root: std::path::PathBuf) -> Result<()> {
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

@@ -14,7 +14,11 @@ pub struct Instance {
     pub id: String,
     pub project: String,
     pub ports: [u16; 3],
+    #[serde(default)]
+    pub dynamic_ports: bool,
     pub backups: [String; 2],
+    #[serde(default)]
+    pub backup_set: Option<String>,
     pub created: String,
     pub tables: [u64; 2],
 }

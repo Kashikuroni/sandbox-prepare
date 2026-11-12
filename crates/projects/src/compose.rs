@@ -26,6 +26,10 @@ pub struct Plan {
     pub environment: BTreeMap<String, String>,
     pub application_services: Vec<String>,
     pub managed_services: BTreeMap<String, String>,
+    #[serde(default)]
+    pub connection_databases: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default)]
+    pub readiness_probe: Option<ReadinessProbe>,
 }
 impl Plan {
     pub fn detach_backup(&mut self) -> Result<()> {
@@ -58,11 +62,15 @@ impl Plan {
         {
             mounts.retain(|mount| mount["target"] != "/backups/clickhouse.tar.zst");
         }
+        let connections = self.connection_databases.clone();
+        let probe = self.readiness_probe.clone();
         *self = protected(
             doc,
             self.application_services.clone(),
             self.managed_services.clone(),
         )?;
+        self.connection_databases = connections;
+        self.readiness_probe = probe;
         Ok(())
     }
 }
@@ -172,6 +180,72 @@ pub fn discover(directory: &Path, cancel: &AtomicBool) -> Result<Vec<Candidate>>
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(candidates)
 }
+pub(crate) fn included_services(
+    source: &serde_json::Map<String, Value>,
+    spec: &ComposeLaunchSpec,
+    managed_names: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let selected: Vec<String> = if spec.services.is_empty() {
+        source
+            .iter()
+            .filter(|(name, value)| {
+                !managed_names.contains(*name)
+                    && value["profiles"].as_array().is_none_or(|profiles| {
+                        profiles
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .any(|p| spec.profiles.iter().any(|selected| selected == p))
+                    })
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    } else {
+        spec.services
+            .iter()
+            .filter(|name| !managed_names.contains(*name))
+            .cloned()
+            .collect()
+    };
+    ensure!(
+        !selected.is_empty(),
+        "Choose application services or enable their Compose profiles"
+    );
+    let mut included = managed_names.clone();
+    let mut queue = selected.clone();
+    while let Some(name) = queue.pop() {
+        if !included.insert(name.clone()) {
+            continue;
+        }
+        let service = source
+            .get(&name)
+            .with_context(|| format!("Unknown Compose service: {name}"))?;
+        if let Some(depends) = service["depends_on"].as_object() {
+            queue.extend(depends.keys().cloned());
+        }
+        if let Some(depends) = service["depends_on"].as_array() {
+            queue.extend(depends.iter().filter_map(Value::as_str).map(str::to_owned));
+        }
+        for key in ["links", "volumes_from"] {
+            if let Some(values) = service[key].as_array() {
+                queue.extend(
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.split(':').next().unwrap_or(s).to_owned()),
+                );
+            }
+        }
+        for key in ["network_mode", "ipc", "pid"] {
+            if let Some(name) = service[key]
+                .as_str()
+                .and_then(|v| v.strip_prefix("service:"))
+            {
+                queue.push(name.into());
+            }
+        }
+    }
+    Ok(included)
+}
 pub fn service_names(document: &Value) -> Vec<String> {
     document["services"]
         .as_object()
@@ -243,7 +317,26 @@ pub fn build(
         .as_ref()
         .context("Choose the source checkout first")?
         .directory;
-    let global = catalog.environment(&project.id, "*")?;
+    let mut global = catalog.environment(&project.id, "*")?;
+    let imported_global = global.clone();
+    let automatic = spec.automatic_connections.as_ref().map(|names| {
+        let role = |kind: &'static str| {
+            spec.databases
+                .iter()
+                .find(|(_, id)| id.as_str() == kind)
+                .map(|(name, _)| name.as_str())
+                .unwrap_or(kind)
+        };
+        crate::launch_profile::environment(
+            names,
+            role("mysql"),
+            role("clickhouse"),
+            &sandbox.password,
+        )
+    });
+    if let Some(values) = &automatic {
+        global.extend(values.clone());
+    }
     register_secrets(&global);
     let mut document = inspect(directory, spec, &global, cancel, true)?;
     let source = document["services"]
@@ -265,71 +358,14 @@ pub fn build(
         roles.insert(role.into(), name);
     }
     let managed_names: BTreeSet<_> = roles.values().cloned().collect();
-    let selected: Vec<String> = if spec.services.is_empty() {
-        source
-            .iter()
-            .filter(|(name, value)| {
-                !managed_names.contains(*name)
-                    && value["profiles"].as_array().is_none_or(|profiles| {
-                        profiles
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .any(|p| spec.profiles.iter().any(|selected| selected == p))
-                    })
-            })
-            .map(|(name, _)| name.clone())
-            .collect()
-    } else {
-        spec.services
-            .iter()
-            .filter(|name| !managed_names.contains(*name))
-            .cloned()
-            .collect()
-    };
-    ensure!(
-        !selected.is_empty(),
-        "Choose application services or enable their Compose profiles"
-    );
-    let mut included = managed_names.clone();
-    let mut queue = selected.clone();
-    while let Some(name) = queue.pop() {
-        if !included.insert(name.clone()) {
-            continue;
-        }
-        let service = source
-            .get(&name)
-            .with_context(|| format!("Unknown Compose service: {name}"))?;
-        if let Some(depends) = service["depends_on"].as_object() {
-            queue.extend(depends.keys().cloned());
-        }
-        if let Some(depends) = service["depends_on"].as_array() {
-            queue.extend(depends.iter().filter_map(Value::as_str).map(str::to_owned));
-        }
-        for key in ["links", "volumes_from"] {
-            if let Some(values) = service[key].as_array() {
-                queue.extend(
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(|s| s.split(':').next().unwrap_or(s).to_owned()),
-                );
-            }
-        }
-        for key in ["network_mode", "ipc", "pid"] {
-            if let Some(name) = service[key]
-                .as_str()
-                .and_then(|v| v.strip_prefix("service:"))
-            {
-                queue.push(name.into());
-            }
-        }
-    }
+    let included = included_services(source, spec, &managed_names)?;
     source.retain(|name, _| included.contains(name));
     let applications: Vec<_> = source
         .keys()
         .filter(|name| !managed_names.contains(*name))
         .cloned()
         .collect();
+    let mut connection_databases = BTreeMap::<String, BTreeSet<String>>::new();
     let mut db_networks = BTreeMap::<String, BTreeSet<String>>::new();
     for name in &applications {
         let service = source.get_mut(name).unwrap();
@@ -395,7 +431,7 @@ pub fn build(
                 !global.is_empty() || !catalog.environment(&project.id, name)?.is_empty(),
                 "Import the env-file values for service {name} before launching"
             );
-            environment.extend(global.clone());
+            environment.extend(imported_global.clone());
         }
         environment.extend(catalog.environment(&project.id, name)?);
         if let Some(explicit) = object.get("environment").and_then(Value::as_object) {
@@ -408,6 +444,29 @@ pub fn build(
             }
         }
         object.remove("env_file");
+        if let Some(values) = &automatic {
+            let (mysql, ch) = crate::launch_profile::inject(&mut environment, values);
+            for (used, role, key) in [
+                (mysql, "mysql", "DB_NAME"),
+                (ch, "clickhouse", "CLICKHOUSE_DATABASE"),
+            ] {
+                if used {
+                    let name = values.get(key).context("Missing automatic database name")?;
+                    ensure!(!name.trim().is_empty(), "Set {key} in the project profile");
+                    connection_databases
+                        .entry(role.into())
+                        .or_default()
+                        .insert(name.clone());
+                    db_networks.entry(role.into()).or_default().extend(
+                        object
+                            .get("networks")
+                            .and_then(Value::as_object)
+                            .into_iter()
+                            .flat_map(|n| n.keys().cloned()),
+                    );
+                }
+            }
+        }
         register_secrets(&environment);
         object.insert("environment".into(), serde_json::to_value(environment)?);
         if let Some(mounts) = object.get_mut("volumes").and_then(Value::as_array_mut) {
@@ -435,7 +494,12 @@ pub fn build(
                 let path = if matches!(role, MountRole::Data) {
                     sandbox.root.join("application-data").join(hex_name(&key))
                 } else {
-                    spec.mount_paths.get(&key).cloned().unwrap_or(original)
+                    let path = spec.mount_paths.get(&key).cloned().unwrap_or(original);
+                    if path.is_relative() {
+                        directory.join(path)
+                    } else {
+                        path
+                    }
                 };
                 if matches!(role, MountRole::Data) {
                     fs::create_dir_all(&path)?;
@@ -456,6 +520,16 @@ pub fn build(
     }
     for binding in &spec.bindings {
         let role = binding.database.as_str();
+        if matches!(
+            binding.parameter,
+            DatabaseParameter::Database | DatabaseParameter::Url
+        ) && !binding.database_name.is_empty()
+        {
+            connection_databases
+                .entry(role.into())
+                .or_default()
+                .insert(binding.database_name.clone());
+        }
         let host = roles
             .get(role)
             .context("Binding refers to an unknown database")?;
@@ -577,7 +651,10 @@ pub fn build(
     document["name"] = managed["name"].clone();
     document["networks"] = Value::Object(networks);
     document["volumes"] = Value::Object(volumes);
-    protected(document, applications, roles)
+    let mut plan = protected(document, applications, roles)?;
+    plan.connection_databases = connection_databases;
+    plan.readiness_probe = spec.readiness_probe.clone();
+    Ok(plan)
 }
 fn hex_name(name: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -616,6 +693,8 @@ fn protected(
         environment,
         application_services,
         managed_services,
+        connection_databases: Default::default(),
+        readiness_probe: None,
     })
 }
 
@@ -767,6 +846,152 @@ mod integration {
         assert_eq!(fs::read(file)?, bytes);
         let second = catalog.create_sandbox(project.id.clone(), "Second".into())?;
         assert_ne!(sandbox.password, second.password);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod automatic_integration {
+    use super::*;
+    #[test]
+    #[ignore = "Requires Docker Compose CLI; inspects disposable files, starts no containers"]
+    fn project_profile_connects_api_and_workers_to_each_sandbox_and_preserves_source_files()
+    -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sandbox-auto-plan-{}",
+            sandbox_platform::docker::nonce()?
+        ));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        fs::create_dir_all(&root)?;
+        let _cleanup = Cleanup(root.clone());
+        let directory = root.join("project");
+        fs::create_dir_all(directory.join("src"))?;
+        let git = |args: &[&str]| -> Result<()> {
+            let result = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&directory)
+                .args(args)
+                .output()?;
+            ensure!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            Ok(())
+        };
+        git(&["init", "-b", "main"])?;
+        git(&["config", "user.name", "Fixture"])?;
+        git(&["config", "user.email", "fixture@example.invalid"])?;
+        git(&["config", "commit.gpgsign", "false"])?;
+        git(&["config", "core.hooksPath", "/dev/null"])?;
+        let document = json!({"services":{
+            "api":{"image":"alpine:3.21","env_file":["app.env"],"environment":{"DB_HOST":"production-explicit","TOKEN":"${TOKEN}"},"volumes":["./src:/code","./storage:/storage"],"networks":["app"]},
+            "worker":{"image":"alpine:3.21","env_file":["app.env"],"networks":["app"]},
+            "database":{"image":"mysql:8.4"},"analytics":{"image":"clickhouse/clickhouse-server:26.8"},"redis":{"image":"redis:7"}
+        },"networks":{"app":{}}});
+        let original = serde_json::to_vec_pretty(&document)?;
+        fs::write(directory.join("compose.json"), &original)?;
+        fs::write(directory.join("src/main.rs"), "fn main() {}")?;
+        git(&["add", "compose.json", "src/main.rs"])?;
+        git(&["commit", "-m", "fixture"])?;
+        let second = root.join("second");
+        git(&["worktree", "add", "-b", "second", second.to_str().unwrap()])?;
+        let catalog = Catalog::open(root.join("data/application.sqlite3"))?;
+        let project = catalog.create_project("Fixture".into(), None, Default::default())?;
+        catalog.save_environment(
+            &project.id,
+            "*",
+            &BTreeMap::from([
+                ("DB_NAME".into(), "app".into()),
+                ("DB_HOST".into(), "production".into()),
+                ("DB_PASSWORD".into(), "production-password".into()),
+                ("CLICKHOUSE_DATABASE".into(), "analytics".into()),
+                (
+                    "CLICKHOUSE_URL".into(),
+                    "https://production.invalid/analytics".into(),
+                ),
+                ("TOKEN".into(), "private $literal ${keep}".into()),
+            ]),
+        )?;
+        let cancel = AtomicBool::new(false);
+        let mut passwords = vec![];
+        for (index, working) in [directory.clone(), second.clone()].into_iter().enumerate() {
+            let mut sandbox =
+                catalog.create_sandbox(project.id.clone(), format!("Fixture {index}"))?;
+            sandbox.source = Some(SourceSelection {
+                directory: working.clone(),
+                owned: false,
+                revision: "fixture".into(),
+                mode: SourceMode::ExistingWorktree {
+                    directory: working.clone(),
+                },
+            });
+            let spec = crate::launch_profile::prepare(
+                &catalog,
+                &sandbox,
+                ComposeLaunchSpec {
+                    files: vec!["compose.json".into()],
+                    ..Default::default()
+                },
+                &cancel,
+            )?;
+            assert!(matches!(spec.mounts["api:/code"], MountRole::Source));
+            assert!(matches!(spec.mounts["api:/storage"], MountRole::Data));
+            assert_eq!(spec.automatic_connections.as_ref().unwrap().mysql, "app");
+            sandbox.compose = Some(spec);
+            let plan = build(
+                &catalog,
+                &project,
+                &sandbox,
+                &format!("generation-{index}"),
+                json!({"name":format!("sp-fixture-{index}"),"services":{"mysql":{"image":"mysql:8.4","labels":{"ru.mentormarketplace.sandbox-prepare.session":"fixture"}},"clickhouse":{"image":"clickhouse/clickhouse-server:26.8"}},"volumes":{}}),
+                &cancel,
+            )?;
+            assert!(!serde_json::to_string(&plan.document)?.contains(&sandbox.password));
+            let generated = working.join("generated.json");
+            fs::write(&generated, serde_json::to_vec(&plan.document)?)?;
+            let resolved = inspect(
+                &working,
+                &ComposeLaunchSpec {
+                    files: vec!["generated.json".into()],
+                    ..Default::default()
+                },
+                &plan.environment,
+                &cancel,
+                true,
+            )?;
+            for service in ["api", "worker"] {
+                let env = &resolved["services"][service]["environment"];
+                assert_eq!(env["DB_HOST"], "database");
+                assert_eq!(env["DB_NAME"], "app");
+                assert_eq!(env["DB_USER"], "sandbox");
+                assert_eq!(env["DB_PASSWORD"], sandbox.password);
+                assert_eq!(env["CLICKHOUSE_HOST"], "analytics");
+                assert_eq!(env["CLICKHOUSE_PORT"], "8123");
+                assert_eq!(env["CLICKHOUSE_URL"], "http://analytics:8123/analytics");
+                assert_eq!(env["CLICKHOUSE_PASSWORD"], sandbox.password);
+                assert_eq!(env["TOKEN"], "private $literal ${keep}");
+                assert!(
+                    resolved["services"]["database"]["networks"]
+                        .get("app")
+                        .is_some()
+                );
+            }
+            assert!(
+                resolved["services"]["redis"]["environment"]
+                    .get("DB_PASSWORD")
+                    .is_none()
+            );
+            assert_eq!(fs::read(working.join("compose.json"))?, original);
+            assert!(!working.join("app.env").exists());
+            passwords.push(sandbox.password);
+        }
+        assert_ne!(passwords[0], passwords[1]);
         Ok(())
     }
 }

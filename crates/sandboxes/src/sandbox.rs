@@ -15,7 +15,6 @@ use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    net::TcpListener,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -28,6 +27,7 @@ use std::{
 pub const MYSQL_IMAGE: &str = "percona/percona-server:8.4.11-11@sha256:95d276d7f2b2718b725ad834a4d8a6f9e855b9566e51be8a9ff98d54b675f644";
 pub const CH_IMAGE: &str = "clickhouse/clickhouse-server:26.8.19.9@sha256:3ddc359dd4c29921f1b926559344c14c7d98f024e1db9d9d02926e182426fba2";
 pub const XB_IMAGE: &str = "percona/percona-xtrabackup:8.4@sha256:3b8032f97ba8e5c184803d0b644a893e80a613a9ca7806eb386aa5fb313778ff";
+mod readiness;
 const OWNER_LABEL: &str = "ru.mentormarketplace.sandbox-prepare.owner";
 const SESSION_LABEL: &str = "ru.mentormarketplace.sandbox-prepare.session";
 const INSTANCE_LABEL: &str = "ru.mentormarketplace.sandbox-prepare.instance";
@@ -43,10 +43,15 @@ pub struct State {
     pub running: [bool; 2],
     pub docker_ready: bool,
     pub shutting_down: bool,
+    pub progress: Option<f32>,
+    pub application_running: bool,
+    pub application_ready: bool,
+    pub endpoints: Vec<String>,
 }
 #[derive(Clone, Copy)]
 pub enum Action {
     Refresh,
+    Run,
     Create,
     Start,
     Stop,
@@ -243,33 +248,106 @@ impl Manager {
         self.revision.fetch_add(1, Ordering::Release);
     }
     fn stage(&self, text: &str) {
-        self.change(|s| s.stage = text.into());
-        tracing::info!(target:"app::sandbox",stage=text,"Sandbox operation");
+        self.report(text.into(), None);
     }
+    pub fn report(&self, text: String, progress: Option<f32>) {
+        self.change(|s| {
+            s.stage = text.clone();
+            s.progress = progress;
+        });
+        tracing::debug!(target:"app::sandbox",stage=text,"Sandbox progress");
+    }
+    pub fn cancellation(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+    /// Missing containers can be recreated, but surviving database data must never be replaced implicitly.
+    pub fn has_database_data(&self) -> Result<bool> {
+        let Some(active) = self.store.load()?.active else {
+            return Ok(false);
+        };
+        let names = self
+            .docker
+            .output(&strings(&["volume", "ls", "--format", "{{.Name}}"]), SHORT)?;
+        let mut found = 0;
+        for index in 0..2 {
+            let name = self.store.volume(&active, index);
+            if !names.lines().any(|value| value == name) {
+                continue;
+            }
+            let output = self.docker.output(
+                &strings(&["volume", "inspect", "--format", "{{json .Labels}}", &name]),
+                SHORT,
+            )?;
+            let labels: Value = serde_json::from_str(&output)?;
+            ensure!(
+                labels[OWNER_LABEL] == self.store.owner && labels[INSTANCE_LABEL] == active.id,
+                "Refusing a foreign database volume"
+            );
+            found += 1;
+        }
+        ensure!(
+            found != 1,
+            "One database volume is missing. Use Update databases with confirmation to replace the remaining test data."
+        );
+        Ok(found == 2)
+    }
+    pub fn reconcile(&self) -> Result<()> {
+        self.refresh()
+    }
+
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
         self.stage("Cancelling…");
     }
+    /// Keep the short metadata commit atomic with respect to reserving a lifecycle operation.
+    pub fn save_configuration<T>(&self, save: impl FnOnce() -> Result<T>) -> Result<T> {
+        let state = self.state.lock().unwrap();
+        ensure!(
+            !state.busy && !self.shutdown.load(Ordering::Acquire),
+            "Wait for the current sandbox operation"
+        );
+        save()
+    }
     pub fn launch(self: &Arc<Self>, action: Action) {
+        let _ = self.launch_prepared(action, |_| Ok(()));
+    }
+    pub fn launch_prepared(
+        self: &Arc<Self>,
+        action: Action,
+        prepare: impl FnOnce(&Manager) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
         {
             let mut state = self.state.lock().unwrap();
-            if state.busy || self.shutdown.load(Ordering::Acquire) {
-                return;
-            }
+            ensure!(
+                !state.busy && !self.shutdown.load(Ordering::Acquire),
+                "Wait for the current sandbox operation"
+            );
             state.busy = true;
             state.error = None;
+            state.stage = "Preparing sandbox…".into();
+            state.progress = None;
         }
         self.cancel.store(false, Ordering::Release);
         self.revision.fetch_add(1, Ordering::Release);
         let manager = self.clone();
         let work = move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match action {
-                Action::Refresh => manager.refresh(),
-                Action::Create => manager.restore(),
-                Action::Start => manager.start(),
-                Action::Stop => manager.stop(),
-                Action::Delete => manager.delete(),
-                Action::Remove => manager.remove(),
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                prepare(&manager)?;
+                match action {
+                    Action::Run => {
+                        if manager.has_database_data()? {
+                            manager.start()
+                        } else {
+                            manager.restore()
+                        }
+                    }
+                    Action::Refresh => manager.refresh(),
+                    Action::Create => manager.restore(),
+                    Action::Start => manager.start(),
+                    Action::Stop => manager.stop(),
+                    Action::Delete => manager.delete(),
+                    Action::Remove => manager.remove(),
+                }
             }))
             .unwrap_or_else(|_| {
                 Err(anyhow::anyhow!(
@@ -286,9 +364,20 @@ impl Manager {
                 .map_err(|error| anyhow::anyhow!("{error:#}"));
             manager.change(|s| {
                 s.busy = false;
-                s.error = result.err().map(|e| format!("{e:#}"));
+                s.error = result
+                    .err()
+                    .map(|e| crate::logging::redact(&format!("{e:#}")));
+                s.progress = None;
                 if s.error.is_none() {
-                    s.stage = "Ready".into();
+                    s.stage = match action {
+                        Action::Stop => "Stopped",
+                        Action::Delete | Action::Remove => "Removed",
+                        _ if s.application_running && !s.application_ready => {
+                            "Running — readiness not confirmed"
+                        }
+                        _ => "Ready",
+                    }
+                    .into();
                 }
             });
             outcome
@@ -311,10 +400,12 @@ impl Manager {
                     state.busy = false;
                     state.error = Some(error.to_string());
                 });
+                return Err(error);
             }
         } else {
             thread::spawn(work);
         }
+        Ok(())
     }
     fn run(
         &self,
@@ -393,47 +484,13 @@ impl Manager {
         if plan.application_services.is_empty() {
             return Ok(());
         }
-        self.stage("Starting project services…");
+        self.validate_connection_databases(instance, &plan)?;
+        self.stage("Building and starting project services…");
         let mut args = strings(&["up", "-d", if build { "--build" } else { "--no-build" }]);
         args.extend(plan.application_services.clone());
         self.compose_command(instance, &args)?;
         self.follow(instance);
-        let started = Instant::now();
-        loop {
-            ensure!(!self.cancel.load(Ordering::Acquire), "Operation cancelled");
-            let mut ready = true;
-            for service in &plan.application_services {
-                let name = format!("{}-app-{service}", instance.project);
-                let output = self.docker.output(
-                    &strings(&["inspect", "--format", "{{json .State}}", &name]),
-                    SHORT,
-                )?;
-                let state: Value = serde_json::from_str(output.trim())?;
-                let status = state["Status"].as_str().unwrap_or("unknown");
-                ensure!(
-                    !matches!(status, "dead" | "exited") || state["ExitCode"] == 0,
-                    "Service {service} failed. See Processes for its log."
-                );
-                if status == "running" && state["Health"]["Status"] == "starting" {
-                    ready = false;
-                }
-                ensure!(
-                    state["Health"]["Status"] != "unhealthy",
-                    "Service {service} is unhealthy. See Processes."
-                );
-                if !matches!(status, "running" | "exited") {
-                    ready = false;
-                }
-            }
-            if ready {
-                return Ok(());
-            }
-            ensure!(
-                started.elapsed() < Duration::from_secs(180),
-                "Project services did not become ready"
-            );
-            thread::sleep(Duration::from_secs(1));
-        }
+        self.wait_for_application(instance, &plan)
     }
     fn owned_containers(&self) -> Result<Vec<String>> {
         if self.store.scope.is_some() {
@@ -502,7 +559,12 @@ impl Manager {
                     "A sandbox container is still running"
                 );
             }
-            self.change(|s| s.running = [false; 2]);
+            self.change(|s| {
+                s.running = [false; 2];
+                s.application_running = false;
+                s.application_ready = false;
+                s.endpoints.clear();
+            });
             return Ok(());
         }
         let running = self.docker.output(
@@ -518,7 +580,12 @@ impl Manager {
             running.trim().is_empty(),
             "Some sandbox containers are still running"
         );
-        self.change(|s| s.running = [false; 2]);
+        self.change(|s| {
+            s.running = [false; 2];
+            s.application_running = false;
+            s.application_ready = false;
+            s.endpoints.clear();
+        });
         Ok(())
     }
     fn refresh(&self) -> Result<()> {
@@ -551,8 +618,27 @@ impl Manager {
     }
     fn inspect_active(&self) -> Result<()> {
         if let Some(instance) = self.snapshot().active {
+            let existing = self.docker.output(
+                &strings(&[
+                    "ps",
+                    "-a",
+                    "--filter",
+                    &format!("label={OWNER_LABEL}={}", self.store.owner),
+                    "--filter",
+                    &format!("label={INSTANCE_LABEL}={}", instance.id),
+                    "--format",
+                    "{{.Names}}",
+                ]),
+                SHORT,
+            )?;
             let mut running = [false; 2];
             for (index, service) in ["mysql", "clickhouse"].into_iter().enumerate() {
+                if !existing
+                    .lines()
+                    .any(|name| name == self.store.container(&instance, service))
+                {
+                    continue;
+                }
                 let output = self.docker.output(
                     &strings(&[
                         "inspect",
@@ -607,8 +693,10 @@ impl Manager {
         let mut instance = Instance {
             id,
             project,
-            ports: [free_port(13306)?, free_port(18123)?, free_port(19000)?],
+            ports: [0; 3],
+            dynamic_ports: true,
             backups: std::array::from_fn(|i| lease.pair.records[i].key.clone()),
+            backup_set: Some(lease.pair.generation.clone()),
             created: chrono::Utc::now().to_rfc3339(),
             tables: [0; 2],
         };
@@ -697,6 +785,9 @@ impl Manager {
             )?;
             self.follow(&instance);
             self.wait_ready(&instance)?;
+            self.capture_ports(&mut instance)?;
+            saved.pending = Some(instance.clone());
+            self.store.save(&saved)?;
             if let Some(old) = &saved.active {
                 self.stop_application(old)?;
             }
@@ -748,6 +839,36 @@ impl Manager {
             .retired
             .retain(|old| self.remove_instance(old).is_err());
         self.store.save(&saved)?;
+        Ok(())
+    }
+    fn capture_ports(&self, instance: &mut Instance) -> Result<()> {
+        if !instance.dynamic_ports {
+            return Ok(());
+        }
+        for (index, service, port) in [
+            (0, "mysql", "3306/tcp"),
+            (1, "clickhouse", "8123/tcp"),
+            (2, "clickhouse", "9000/tcp"),
+        ] {
+            let output = self.docker.output(
+                &strings(&[
+                    "inspect",
+                    "--format",
+                    "{{json .NetworkSettings.Ports}}",
+                    &self.store.container(instance, service),
+                ]),
+                SHORT,
+            )?;
+            let ports: Value = serde_json::from_str(&output)?;
+            let assigned = ports[port]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|binding| binding["HostPort"].as_str()?.parse::<u16>().ok())
+                .find(|port| *port > 0)
+                .context("Docker did not publish a database port")?;
+            instance.ports[index] = assigned;
+        }
         Ok(())
     }
     fn probe_args(&self, instance: &Instance, flag: &str) -> Vec<String> {
@@ -919,7 +1040,7 @@ impl Manager {
         Ok([mysql, ch])
     }
     fn start(&self) -> Result<()> {
-        let instance = self.snapshot().active.context("Create a sandbox first")?;
+        let mut instance = self.snapshot().active.context("Create a sandbox first")?;
         self.stage("Starting databases…");
         self.write_config(&instance, None)?;
         self.compose(
@@ -939,6 +1060,18 @@ impl Manager {
             let _ = self.stop_all();
             return Err(error);
         }
+        self.capture_ports(&mut instance)?;
+        let mut saved = self.store.load()?;
+        ensure!(
+            saved
+                .active
+                .as_ref()
+                .is_some_and(|active| active.id == instance.id),
+            "Active sandbox generation changed"
+        );
+        saved.active = Some(instance.clone());
+        self.store.save(&saved)?;
+        self.change(|s| s.active = Some(instance.clone()));
         if let Err(error) = self.start_application(&instance, true) {
             let _ = self.stop_all();
             return Err(error);
@@ -1285,20 +1418,14 @@ impl Manager {
         )?;
         let base = compose_definition(&self.store, instance, archive, &self.session)?;
         let compose = if let Some((catalog, id, project)) = &self.store.scope {
-            let mut plan = if let Some(plan) =
-                catalog.generation_plan::<sandbox_projects::compose::Plan>(id, &instance.id)?
-            {
-                plan
-            } else {
-                sandbox_projects::compose::build(
-                    catalog,
-                    &catalog.project(project)?,
-                    &catalog.sandbox(id)?,
-                    &instance.id,
-                    base,
-                    &self.cancel,
-                )?
-            };
+            let mut plan = sandbox_projects::compose::build(
+                catalog,
+                &catalog.project(project)?,
+                &catalog.sandbox(id)?,
+                &instance.id,
+                base,
+                &self.cancel,
+            )?;
             if archive.is_none() {
                 plan.detach_backup()?;
             }
@@ -1316,9 +1443,10 @@ impl Manager {
         Ok(())
     }
 }
+#[cfg(test)]
 fn free_port(preferred: u16) -> Result<u16> {
-    Ok(TcpListener::bind(("127.0.0.1", preferred))
-        .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))?
+    Ok(std::net::TcpListener::bind(("127.0.0.1", preferred))
+        .or_else(|_| std::net::TcpListener::bind(("127.0.0.1", 0)))?
         .local_addr()?
         .port())
 }
@@ -1347,9 +1475,14 @@ fn compose_definition(
     if let Some(path) = archive {
         ch_mounts.push(json!({"type":"bind","source":path.display().to_string().replace('$',"$$"),"target":"/backups/clickhouse.tar.zst","read_only":true}));
     }
+    let ports = if instance.dynamic_ports {
+        [0; 3]
+    } else {
+        instance.ports
+    };
     Ok(json!({"name":instance.project,"services":{
-        "mysql":{"image":MYSQL_IMAGE,"container_name":store.container(instance,"mysql"),"user":"0:0","entrypoint":["/bin/bash","/run/sandbox/mysql-entry.sh"],"restart":"no","labels":labels,"mem_limit":"2g","stop_grace_period":"20s","ports":[format!("127.0.0.1:{}:3306",instance.ports[0])],"volumes":[bind,{"type":"volume","source":"mysql-data","target":"/var/lib/mysql"}],"logging":{"driver":"json-file","options":{"max-size":"10m","max-file":"3"}}},
-        "clickhouse":{"image":CH_IMAGE,"container_name":store.container(instance,"clickhouse"),"user":"0:0","entrypoint":["/bin/bash","/run/sandbox/ch-entry.sh"],"restart":"no","labels":labels,"mem_limit":"3g","stop_grace_period":"20s","ports":[format!("127.0.0.1:{}:8123",instance.ports[1]),format!("127.0.0.1:{}:9000",instance.ports[2])],"volumes":ch_mounts,"logging":{"driver":"json-file","options":{"max-size":"10m","max-file":"3"}}}
+        "mysql":{"image":MYSQL_IMAGE,"container_name":store.container(instance,"mysql"),"user":"0:0","entrypoint":["/bin/bash","/run/sandbox/mysql-entry.sh"],"restart":"no","labels":labels,"mem_limit":"2g","stop_grace_period":"20s","ports":[format!("127.0.0.1:{}:3306",ports[0])],"volumes":[bind,{"type":"volume","source":"mysql-data","target":"/var/lib/mysql"}],"logging":{"driver":"json-file","options":{"max-size":"10m","max-file":"3"}}},
+        "clickhouse":{"image":CH_IMAGE,"container_name":store.container(instance,"clickhouse"),"user":"0:0","entrypoint":["/bin/bash","/run/sandbox/ch-entry.sh"],"restart":"no","labels":labels,"mem_limit":"3g","stop_grace_period":"20s","ports":[format!("127.0.0.1:{}:8123",ports[1]),format!("127.0.0.1:{}:9000",ports[2])],"volumes":ch_mounts,"logging":{"driver":"json-file","options":{"max-size":"10m","max-file":"3"}}}
     },"volumes":{"mysql-data":{"name":store.volume(instance,0),"labels":labels},"clickhouse-data":{"name":store.volume(instance,1),"labels":labels}},"networks":{"default":{"labels":labels}}}))
 }
 struct CountedReader<R> {

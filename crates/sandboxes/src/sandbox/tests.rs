@@ -23,7 +23,9 @@ fn instance(manager: &Manager) -> Result<Instance> {
         project: format!("sp-{}-{}", &manager.store.owner[..12], &id[..12]),
         id,
         ports: [free_port(0)?, free_port(0)?, free_port(0)?],
+        dynamic_ports: false,
         backups: ["ch/test".into(), "mysql/test".into()],
+        backup_set: None,
         created: chrono::Utc::now().to_rfc3339(),
         tables: [0; 2],
     })
@@ -38,7 +40,9 @@ fn compose_is_pinned_separated_labelled_and_contains_no_credentials() -> Result<
         id: id.clone(),
         project: format!("sp-{}-{}", &store.owner[..12], &id[..12]),
         ports: [13306, 18123, 19000],
+        dynamic_ports: false,
         backups: ["ch/x".into(), "mysql/x".into()],
+        backup_set: None,
         created: String::new(),
         tables: [0; 2],
     };
@@ -414,8 +418,8 @@ fn watchdog_stops_only_its_session_when_parent_pipe_closes() -> Result<()> {
 #[ignore = "Restores two scoped sandboxes concurrently from disposable physical backups"]
 fn two_sandboxes_share_archives_but_not_databases_or_project_processes() -> Result<()> {
     use sandbox_core::models::{
-        ComposeLaunchSpec, DatabaseBinding, DatabaseId, DatabaseParameter, SourceMode,
-        SourceSelection,
+        ComposeLaunchSpec, DatabaseBinding, DatabaseId, DatabaseNames, DatabaseParameter,
+        SourceMode, SourceSelection,
     };
     let (fixture, root) = fixture()?;
     let source = instance(&fixture)?;
@@ -437,16 +441,19 @@ fn two_sandboxes_share_archives_but_not_databases_or_project_processes() -> Resu
     fs::write(
         directory.join("compose.json"),
         serde_json::to_vec(
-            &json!({"services":{"api":{"image":MYSQL_IMAGE,"entrypoint":["/bin/bash","-c"],"command":["echo project-started; exec sleep 600"],"depends_on":{"db":{"condition":"service_healthy"}},"volumes":["app-data:/app-data"]},"db":{"image":MYSQL_IMAGE}},"volumes":{"app-data":{}}}),
+            &json!({"services":{"api":{"image":MYSQL_IMAGE,"entrypoint":["/bin/bash","-c"],"command":["echo project-started; exec sleep 600"],"environment":{"DB_HOST":"production","CLICKHOUSE_URL":"http://production/fixture"},"healthcheck":{"test":["CMD-SHELL","test $${DB_HOST} = db && test $${DB_NAME} = fixture && test $${DB_USER} = sandbox && test $${CLICKHOUSE_HOST} = clickhouse && test $${#DB_PASSWORD} -gt 0"],"interval":"1s","timeout":"3s","retries":30},"depends_on":{"db":{"condition":"service_healthy"}},"volumes":["app-data:/app-data"]},"db":{"image":MYSQL_IMAGE}},"volumes":{"app-data":{}}}),
         )?,
     )?;
     let mut managers = vec![];
     let mut cleanup = vec![];
     for index in 0..2 {
+        let working = root.join(format!("project-{index}"));
+        fs::create_dir_all(&working)?;
+        fs::copy(directory.join("compose.json"), working.join("compose.json"))?;
         let mut sandbox =
             catalog.create_sandbox(project.id.clone(), format!("Parallel {index}"))?;
         sandbox.source = Some(SourceSelection {
-            directory: directory.clone(),
+            directory: working,
             mode: SourceMode::CurrentCheckout,
             owned: false,
             revision: "fixture".into(),
@@ -454,6 +461,10 @@ fn two_sandboxes_share_archives_but_not_databases_or_project_processes() -> Resu
         let mut spec = ComposeLaunchSpec {
             files: vec!["compose.json".into()],
             services: vec!["api".into()],
+            automatic_connections: Some(DatabaseNames {
+                mysql: "fixture".into(),
+                clickhouse: "fixture".into(),
+            }),
             ..Default::default()
         };
         spec.databases.insert(
@@ -502,6 +513,21 @@ fn two_sandboxes_share_archives_but_not_databases_or_project_processes() -> Resu
     assert_ne!(first.ports, second.ports);
     assert_ne!(managers[0].store.password, managers[1].store.password);
     managers[0].sql(&first, true, "INSERT INTO fixture.numbers VALUES (99);")?;
+    assert!(managers.iter().all(|m| m.snapshot().application_ready));
+    managers[0].launch(Action::Run);
+    wait(&managers[0], Duration::from_secs(180))?;
+    assert_eq!(managers[0].snapshot().active.as_ref().unwrap().id, first.id);
+    assert_eq!(
+        managers[0].snapshot().active.as_ref().unwrap().backup_set,
+        first.backup_set
+    );
+    assert_eq!(
+        managers[0]
+            .sql(&first, true, "SELECT COUNT(*) FROM fixture.numbers;")?
+            .trim(),
+        "4"
+    );
+
     assert_eq!(
         managers[1]
             .sql(&second, true, "SELECT COUNT(*) FROM fixture.numbers;")?
@@ -553,6 +579,33 @@ fn two_sandboxes_share_archives_but_not_databases_or_project_processes() -> Resu
             )?
             .trim(),
         "true"
+    );
+    // Removing containers must recreate processes without replacing surviving volumes.
+    let mut remove = strings(&["rm", "-f"]);
+    remove.extend(managers[0].owned_containers()?);
+    managers[0].docker.output(&remove, SHORT)?;
+    assert!(managers[0].has_database_data()?);
+    managers[0].launch(Action::Run);
+    wait(&managers[0], Duration::from_secs(120))?;
+    let restarted = managers[0].snapshot().active.unwrap();
+    assert_eq!(restarted.id, first.id);
+    assert_eq!(
+        managers[0]
+            .sql(&restarted, true, "SELECT COUNT(*) FROM fixture.numbers;")?
+            .trim(),
+        "4"
+    );
+    managers[0].stop()?;
+    let mut remove = strings(&["rm", "-f"]);
+    remove.extend(managers[0].owned_containers()?);
+    managers[0].docker.output(&remove, SHORT)?;
+    managers[0].docker.output(
+        &strings(&["volume", "rm", &managers[0].store.volume(&restarted, 0)]),
+        SHORT,
+    )?;
+    assert!(
+        managers[0].has_database_data().is_err(),
+        "Partial data loss must require explicit replacement"
     );
     operations.stop();
     executor.block_on(operations.join());
