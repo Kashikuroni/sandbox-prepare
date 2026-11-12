@@ -1,11 +1,16 @@
 //! Owns only this installation's labelled Docker resources. Restores publish a pair.
 use crate::{
-    backup_cache::{Cache, FILES},
+    backup_cache::FILES,
     docker::{Docker, strings},
     process_log::ProcessLog,
     sandbox_store::{Instance, Store, service_file},
 };
 use anyhow::{Context, Result, ensure};
+use sandbox_core::{
+    models::{Sandbox, Scope},
+    operations::{Operations, RestoreLimit},
+};
+use sandbox_platform::catalog::Catalog;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},
@@ -47,9 +52,35 @@ pub enum Action {
     Stop,
     Delete,
 }
-struct Watchdog {
+pub struct Watchdog {
     input: Option<ChildStdin>,
     child: Child,
+}
+impl Watchdog {
+    pub fn arm(owner: &str, docker: &Docker, session: &str) -> Result<Self> {
+        let mut child = Command::new(std::env::current_exe()?)
+            .args([
+                std::ffi::OsStr::new("--sandbox-watchdog"),
+                std::ffi::OsStr::new(owner),
+                docker.binary.as_os_str(),
+                std::ffi::OsStr::new(session),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Could not start sandbox lifecycle watchdog")?;
+        Ok(Self {
+            input: child.stdin.take(),
+            child,
+        })
+    }
+    pub fn disarm(mut self) {
+        if let Some(mut input) = self.input.take() {
+            let _ = input.write_all(b"clean");
+        }
+        let _ = self.child.wait();
+    }
 }
 pub struct Manager {
     pub store: Store,
@@ -65,8 +96,63 @@ pub struct Manager {
     followers: Mutex<Vec<(Arc<AtomicBool>, thread::JoinHandle<()>)>>,
     watchdog: Mutex<Option<Watchdog>>,
     _lock: File,
+    operations: Option<Arc<Operations>>,
+    limit: Arc<RestoreLimit>,
+    scope: Scope,
 }
 impl Manager {
+    pub fn scoped(
+        catalog: Catalog,
+        sandbox: Sandbox,
+        operations: Arc<Operations>,
+        limit: Arc<RestoreLimit>,
+        session: String,
+    ) -> Result<Arc<Self>> {
+        let scope = Scope {
+            project: Some(sandbox.project_id.clone()),
+            sandbox: Some(sandbox.id.clone()),
+            operation: None,
+        };
+        let locks = catalog.root.join("sandboxes/.locks");
+        fs::create_dir_all(&locks)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(locks.join(format!("{}.lock", sandbox.id)))?;
+        lock.try_lock()
+            .context("Sandbox is already managed by another controller")?;
+        let store = Store::scoped(catalog, sandbox)?;
+        let active = store.load()?.active;
+        let logs = Arc::new(ProcessLog::new(
+            store.root.join("process-logs"),
+            vec![store.password.clone(), store.root_password.clone()],
+        ));
+        let manager = Arc::new(Self {
+            store,
+            logs,
+            revision: AtomicU64::new(1),
+            extracted_bytes: Arc::new(AtomicU64::new(0)),
+            docker: Docker::discover(),
+            state: Mutex::new(State {
+                active,
+                ..Default::default()
+            }),
+            cancel: Arc::new(AtomicBool::new(false)),
+            session,
+            reconciled: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            followers: Mutex::new(vec![]),
+            watchdog: Mutex::new(None),
+            _lock: lock,
+            operations: Some(operations),
+            limit,
+            scope,
+        });
+        manager.launch(Action::Refresh);
+        Ok(manager)
+    }
     pub fn open() -> Result<Arc<Self>> {
         Self::at(crate::database::database_path()?, true)
     }
@@ -102,6 +188,9 @@ impl Manager {
             followers: Mutex::new(vec![]),
             watchdog: Mutex::new(None),
             _lock: lock,
+            operations: None,
+            limit: RestoreLimit::new(2),
+            scope: Scope::default(),
         });
         if watchdog {
             manager.arm_watchdog()?;
@@ -136,7 +225,7 @@ impl Manager {
         self.cancel.store(false, Ordering::Release);
         self.revision.fetch_add(1, Ordering::Release);
         let manager = self.clone();
-        thread::spawn(move || {
+        let work = move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match action {
                 Action::Refresh => manager.refresh(),
                 Action::Create => manager.restore(),
@@ -153,6 +242,10 @@ impl Manager {
                 manager.logs.append("Lifecycle", format!("{error:#}"));
                 tracing::error!(target:"app::sandbox",%error,"Sandbox operation failed");
             }
+            let outcome = result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| anyhow::anyhow!("{error:#}"));
             manager.change(|s| {
                 s.busy = false;
                 s.error = result.err().map(|e| format!("{e:#}"));
@@ -160,7 +253,26 @@ impl Manager {
                     s.stage = "Ready".into();
                 }
             });
-        });
+            outcome
+        };
+        if let Some(operations) = &self.operations {
+            if let Err(error) = operations.spawn_blocking(
+                self.scope.clone(),
+                "Sandbox operation",
+                self.cancel.clone(),
+                move |job| {
+                    job.running();
+                    work()
+                },
+            ) {
+                self.change(|state| {
+                    state.busy = false;
+                    state.error = Some(error.to_string());
+                });
+            }
+        } else {
+            thread::spawn(work);
+        }
     }
     fn run(
         &self,
@@ -188,6 +300,38 @@ impl Manager {
         self.run(&command, None, "Compose", LONG)
     }
     fn owned_containers(&self) -> Result<Vec<String>> {
+        if self.store.scope.is_some() {
+            let saved = self.store.load()?;
+            let mut ids = Vec::new();
+            for instance in saved
+                .active
+                .iter()
+                .chain(saved.pending.iter())
+                .chain(saved.retired.iter())
+            {
+                self.store.validate(instance)?;
+                let output = self.docker.output(
+                    &strings(&[
+                        "ps",
+                        "-aq",
+                        "--filter",
+                        &format!("label={OWNER_LABEL}={}", self.store.owner),
+                        "--filter",
+                        &format!("label={INSTANCE_LABEL}={}", instance.id),
+                    ]),
+                    SHORT,
+                )?;
+                ids.extend(
+                    output
+                        .lines()
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_owned),
+                );
+            }
+            ids.sort();
+            ids.dedup();
+            return Ok(ids);
+        }
         let output = self.docker.output(
             &strings(&[
                 "ps",
@@ -210,6 +354,20 @@ impl Manager {
             let mut args = strings(&["stop", "--timeout", "15"]);
             args.extend(ids);
             self.docker.output(&args, Duration::from_secs(45))?;
+        }
+        if self.store.scope.is_some() {
+            for id in self.owned_containers()? {
+                let status = self.docker.output(
+                    &strings(&["inspect", "--format", "{{.State.Running}}", &id]),
+                    SHORT,
+                )?;
+                ensure!(
+                    status.trim() != "true",
+                    "A sandbox container is still running"
+                );
+            }
+            self.change(|s| s.running = [false; 2]);
+            return Ok(());
         }
         let running = self.docker.output(
             &strings(&[
@@ -293,7 +451,9 @@ impl Manager {
     }
     fn restore(&self) -> Result<()> {
         self.stage("Checking local backups…");
-        let lease = Cache::for_database(self.store.database.clone())?.lease()?;
+        let lease = self.store.cache()?.lease()?;
+        self.stage("Waiting for a restore slot…");
+        let _permit = self.limit.acquire(&self.cancel)?;
         self.docker.check()?;
         self.pull()?;
         let mut saved = self.store.load()?;
@@ -768,28 +928,16 @@ impl Manager {
         Ok(())
     }
     fn arm_watchdog(&self) -> Result<()> {
-        let mut child = Command::new(std::env::current_exe()?)
-            .arg("--sandbox-watchdog")
-            .arg(&self.store.owner)
-            .arg(&self.docker.binary)
-            .arg(&self.session)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("Could not start sandbox lifecycle watchdog")?;
-        *self.watchdog.lock().unwrap() = Some(Watchdog {
-            input: child.stdin.take(),
-            child,
-        });
+        *self.watchdog.lock().unwrap() = Some(Watchdog::arm(
+            &self.store.owner,
+            &self.docker,
+            &self.session,
+        )?);
         Ok(())
     }
     fn disarm_watchdog(&self) {
-        if let Some(mut watchdog) = self.watchdog.lock().unwrap().take() {
-            if let Some(mut input) = watchdog.input.take() {
-                let _ = input.write_all(b"clean");
-            }
-            let _ = watchdog.child.wait();
+        if let Some(watchdog) = self.watchdog.lock().unwrap().take() {
+            watchdog.disarm();
         }
     }
     fn write_config(&self, instance: &Instance, archive: Option<&std::path::Path>) -> Result<()> {

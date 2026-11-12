@@ -124,10 +124,10 @@ All / MySQL / ClickHouse / Restore, пауза просмотра и вирту�
 в памяти и ротация используют настройки Logging. Пароли маскируются перед записью.
 Это отдельный источник от правой панели логов самого приложения.
 
-Проверки: `cargo test --offline`. Docker-тесты запускаются явно:
-`cargo test --offline sandbox::tests::docker_restores -- --ignored --nocapture`
+Проверки: `cargo test --workspace --offline`. Docker-тесты запускаются явно:
+`cargo test -p sandbox_sandboxes --offline sandbox::tests::docker_restores -- --ignored --nocapture`
 и после сборки приложения
-`cargo test --offline watchdog_stops_only -- --ignored --nocapture`.
+`cargo test -p sandbox_sandboxes --offline watchdog_stops_only -- --ignored --nocapture`.
 Они используют только собственные случайно именованные тестовые ресурсы.
 
 ## Логи приложения

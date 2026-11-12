@@ -1,4 +1,5 @@
 use super::*;
+use crate::backup_cache::Cache;
 use crate::{archive_check, backup_cache::Record, sandbox_store::valid_id};
 use rusqlite::{Connection, params};
 

@@ -4,3 +4,4 @@ pub use sandbox_telemetry::logging;
 pub mod archive_check;
 pub mod backup_cache;
 pub mod backups;
+pub mod service;

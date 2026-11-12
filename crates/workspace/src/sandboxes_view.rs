@@ -37,15 +37,18 @@ pub struct SandboxesView {
     copied: bool,
 }
 impl SandboxesView {
-    pub fn new(settings: &crate::settings::Settings, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        manager: Option<Arc<Manager>>,
+        settings: &crate::settings::Settings,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let theme = settings.theme;
-        let manager = Manager::open();
-        if let Ok(manager) = &manager {
+        if let Some(manager) = &manager {
             manager
                 .logs
                 .configure(settings.current_log_limit, settings.logging);
         }
-        let error = manager.as_ref().err().map(|e| format!("{e:#}"));
+        let error = None;
         cx.spawn(async move |view, cx| {
             loop {
                 gpui::Timer::after(Duration::from_millis(200)).await;
@@ -56,10 +59,6 @@ impl SandboxesView {
                         };
                         let revision = manager.revision.load(Ordering::Acquire);
                         let logs = manager.logs.revision.load(Ordering::Acquire);
-                        if view.exit_requested && manager.exit_ready() {
-                            cx.quit();
-                            return;
-                        }
                         if revision != view.revision || (!view.paused && logs != view.log_revision)
                         {
                             view.revision = revision;
@@ -77,7 +76,7 @@ impl SandboxesView {
         })
         .detach();
         Self {
-            manager: manager.ok(),
+            manager,
             error,
             theme,
             processes: false,
@@ -110,24 +109,9 @@ impl SandboxesView {
         self.processes = show;
         cx.notify();
     }
-    pub fn request_exit(&mut self, cx: &mut Context<Self>) {
-        self.exit_requested = true;
-        if let Some(manager) = &self.manager {
-            manager.begin_shutdown();
-        } else {
-            cx.quit();
-        }
+    pub fn set_stopping(&mut self, stopping: bool, cx: &mut Context<Self>) {
+        self.exit_requested = stopping;
         cx.notify();
-    }
-    pub fn may_close(&self) -> bool {
-        self.exit_requested && self.manager.as_ref().is_none_or(|m| m.exit_ready())
-    }
-    pub fn shutdown_fallback(&self) {
-        if let Some(manager) = &self.manager
-            && let Err(error) = manager.shutdown_blocking()
-        {
-            tracing::error!(target:"app::sandbox",%error,"Shutdown cleanup failed; watchdog will retry");
-        }
     }
     fn refresh_lines(&mut self) {
         let Some(manager) = &self.manager else {

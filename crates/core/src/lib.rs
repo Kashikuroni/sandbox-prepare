@@ -1,6 +1,9 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+pub mod models;
+pub mod operations;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeMode {

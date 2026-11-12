@@ -17,3 +17,5 @@ sandbox_platform.workspace = true
 sandbox_telemetry.workspace = true
 sandbox_backups.workspace = true
 sandbox_sandboxes.workspace = true
+sandbox_runtime.workspace = true
+sandbox_core.workspace = true

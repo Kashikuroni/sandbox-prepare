@@ -1,10 +1,12 @@
 pub use sandbox_backups::{backup_cache, backups};
 pub use sandbox_platform::database;
+use sandbox_runtime::Runtime;
 pub use sandbox_sandboxes::sandbox;
 pub use sandbox_settings::settings;
 pub use sandbox_telemetry::logging;
 pub use sandbox_telemetry::process_log;
 pub use sandbox_ui::{icons, text_input, theme};
+use std::sync::Arc;
 mod logs_view;
 mod sandboxes_view;
 mod settings_view;
@@ -59,6 +61,7 @@ impl Section {
 }
 
 struct Workspace {
+    application: Arc<Runtime>,
     active_section: Section,
     sidebar_open: bool,
     focus_handle: FocusHandle,
@@ -74,7 +77,7 @@ struct Workspace {
 }
 
 impl Workspace {
-    fn new(window: &mut Window, runtime: tokio::runtime::Handle, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, application: Arc<Runtime>, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
         cx.observe_window_bounds(window, |this, _, cx| {
@@ -96,6 +99,7 @@ impl Workspace {
         let settings = settings_model.read(cx).value.clone();
         cx.observe(&settings_model, |this, model, cx| {
             this.settings = model.read(cx).value.clone();
+            this.application.configure(&this.settings);
             let theme = this.settings.theme;
             this.logs.update(cx, |logs, cx| logs.set_theme(theme, cx));
             this.sandbox.update(cx, |sandbox, cx| {
@@ -109,29 +113,75 @@ impl Workspace {
         })
         .detach();
         let logs = cx.new(|cx| logs_view::LogsView::new(settings.theme, cx));
-        let backups = cx.new(|cx| backups_view::BackupsView::new(runtime, settings.theme, cx));
-        let sandbox = cx.new(|cx| sandboxes_view::SandboxesView::new(&settings, cx));
+        let project = application
+            .catalog
+            .projects()
+            .expect("Opened catalog")
+            .remove(0);
+        let service = application
+            .backups(&project.id)
+            .expect("Opened backup service");
+        let rows = application
+            .catalog
+            .sandboxes()
+            .expect("Opened sandbox catalog");
+        let record = if let Some(record) = rows
+            .into_iter()
+            .find(|sandbox| sandbox.project_id == project.id)
+        {
+            record
+        } else {
+            application
+                .catalog
+                .create_sandbox(project.id.clone(), "Sandbox".into())
+                .expect("Create initial sandbox")
+        };
+        let manager = application.manager(&record.id).ok();
+        let backups = cx.new(|cx| backups_view::BackupsView::new(service, settings.theme, cx));
+        let sandbox = cx.new(|cx| sandboxes_view::SandboxesView::new(manager, &settings, cx));
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
-            weak.update(cx, |workspace, cx| {
-                if workspace.sandbox.read(cx).may_close() {
+            weak.update(cx, |workspace, _cx| {
+                if workspace.application.exit_ready() {
                     true
                 } else {
-                    workspace
-                        .sandbox
-                        .update(cx, |sandbox, cx| sandbox.request_exit(cx));
+                    workspace.application.begin_shutdown();
                     false
                 }
             })
             .unwrap_or(true)
         });
-        cx.on_app_quit(|workspace, cx| {
-            workspace.sandbox.read(cx).shutdown_fallback();
+        cx.on_app_quit(|workspace, _cx| {
+            if let Err(error)=workspace.application.shutdown_blocking() {tracing::error!(target:"app::sandbox",%error,"Shutdown failed; watchdog will retry");}
             async {}
         })
         .detach();
 
+        cx.spawn(async move |workspace, cx| {
+            loop {
+                gpui::Timer::after(std::time::Duration::from_millis(200)).await;
+                if workspace
+                    .update(cx, |workspace, cx| {
+                        if workspace.application.exit_ready() {
+                            cx.quit();
+                            return;
+                        }
+                        if workspace.application.is_stopping() {
+                            workspace
+                                .sandbox
+                                .update(cx, |view, cx| view.set_stopping(true, cx));
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         Self {
+            application,
             active_section: Section::Backups,
             sidebar_open: true,
             focus_handle,
@@ -162,7 +212,7 @@ impl Workspace {
             return;
         }
         let model = self.settings_model.clone();
-        let backups = self.backups.clone();
+        let backups = self.backups.read(cx).service();
         let bounds = Bounds::centered(None, size(px(1000.), px(740.)), cx);
         match cx.open_window(
             WindowOptions {
@@ -305,9 +355,8 @@ impl Render for Workspace {
                 this.toggle_sidebar(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleLogs, _, cx| this.toggle_logs(cx)))
-            .on_action(cx.listener(|this, _: &QuitSandbox, _, cx| {
-                this.sandbox
-                    .update(cx, |sandbox, cx| sandbox.request_exit(cx))
+            .on_action(cx.listener(|this, _: &QuitSandbox, _, _| {
+                this.application.begin_shutdown();
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|_, _: &FocusNext, window, _| window.focus_next()))
@@ -364,6 +413,14 @@ impl Render for Workspace {
                             .child(Icon::Settings.render(palette.icon)),
                     ),
             )
+            .children(self.application.shutdown_status().error.map(|error| {
+                div()
+                    .px_4()
+                    .py_2()
+                    .text_sm()
+                    .text_color(rgb(palette.error))
+                    .child(error)
+            }))
             .child(
                 div()
                     .flex()
@@ -516,7 +573,14 @@ pub fn run() {
         .enable_all()
         .build()
         .expect("Не удалось запустить фоновые задачи");
-    let runtime_handle = runtime.handle().clone();
+    let application = match Runtime::open(runtime.handle().clone(), &initial) {
+        Ok(application) => application,
+        Err(error) => {
+            tracing::error!(target:"app::startup",%error,"Could not open application runtime");
+            eprintln!("Could not start Sandbox Prepare: {error:#}");
+            return;
+        }
+    };
     Application::new()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
@@ -558,17 +622,15 @@ pub fn run() {
                         }),
                         ..Default::default()
                     },
-                    |window, cx| cx.new(|cx| Workspace::new(window, runtime_handle, cx)),
+                    |window, cx| cx.new(|cx| Workspace::new(window, application.clone(), cx)),
                 )
                 .expect("Не удалось открыть окно");
             cx.on_action(move |_: &OpenSettings, cx| {
                 let _ = workspace_window.update(cx, |workspace, _, cx| workspace.open_settings(cx));
             });
             cx.on_action(move |_: &QuitSandbox, cx| {
-                let _ = workspace_window.update(cx, |workspace, _, cx| {
-                    workspace
-                        .sandbox
-                        .update(cx, |sandbox, cx| sandbox.request_exit(cx));
+                let _ = workspace_window.update(cx, |workspace, _, _cx| {
+                    workspace.application.begin_shutdown();
                 });
             });
 

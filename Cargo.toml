@@ -36,3 +36,4 @@ sandbox_settings = { path = "crates/settings" }
 sandbox_backups = { path = "crates/backups" }
 sandbox_sandboxes = { path = "crates/sandboxes" }
 sandbox_workspace = { path = "crates/workspace" }
+sandbox_runtime = { path = "crates/runtime" }

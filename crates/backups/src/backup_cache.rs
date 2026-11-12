@@ -4,6 +4,8 @@ use crate::{
 };
 use anyhow::{Context as _, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
+use sandbox_core::models::ProjectId;
+use sandbox_platform::catalog::Catalog;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -100,8 +102,13 @@ impl Snapshot {
 pub struct Cache {
     root: PathBuf,
     database: PathBuf,
+    scope: Option<(Catalog, ProjectId)>,
 }
 impl Cache {
+    pub fn directory(&self, generation: &str) -> Result<PathBuf> {
+        ensure!(owned_name(generation, "pair-"), "Invalid backup generation");
+        Ok(self.root.join(generation))
+    }
     pub fn application() -> Result<Self> {
         Self::for_database(crate::database::database_path()?)
     }
@@ -110,7 +117,19 @@ impl Cache {
             .parent()
             .context("Application directory is missing")?
             .join("backups");
-        Ok(Self { root, database })
+        Ok(Self {
+            root,
+            database,
+            scope: None,
+        })
+    }
+    pub fn for_project(catalog: Catalog, id: ProjectId) -> Result<Self> {
+        let root = catalog.project(&id)?.backup_root;
+        Ok(Self {
+            root,
+            database: catalog.database.clone(),
+            scope: Some((catalog, id)),
+        })
     }
     fn connection(&self) -> Result<Connection> {
         let db = Connection::open(&self.database)?;
@@ -119,6 +138,9 @@ impl Cache {
         Ok(db)
     }
     fn lock(&self) -> Result<File> {
+        self.named_lock(".lock", false)
+    }
+    fn named_lock(&self, name: &str, shared: bool) -> Result<File> {
         fs::create_dir_all(&self.root)?;
         #[cfg(unix)]
         {
@@ -130,18 +152,25 @@ impl Cache {
             .truncate(false)
             .read(true)
             .write(true)
-            .open(self.root.join(".lock"))?;
-        file.try_lock()
-            .context("Backups are in use by another operation or application instance")?;
+            .open(self.root.join(name))?;
+        if shared {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        }
+        .context("Backups are in use by another operation or application instance")?;
         Ok(file)
     }
     fn read_pair(&self) -> Result<Option<Pair>> {
-        let json: Option<String> = self
-            .connection()?
-            .query_row("SELECT manifest FROM backup_pair WHERE id=1", [], |row| {
-                row.get(0)
-            })
-            .optional()?;
+        let json: Option<String> = if let Some((catalog, id)) = &self.scope {
+            catalog.backup_manifest(id)?
+        } else {
+            self.connection()?
+                .query_row("SELECT manifest FROM backup_pair WHERE id=1", [], |row| {
+                    row.get(0)
+                })
+                .optional()?
+        };
         let pair: Option<Pair> = json
             .map(|json| serde_json::from_str(&json))
             .transpose()
@@ -155,11 +184,14 @@ impl Cache {
         Ok(pair)
     }
     fn store_pair(&self, pair: &Pair) -> Result<()> {
+        if let Some((catalog, id)) = &self.scope {
+            return catalog.save_backup_manifest(id, &serde_json::to_string(pair)?);
+        }
         self.connection()?.execute("INSERT INTO backup_pair(id,manifest) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET manifest=excluded.manifest", params![serde_json::to_string(pair)?])?;
         Ok(())
     }
     pub fn load(&self) -> Result<Snapshot> {
-        let _lock = self.lock()?;
+        let _lock = self.named_lock(".lock", self.scope.is_some())?;
         let mut pair = self.read_pair()?;
         let mut valid = [false; 2];
         let mut migrated = false;
@@ -183,7 +215,19 @@ impl Cache {
                 self.store_pair(pair)?;
             }
         }
-        let warnings = self.cleanup(pair.as_ref().map(|pair| pair.generation.as_str()));
+        let warnings = if self.scope.is_none() {
+            self.cleanup(pair.as_ref().map(|pair| pair.generation.as_str()))
+        } else {
+            drop(_lock);
+            if let (Ok(_writer), Ok(_archive)) =
+                (self.named_lock(".update.lock", false), self.lock())
+            {
+                let current = self.read_pair()?;
+                self.cleanup(current.as_ref().map(|pair| pair.generation.as_str()))
+            } else {
+                Vec::new()
+            }
+        };
         Ok(Snapshot {
             pair,
             valid,
@@ -191,7 +235,7 @@ impl Cache {
         })
     }
     pub fn lease(&self) -> Result<BackupLease> {
-        let lock = self.lock()?;
+        let lock = self.named_lock(".lock", self.scope.is_some())?;
         let pair = self.read_pair()?.context("Download both backups first")?;
         let directory = self.root.join(&pair.generation);
         ensure!(
@@ -240,7 +284,11 @@ impl Cache {
         warnings
     }
     fn begin(&self) -> Result<Pending> {
-        let lock = self.lock()?;
+        let lock = if self.scope.is_some() {
+            self.named_lock(".update.lock", false)?
+        } else {
+            self.lock()?
+        };
         self.read_pair()?; // A corrupt pointer must never trigger destructive cleanup.
         let id = format!(
             "{}-{}-{}",
@@ -282,7 +330,16 @@ struct Pending {
     published: bool,
 }
 impl Pending {
+    #[cfg(test)]
     fn commit(mut self, pair: Pair) -> Result<Snapshot> {
+        let _publication = if self.cache.scope.is_some() {
+            Some(self.cache.lock()?)
+        } else {
+            None
+        };
+        self.publish(pair)
+    }
+    fn publish(&mut self, pair: Pair) -> Result<Snapshot> {
         // Durable files first, then a single SQLite commit publishes both paths together.
         for name in FILES {
             File::open(self.directory.join(name))?.sync_all()?;
@@ -385,6 +442,7 @@ pub enum Progress {
     VerificationBytes(usize, u64, u64),
     VerificationFailed(usize),
     Verified(usize),
+    WaitingForReaders,
     Publishing,
 }
 pub async fn update(
@@ -493,9 +551,36 @@ pub async fn update(
             origin: Origin::new(&config),
             records: records.map(|record| record.expect("Both backup workers succeeded")),
         };
+        let publication = if pending.cache.scope.is_some() {
+            progress(Progress::WaitingForReaders);
+            loop {
+                ensure!(!control.cancelled(), "Cancelled");
+                match pending.cache.lock() {
+                    Ok(lock) => break Some(lock),
+                    Err(error) => {
+                        if !error.chain().any(|error| {
+                            matches!(
+                                error.downcast_ref::<std::fs::TryLockError>(),
+                                Some(std::fs::TryLockError::WouldBlock)
+                            )
+                        }) {
+                            return Err(error);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        } else {
+            None
+        };
         control.begin_publish()?;
         progress(Progress::Publishing);
-        tokio::task::spawn_blocking(move || pending.commit(pair)).await?
+        tokio::task::spawn_blocking(move || {
+            let _publication = publication;
+            let mut pending = pending;
+            pending.publish(pair)
+        })
+        .await?
     }
     .await;
     result.map_err(|error: anyhow::Error| {
@@ -585,6 +670,7 @@ mod tests {
         Cache {
             root: directory.join("backups"),
             database: directory.join("application.sqlite3"),
+            scope: None,
         }
     }
     fn install(cache: &Cache, config: &StorageConfig) -> Result<Snapshot> {
@@ -755,6 +841,29 @@ mod tests {
         let path = cache.root.join(pair.generation).join(FILES[0]);
         fs::write(&path, b"changed")?;
         assert!(cache.lease().is_err());
+        fs::remove_dir_all(cache.database.parent().unwrap())?;
+        Ok(())
+    }
+    #[test]
+    fn project_readers_share_archives_and_block_only_publication_and_cleanup() -> Result<()> {
+        let legacy = cache("shared-readers");
+        let catalog = Catalog::open(legacy.database.clone())?;
+        let project = catalog.projects()?.remove(0);
+        let cache = Cache::for_project(catalog, project.id)?;
+        let pair = install(&cache, &StorageConfig::default())?.pair.unwrap();
+        let first = cache.lease()?;
+        let second = cache.lease()?;
+        assert!(!cache.load()?.missing());
+        let pending = cache.begin()?;
+        assert!(cache.lock().is_err());
+        assert!(cache.begin().is_err());
+        assert!(!cache.load()?.missing());
+        drop(first);
+        assert!(cache.lock().is_err());
+        drop(second);
+        assert!(cache.lock().is_ok());
+        drop(pending);
+        assert!(cache.root.join(pair.generation).exists());
         fs::remove_dir_all(cache.database.parent().unwrap())?;
         Ok(())
     }

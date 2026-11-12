@@ -1,28 +1,35 @@
 use crate::theme::ThemePalette as _;
 use crate::{
     backups::StorageConfig,
-    backups_view::BackupsView,
     logging,
     settings::{Settings, SettingsModel},
     text_input::{Edited, TextInput},
     theme::{Palette, ThemeMode},
 };
 use gpui::{Context, Div, Entity, FocusHandle, Render, Stateful, Window, div, prelude::*, px, rgb};
-use std::time::Duration;
+use sandbox_backups::service::Service;
+use std::{sync::Arc, time::Duration};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
     Appearance,
     Storage,
     Logging,
+    Sandboxes,
 }
 impl Section {
-    const ALL: [Self; 3] = [Self::Appearance, Self::Storage, Self::Logging];
+    const ALL: [Self; 4] = [
+        Self::Appearance,
+        Self::Storage,
+        Self::Logging,
+        Self::Sandboxes,
+    ];
     fn label(self) -> &'static str {
         match self {
             Self::Appearance => "Appearance",
             Self::Storage => "Storage",
             Self::Logging => "Logging",
+            Self::Sandboxes => "Sandboxes",
         }
     }
 }
@@ -40,12 +47,12 @@ enum Confirmation {
 
 pub struct SettingsWindow {
     model: Entity<SettingsModel>,
-    backups: Entity<BackupsView>,
+    backups: Arc<Service>,
     section: Section,
     search: Entity<TextInput>,
     storage: [Entity<TextInput>; 5],
     saved_storage: [String; 5],
-    logs: [Entity<TextInput>; 4],
+    logs: [Entity<TextInput>; 5],
     editor: Entity<TextInput>,
     json_mode: bool,
     message: Option<(bool, String)>,
@@ -53,13 +60,13 @@ pub struct SettingsWindow {
     modal: Option<Confirmation>,
     modal_focus: [FocusHandle; 2],
     busy: bool,
-    log_save_tasks: [Option<gpui::Task<()>>; 4],
-    log_errors: [Option<String>; 4],
+    log_save_tasks: [Option<gpui::Task<()>>; 5],
+    log_errors: [Option<String>; 5],
 }
 impl SettingsWindow {
     pub fn new(
         model: Entity<SettingsModel>,
-        backups: Entity<BackupsView>,
+        backups: Arc<Service>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -67,12 +74,8 @@ impl SettingsWindow {
         let theme = settings.theme;
         let search = cx.new(|cx| TextInput::search(theme, cx));
         cx.observe(&search, |_, _, cx| cx.notify()).detach();
-        let config = crate::database::load_storage();
-        let message = config
-            .as_ref()
-            .err()
-            .map(|error| (true, format!("Could not load connection: {error:#}")));
-        let config = config.ok().flatten().unwrap_or_default();
+        let config = backups.project().storage;
+        let message = None;
         let saved_storage = [
             config.endpoint,
             config.bucket,
@@ -301,11 +304,12 @@ impl SettingsWindow {
         self.message = Some(
             match self
                 .backups
-                .update(cx, |view, cx| view.configure(config, cx))
+                .configure(config)
+                .map_err(|error| error.to_string())
             {
                 Ok(()) => {
                     self.saved_storage = values;
-                    (false, "Connection saved. Checking backups…".into())
+                    (false, "Project connection saved.".into())
                 }
                 Err(error) => (true, error),
             },
@@ -318,7 +322,7 @@ impl SettingsWindow {
         }
         if !clear {
             self.flush_logging(cx);
-            if self.log_errors.iter().any(Option::is_some) {
+            if self.log_errors.iter().take(4).any(Option::is_some) {
                 self.message = Some((
                     true,
                     "Correct logging settings before checking retention.".into(),
@@ -463,11 +467,24 @@ impl SettingsWindow {
                 "Check every (hours)",
                 "Check retention at this interval and on startup when a check is due.",
             ),
+            (
+                "Concurrent restores",
+                "Maximum heavy restorations running together. Other work remains available.",
+            ),
         ]
         .into_iter()
         .enumerate()
         {
-            if self.matches(title, description, Section::Logging, cx) {
+            if self.matches(
+                title,
+                description,
+                if index == 4 {
+                    Section::Sandboxes
+                } else {
+                    Section::Logging
+                },
+                cx,
+            ) {
                 rows.push(
                     setting_row(title, description, palette).child(
                         div()
@@ -718,18 +735,20 @@ fn logging_edit(current: &Settings, index: usize, value: &str) -> anyhow::Result
         1 => settings.logging.max_file_mib = value.parse().map_err(|_| invalid())?,
         2 => settings.logging.retention_days = value.parse().map_err(|_| invalid())?,
         3 => settings.logging.check_interval_hours = value.parse().map_err(|_| invalid())?,
+        4 => settings.max_parallel_restores = value.parse().map_err(|_| invalid())?,
         _ => anyhow::bail!("Unknown logging field"),
     }
     settings.validate()?;
     Ok(settings)
 }
 
-fn log_values(settings: &Settings) -> [String; 4] {
+fn log_values(settings: &Settings) -> [String; 5] {
     [
         settings.current_log_limit.to_string(),
         settings.logging.max_file_mib.to_string(),
         settings.logging.retention_days.to_string(),
         settings.logging.check_interval_hours.to_string(),
+        settings.max_parallel_restores.to_string(),
     ]
 }
 fn setting_row(title: &'static str, description: &'static str, palette: Palette) -> Div {

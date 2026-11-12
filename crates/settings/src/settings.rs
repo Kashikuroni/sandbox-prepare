@@ -16,6 +16,7 @@ pub struct Settings {
     pub theme: ThemeMode,
     pub current_log_limit: usize,
     pub logging: LogSettings,
+    pub max_parallel_restores: usize,
 }
 
 impl Default for Settings {
@@ -24,6 +25,7 @@ impl Default for Settings {
             theme: ThemeMode::default(),
             current_log_limit: 2000,
             logging: LogSettings::default(),
+            max_parallel_restores: 2,
         }
     }
 }
@@ -41,6 +43,10 @@ impl Settings {
         anyhow::ensure!(
             self.current_log_limit > 0,
             "Current log records must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.max_parallel_restores > 0,
+            "Concurrent restores must be greater than zero"
         );
         self.logging.validate()
     }
@@ -227,6 +233,7 @@ mod tests {
                 retention_days: 2,
                 check_interval_hours: 12,
             },
+            max_parallel_restores: 2,
         };
         settings.save_to(&path)?;
         assert_eq!(Settings::load_from(&path)?, settings);

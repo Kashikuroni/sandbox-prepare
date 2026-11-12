@@ -1,16 +1,17 @@
 use crate::theme::ThemePalette as _;
 use crate::{
     backup_cache::{self, Cache, Progress, SOURCES, Snapshot},
-    backups::{self, Backup, DownloadError, StorageClient, StorageConfig, format_size},
+    backups::{Backup, DownloadError, StorageConfig, format_size},
     icons::Icon,
     theme::{Palette, ThemeMode},
 };
 use gpui::{Context, Div, Render, Window, div, prelude::*, px, rgb};
+use sandbox_backups::service::Service;
+use std::sync::{Arc, atomic::Ordering};
 use std::{
     sync::mpsc,
     time::{Duration, Instant},
 };
-use tokio::runtime::Handle;
 
 enum Transfer {
     Idle,
@@ -43,7 +44,8 @@ enum Event {
 }
 pub struct BackupsView {
     config: StorageConfig,
-    runtime: Handle,
+    service: Arc<Service>,
+    revision: u64,
     rows: [Row; 2],
     events: mpsc::Sender<Event>,
     theme: ThemeMode,
@@ -58,7 +60,7 @@ pub struct BackupsView {
     message: Option<String>,
 }
 impl BackupsView {
-    pub fn new(runtime: Handle, theme: ThemeMode, cx: &mut Context<Self>) -> Self {
+    pub fn new(service: Arc<Service>, theme: ThemeMode, cx: &mut Context<Self>) -> Self {
         let (events, receiver) = mpsc::channel();
         cx.spawn(async move |view, cx| {
             loop {
@@ -66,6 +68,12 @@ impl BackupsView {
                 let pending: Vec<_> = receiver.try_iter().collect();
                 if view
                     .update(cx, |view, cx| {
+                        let revision = view.service.revision.load(Ordering::Acquire);
+                        if revision != view.revision && !view.busy() {
+                            view.revision = revision;
+                            view.config = view.service.project().storage;
+                            view.check(cx);
+                        }
                         if pending.is_empty() {
                             return;
                         }
@@ -81,14 +89,12 @@ impl BackupsView {
             }
         })
         .detach();
-        let cache = Cache::application();
-        let local_error = cache.as_ref().err().map(|error| format!("{error:#}"));
+        let cache = service.cache.clone();
+        let local_error = None;
         let mut view = Self {
-            config: crate::database::load_storage()
-                .ok()
-                .flatten()
-                .unwrap_or_default(),
-            runtime,
+            config: service.project().storage,
+            revision: service.revision.load(Ordering::Acquire),
+            service,
             theme,
             events,
             rows: std::array::from_fn(|_| Row {
@@ -98,7 +104,7 @@ impl BackupsView {
                 error: None,
                 transfer: Transfer::Idle,
             }),
-            cache: cache.ok(),
+            cache: Some(cache),
             local: Snapshot::default(),
             local_loading: false,
             local_error,
@@ -114,27 +120,8 @@ impl BackupsView {
     fn busy(&self) -> bool {
         self.cancel.is_some() || self.local_loading || self.rows.iter().any(|row| row.loading)
     }
-    pub fn configure(
-        &mut self,
-        config: StorageConfig,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        if self.busy() {
-            return Err("Wait for the current operation before changing the connection.".into());
-        }
-        if config.access_key.is_empty()
-            || config.secret_key.is_empty()
-            || config.bucket.is_empty()
-            || config.region.is_empty()
-            || !(config.endpoint.starts_with("https://") || config.endpoint.starts_with("http://"))
-        {
-            return Err("Enter an HTTP(S) endpoint, bucket, region and both keys.".into());
-        }
-        crate::database::save_storage(&config)
-            .map_err(|error| format!("Could not save connection: {error}"))?;
-        self.config = config;
-        self.check(cx);
-        Ok(())
+    pub fn service(&self) -> Arc<Service> {
+        self.service.clone()
     }
     pub fn set_theme(&mut self, theme: ThemeMode, cx: &mut Context<Self>) {
         self.theme = theme;
@@ -158,20 +145,16 @@ impl BackupsView {
             && !self.current()
     }
     fn check_remote(&mut self) {
-        for (index, (_, prefix)) in SOURCES.into_iter().enumerate() {
+        for index in 0..2 {
             self.rows[index].loading = true;
             self.rows[index].error = None;
-            let config = self.config.clone();
             let events = self.events.clone();
-            self.runtime.spawn(async move {
-                let result = async {
-                    let client = config.client().await?;
-                    backups::latest_backup(&client, &config.bucket, prefix).await
-                }
-                .await
-                .map_err(|error: anyhow::Error| format!("{error:#}"));
+            if let Err(error) = self.service.check_remote(index, move |result| {
                 let _ = events.send(Event::Listed(index, result));
-            });
+            }) {
+                self.rows[index].loading = false;
+                self.rows[index].error = Some(error.to_string());
+            }
         }
     }
     fn check(&mut self, cx: &mut Context<Self>) {
@@ -179,16 +162,13 @@ impl BackupsView {
             return;
         }
         self.message = None;
-        if let Some(cache) = self.cache.clone() {
-            self.local_loading = true;
-            let events = self.events.clone();
-            self.runtime.spawn(async move {
-                let result = tokio::task::spawn_blocking(move || cache.load())
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result.map_err(|error| format!("{error:#}")));
-                let _ = events.send(Event::Local(result));
-            });
+        self.local_loading = true;
+        let events = self.events.clone();
+        if let Err(error) = self.service.check_local(move |result| {
+            let _ = events.send(Event::Local(result));
+        }) {
+            self.local_loading = false;
+            self.local_error = Some(error.to_string());
         }
         self.check_remote();
         cx.notify();
@@ -200,11 +180,6 @@ impl BackupsView {
         let Some(remote) = self.remote() else {
             return;
         };
-        let Some(cache) = self.cache.clone() else {
-            return;
-        };
-        let control = backup_cache::UpdateControl::new();
-        self.cancel = Some(control.clone());
         self.cancelling = false;
         self.publishing = false;
         self.message = None;
@@ -212,25 +187,25 @@ impl BackupsView {
             row.transfer = Transfer::Idle;
         }
         let events = self.events.clone();
-        let config = self.config.clone();
-        self.runtime.spawn(async move {
-            let result = backup_cache::update(cache, config, remote, control, |progress| {
-                let _ = events.send(Event::Progress(progress));
-            })
-            .await;
-            let _ = events.send(Event::Finished(result));
-        });
+        let finish = self.events.clone();
+        match self.service.download(
+            remote,
+            move |event| {
+                let _ = events.send(Event::Progress(event));
+            },
+            move |result| {
+                let _ = finish.send(Event::Finished(result));
+            },
+        ) {
+            Ok(control) => self.cancel = Some(control),
+            Err(error) => self.message = Some(error.to_string()),
+        }
         cx.notify();
     }
     fn verify_integrity(&mut self, cx: &mut Context<Self>) {
         if self.busy() || self.local.pair.is_none() {
             return;
         }
-        let Some(cache) = self.cache.clone() else {
-            return;
-        };
-        let control = backup_cache::UpdateControl::new();
-        self.cancel = Some(control.clone());
         self.integrity_check = true;
         self.cancelling = false;
         self.publishing = false;
@@ -239,12 +214,21 @@ impl BackupsView {
             row.transfer = Transfer::Idle;
         }
         let events = self.events.clone();
-        self.runtime.spawn_blocking(move || {
-            let result = backup_cache::verify_local(cache, control, |progress| {
-                let _ = events.send(Event::Progress(progress));
-            });
-            let _ = events.send(Event::IntegrityFinished(result));
-        });
+        let finish = self.events.clone();
+        match self.service.verify(
+            move |event| {
+                let _ = events.send(Event::Progress(event));
+            },
+            move |result| {
+                let _ = finish.send(Event::IntegrityFinished(result));
+            },
+        ) {
+            Ok(control) => self.cancel = Some(control),
+            Err(error) => {
+                self.integrity_check = false;
+                self.message = Some(error.to_string());
+            }
+        }
         cx.notify();
     }
     fn cancel(&mut self, cx: &mut Context<Self>) {
@@ -328,6 +312,10 @@ impl BackupsView {
                 }
                 Progress::Verified(index) => self.rows[index].transfer = Transfer::Verified,
                 Progress::Publishing => self.publishing = true,
+                Progress::WaitingForReaders => {
+                    self.message =
+                        Some("Waiting for restores to release the current backups…".into())
+                }
             },
             Event::IntegrityFinished(result) => {
                 self.cancel = None;
@@ -600,15 +588,13 @@ impl BackupsView {
                         exact_date(&record.modified),
                     ));
                 if let Some(pair) = &self.local.pair
-                    && let Ok(database) = crate::database::database_path()
-                    && let Some(parent) = database.parent()
+                    && let Some(cache) = &self.cache
+                    && let Ok(directory) = cache.directory(&pair.generation)
                 {
                     details = details.child(detail(
                         index,
                         "Local path",
-                        parent
-                            .join("backups")
-                            .join(&pair.generation)
+                        directory
                             .join(backup_cache::FILES[index])
                             .display()
                             .to_string(),
@@ -672,13 +658,6 @@ impl BackupsView {
                 );
         }
         content
-    }
-}
-impl Drop for BackupsView {
-    fn drop(&mut self) {
-        if let Some(cancel) = &self.cancel {
-            let _ = cancel.cancel();
-        }
     }
 }
 fn progress_value(width: f32, text: String) -> Div {

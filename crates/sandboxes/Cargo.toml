@@ -17,3 +17,4 @@ tokio.workspace = true
 sandbox_platform.workspace = true
 sandbox_telemetry.workspace = true
 sandbox_backups.workspace = true
+sandbox_core.workspace = true

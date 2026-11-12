@@ -5492,6 +5492,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -5501,6 +5503,23 @@ dependencies = [
  "anyhow",
  "rusqlite",
  "sandbox_core",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "sandbox_runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "sandbox_backups",
+ "sandbox_core",
+ "sandbox_platform",
+ "sandbox_sandboxes",
+ "sandbox_settings",
+ "sandbox_telemetry",
+ "tokio",
  "tracing",
 ]
 
@@ -5512,6 +5531,7 @@ dependencies = [
  "chrono",
  "rusqlite",
  "sandbox_backups",
+ "sandbox_core",
  "sandbox_platform",
  "sandbox_telemetry",
  "serde",
@@ -5568,7 +5588,9 @@ dependencies = [
  "chrono",
  "gpui",
  "sandbox_backups",
+ "sandbox_core",
  "sandbox_platform",
+ "sandbox_runtime",
  "sandbox_sandboxes",
  "sandbox_settings",
  "sandbox_telemetry",

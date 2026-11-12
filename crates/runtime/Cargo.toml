@@ -1,0 +1,16 @@
+[package]
+name = "sandbox_runtime"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+sandbox_core.workspace = true
+sandbox_platform.workspace = true
+sandbox_telemetry.workspace = true
+sandbox_settings.workspace = true
+sandbox_backups.workspace = true
+sandbox_sandboxes.workspace = true
