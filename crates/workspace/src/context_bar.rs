@@ -30,6 +30,7 @@ pub(super) struct ContextBar {
     sandboxes: Vec<Sandbox>,
     snapshots: BTreeMap<ProjectId, RepositoryState>,
     last_query: BTreeMap<ProjectId, Instant>,
+    invalidated_git: BTreeSet<ProjectId>,
     jobs: BTreeMap<ProjectId, Arc<Operation>>,
     errors: BTreeMap<ProjectId, String>,
     source_jobs: BTreeMap<ProjectId, Arc<Operation>>,
@@ -46,6 +47,7 @@ impl Default for ContextBar {
             sandboxes: vec![],
             snapshots: BTreeMap::new(),
             last_query: BTreeMap::new(),
+            invalidated_git: BTreeSet::new(),
             jobs: BTreeMap::new(),
             errors: BTreeMap::new(),
             source_jobs: BTreeMap::new(),
@@ -55,6 +57,107 @@ impl Default for ContextBar {
             receiver,
         }
     }
+}
+impl ContextBar {
+    fn invalidate_git(&mut self, id: &ProjectId) {
+        self.snapshots.remove(id);
+        self.errors.remove(id);
+        self.last_query.remove(id);
+        // An older in-flight query must finish before the required fresh query starts.
+        self.invalidated_git.insert(id.clone());
+    }
+    fn begin_git_query(&mut self, id: &ProjectId, force: bool) -> bool {
+        if self.jobs.contains_key(id) {
+            return false;
+        }
+        if !force
+            && !self.invalidated_git.contains(id)
+            && self
+                .last_query
+                .get(id)
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(10))
+        {
+            return false;
+        }
+        self.invalidated_git.remove(id);
+        self.last_query.insert(id.clone(), Instant::now());
+        true
+    }
+    /// True means this result predates source preparation and must be queried again.
+    fn finish_git_query(
+        &mut self,
+        id: &ProjectId,
+        result: anyhow::Result<RepositoryState>,
+    ) -> bool {
+        self.jobs.remove(id);
+        if self.invalidated_git.contains(id) {
+            return true;
+        }
+        match result {
+            Ok(snapshot) => {
+                let valid = self
+                    .projects
+                    .iter()
+                    .find(|p| &p.id == id)
+                    .and_then(|p| p.repository.as_ref())
+                    .is_some_and(|r| r.directory == snapshot.directory);
+                if valid {
+                    self.snapshots.insert(id.clone(), snapshot);
+                    self.errors.remove(id);
+                }
+            }
+            Err(error) => {
+                self.errors
+                    .insert(id.clone(), logging::redact(&format!("{error:#}")));
+            }
+        }
+        false
+    }
+}
+fn source_label(
+    current: Option<&Sandbox>,
+    snapshot: Option<&RepositoryState>,
+    checking: bool,
+    git_error: bool,
+) -> String {
+    let Some(source) = current.and_then(|s| s.source.as_ref()) else {
+        return if current.is_some() {
+            "Legacy environment"
+        } else {
+            "Choose working copy"
+        }
+        .into();
+    };
+    let selected = snapshot.and_then(|s| {
+        s.trees
+            .iter()
+            .find(|t| !t.prunable && same_path(&t.directory, &source.directory))
+    });
+    if selected.is_none() && snapshot.is_some() && !checking && !git_error {
+        return "Working copy unavailable".into();
+    }
+    let branch = selected
+        .map(|tree| {
+            tree.branch
+                .clone()
+                .unwrap_or_else(|| tree.revision.chars().take(8).collect())
+        })
+        .unwrap_or_else(|| match &source.mode {
+            SourceMode::ManagedWorktree { branch } => branch.clone(),
+            _ => source
+                .directory
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| source.revision.chars().take(8).collect()),
+        });
+    let kind = if source.owned {
+        "Isolated worktree"
+    } else if matches!(source.mode, SourceMode::CurrentCheckout) {
+        "Local checkout"
+    } else {
+        "Existing worktree"
+    };
+    format!("{kind} / {branch}")
 }
 fn same_path(left: &Path, right: &Path) -> bool {
     left == right
@@ -179,42 +282,14 @@ impl Workspace {
             .iter()
             .find(|s| Some(&s.id) == self.sandbox_id.as_ref());
         let source = current.and_then(|s| s.source.as_ref());
-        let selected = source.and_then(|s| {
-            snapshot.and_then(|snapshot| {
-                snapshot
-                    .trees
-                    .iter()
-                    .find(|t| same_path(&t.directory, &s.directory))
-            })
-        });
-        let label = selected
-            .map(|tree| {
-                tree.branch
-                    .clone()
-                    .unwrap_or_else(|| tree.revision.chars().take(8).collect())
-            })
-            .map(|branch| {
-                format!(
-                    "{} / {branch}",
-                    if source.is_some_and(|s| s.owned) {
-                        "Isolated worktree"
-                    } else if source.is_some_and(|s| matches!(s.mode, SourceMode::CurrentCheckout))
-                    {
-                        "Local checkout"
-                    } else {
-                        "Existing worktree"
-                    }
-                )
-            })
-            .unwrap_or_else(|| {
-                if source.is_some() {
-                    "Working copy unavailable".into()
-                } else if current.is_some() {
-                    "Legacy environment".into()
-                } else {
-                    "Choose working copy".into()
-                }
-            });
+        let checking = self.context_bar.jobs.contains_key(&self.project_id)
+            || self.context_bar.invalidated_git.contains(&self.project_id);
+        let label = source_label(
+            current.copied(),
+            snapshot,
+            checking,
+            self.context_bar.errors.contains_key(&self.project_id),
+        );
         let mut branches = vec![];
         let mut worktrees = vec![];
         if let Some(snapshot) = snapshot {
@@ -272,15 +347,10 @@ impl Workspace {
             .or_else(|| {
                 if self.context_bar.source_jobs.contains_key(&self.project_id) {
                     Some("Preparing working copy…".into())
+                } else if checking || snapshot.is_none() && source.is_some() {
+                    Some("Checking working copy…".into())
                 } else if snapshot.is_none() {
-                    Some(
-                        if self.context_bar.jobs.contains_key(&self.project_id) {
-                            "Reading Git…"
-                        } else {
-                            "Open a Git project to choose a working copy."
-                        }
-                        .into(),
-                    )
+                    Some("Open a Git project to choose a working copy.".into())
                 } else {
                     None
                 }
@@ -434,7 +504,7 @@ impl Workspace {
     }
     fn query_git(&mut self, force: bool, cx: &mut Context<Self>) {
         let id = self.project_id.clone();
-        if self.application.is_stopping() || self.context_bar.jobs.contains_key(&id) {
+        if self.application.is_stopping() {
             return;
         }
         let Some(repository) = self
@@ -446,18 +516,9 @@ impl Workspace {
         else {
             return;
         };
-        if !force
-            && self
-                .context_bar
-                .last_query
-                .get(&id)
-                .is_some_and(|last| last.elapsed() < Duration::from_secs(10))
-        {
+        if !self.context_bar.begin_git_query(&id, force) {
             return;
         }
-        self.context_bar
-            .last_query
-            .insert(id.clone(), Instant::now());
         let sender = self.context_bar.sender.clone();
         let project = id.clone();
         let flag = Arc::new(AtomicBool::new(false));
@@ -508,6 +569,7 @@ impl Workspace {
                     match result {
                         Ok(id) => {
                             self.context_bar.source_errors.remove(&project);
+                            self.context_bar.invalidate_git(&project);
                             self.context_bar
                                 .last_sandbox
                                 .insert(project.clone(), Some(id.clone()));
@@ -528,28 +590,11 @@ impl Workspace {
                     self.refresh_choices(cx);
                 }
                 NavigationEvent::Git(id, result) => {
-                    self.context_bar.jobs.remove(&id);
-                    match result {
-                        Ok(snapshot) => {
-                            let valid = self
-                                .context_bar
-                                .projects
-                                .iter()
-                                .find(|p| p.id == id)
-                                .and_then(|p| p.repository.as_ref())
-                                .is_some_and(|r| r.directory == snapshot.directory);
-                            if valid {
-                                self.context_bar.snapshots.insert(id.clone(), snapshot);
-                                self.context_bar.errors.remove(&id);
-                            }
-                        }
-                        Err(error) => {
-                            self.context_bar
-                                .errors
-                                .insert(id.clone(), logging::redact(&format!("{error:#}")));
-                        }
-                    }
+                    let retry = self.context_bar.finish_git_query(&id, result);
                     if id == self.project_id {
+                        if retry {
+                            self.query_git(true, cx);
+                        }
                         self.refresh_source_choices(cx);
                     }
                 }
@@ -703,5 +748,151 @@ impl Workspace {
                     .max_w(px((available * 0.6).min(360.)))
                     .child(self.source_menu.clone()),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sandbox_core::models::{Repository, SourceSelection};
+
+    fn record() -> Sandbox {
+        Sandbox {
+            id: SandboxId::try_from("working-copy".to_owned()).unwrap(),
+            project_id: ProjectId::try_from("project".to_owned()).unwrap(),
+            name: "feat/test-sandbox".into(),
+            root: "/fixture/data".into(),
+            password: String::new(),
+            root_password: String::new(),
+            source: Some(SourceSelection {
+                mode: SourceMode::ManagedWorktree {
+                    branch: "feat/test-sandbox".into(),
+                },
+                directory: "/fixture/worktree".into(),
+                owned: true,
+                revision: "12345678".into(),
+            }),
+            compose: None,
+        }
+    }
+    fn snapshot(trees: Vec<Worktree>) -> RepositoryState {
+        RepositoryState {
+            directory: "/fixture/repo".into(),
+            trees,
+            branches: vec![],
+            local: BTreeSet::new(),
+        }
+    }
+    fn tree(prunable: bool) -> Worktree {
+        Worktree {
+            directory: "/fixture/worktree".into(),
+            branch: Some("feat/test-sandbox".into()),
+            revision: "12345678".into(),
+            locked: false,
+            prunable,
+        }
+    }
+    #[test]
+    fn source_label_requires_a_completed_successful_check_before_reporting_unavailable() {
+        let record = record();
+        let expected = "Isolated worktree / feat/test-sandbox";
+        let missing = snapshot(vec![]);
+        assert_eq!(source_label(Some(&record), None, false, false), expected);
+        assert_eq!(
+            source_label(Some(&record), Some(&missing), true, false),
+            expected
+        );
+        assert_eq!(
+            source_label(Some(&record), Some(&missing), false, true),
+            expected
+        );
+        assert_eq!(
+            source_label(Some(&record), Some(&missing), false, false),
+            "Working copy unavailable"
+        );
+        assert_eq!(
+            source_label(
+                Some(&record),
+                Some(&snapshot(vec![tree(false)])),
+                false,
+                false
+            ),
+            expected
+        );
+        assert_eq!(
+            source_label(
+                Some(&record),
+                Some(&snapshot(vec![tree(true)])),
+                false,
+                false
+            ),
+            "Working copy unavailable"
+        );
+        let mut renamed = tree(false);
+        renamed.branch = Some("feat/renamed".into());
+        assert_eq!(
+            source_label(Some(&record), Some(&snapshot(vec![renamed])), false, false),
+            "Isolated worktree / feat/renamed"
+        );
+    }
+    #[test]
+    fn source_preparation_invalidates_inflight_results_and_bypasses_the_refresh_interval()
+    -> anyhow::Result<()> {
+        let record = record();
+        let id = record.project_id.clone();
+        let mut bar = ContextBar::default();
+        bar.projects.push(Project {
+            id: id.clone(),
+            name: "Fixture".into(),
+            repository: Some(Repository {
+                directory: "/fixture/repo".into(),
+                owned: false,
+                url: None,
+            }),
+            storage: Default::default(),
+            databases: Default::default(),
+            backup_root: "/fixture/backups".into(),
+        });
+        assert!(bar.begin_git_query(&id, false));
+        assert!(!bar.finish_git_query(&id, Ok(snapshot(vec![]))));
+        assert!(!bar.begin_git_query(&id, false)); // ordinary polling is throttled
+
+        let executor = tokio::runtime::Runtime::new()?;
+        let operations = sandbox_core::operations::Operations::new(executor.handle().clone());
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let job = operations.spawn(
+            Scope::default(),
+            "In-flight Git fixture",
+            move |_| async move {
+                let _ = blocked.await;
+                Ok(())
+            },
+        )?;
+        bar.jobs.insert(id.clone(), job);
+        bar.invalidate_git(&id); // creation completed while an older query was running
+        assert!(!bar.begin_git_query(&id, true)); // no overlapping query
+        assert!(bar.finish_git_query(&id, Ok(snapshot(vec![]))));
+        assert!(!bar.snapshots.contains_key(&id)); // old result must not restore the stale cache
+        assert!(bar.invalidated_git.contains(&id)); // remains pending even if project is inactive
+        assert_eq!(
+            source_label(Some(&record), bar.snapshots.get(&id), true, false),
+            "Isolated worktree / feat/test-sandbox"
+        );
+        release.send(()).unwrap();
+        executor.block_on(operations.join());
+
+        assert!(bar.begin_git_query(&id, false)); // required refresh starts immediately
+        assert!(!bar.finish_git_query(&id, Ok(snapshot(vec![tree(false)]))));
+        assert_eq!(
+            source_label(Some(&record), bar.snapshots.get(&id), false, false),
+            "Isolated worktree / feat/test-sandbox"
+        );
+        assert!(!bar.begin_git_query(&id, false)); // normal throttle is restored
+
+        bar.invalidate_git(&id);
+        assert!(bar.finish_git_query(&id, Err(anyhow::anyhow!("older request failed"))));
+        assert!(!bar.errors.contains_key(&id));
+        assert!(bar.begin_git_query(&id, false));
+        Ok(())
     }
 }
