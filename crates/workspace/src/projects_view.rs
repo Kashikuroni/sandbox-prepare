@@ -76,6 +76,7 @@ pub struct ProjectsView {
     tab: usize,
     remove_confirmation: bool,
     drafts: std::collections::BTreeMap<SandboxId, LaunchDraft>,
+    form_focus: Option<bool>,
     binding_error: Option<String>,
     save_error: Option<String>,
 }
@@ -215,6 +216,7 @@ impl ProjectsView {
             tab: 1,
             remove_confirmation: false,
             drafts: Default::default(),
+            form_focus: None,
             binding_error: None,
             save_error: None,
         };
@@ -222,6 +224,66 @@ impl ProjectsView {
             .detach();
         view.load(cx);
         view
+    }
+    pub fn prepare_project_form(&mut self, clone_remote: bool, cx: &mut Context<Self>) {
+        self.tab = 0;
+        self.error = None;
+        self.notice = None;
+        if self.clone_remote != clone_remote {
+            self.location
+                .update(cx, |input, cx| input.set_value(String::new(), cx));
+        }
+        self.clone_remote = clone_remote;
+        self.form_focus = Some(false);
+        cx.notify();
+    }
+    pub fn prepare_sandbox_form(&mut self, mode: Option<SourceMode>, cx: &mut Context<Self>) {
+        self.tab = 1;
+        self.error = None;
+        self.notice = None;
+        let mut name = "Sandbox".to_owned();
+        if let Some(mode) = mode {
+            let value = match mode {
+                SourceMode::ManagedWorktree { branch } => {
+                    if !branch.is_empty() {
+                        name = branch.clone();
+                    }
+                    self.branch
+                        .update(cx, |input, cx| input.set_value(branch, cx));
+                    "managed"
+                }
+                SourceMode::CurrentCheckout => "current",
+                SourceMode::ExistingWorktree { directory } => {
+                    let path = directory.display().to_string();
+                    name = directory
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or(name);
+                    self.worktree.update(cx, |s, cx| {
+                        s.set(vec![OptionItem::new(path.clone(), path.clone())], path, cx)
+                    });
+                    "existing"
+                }
+            };
+            self.mode.update(cx, |s, cx| {
+                s.set(
+                    [
+                        ("managed", "New isolated worktree"),
+                        ("current", "Current checkout"),
+                        ("existing", "Existing worktree"),
+                    ]
+                    .into_iter()
+                    .map(|(v, l)| OptionItem::new(v, l))
+                    .collect(),
+                    value.into(),
+                    cx,
+                )
+            });
+        }
+        self.sandbox_name
+            .update(cx, |input, cx| input.set_value(name, cx));
+        self.form_focus = Some(true);
+        cx.notify();
     }
     pub fn context(
         &mut self,
@@ -849,6 +911,13 @@ fn button(
 }
 impl Render for ProjectsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(sandbox) = self.form_focus.take() {
+            if sandbox {
+                self.sandbox_name.read(cx).focus(window);
+            } else {
+                self.project_name.read(cx).focus(window);
+            }
+        }
         let p = self.theme.palette(window.appearance());
         let ready = self.operation.is_none() && !self.app.is_stopping();
         let sandbox = self

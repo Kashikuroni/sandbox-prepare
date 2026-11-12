@@ -262,6 +262,13 @@ impl Runtime {
         services.insert(id.clone(), service.clone());
         Ok(service)
     }
+    pub fn sandbox_status(&self, id: &SandboxId) -> Option<sandbox_sandboxes::sandbox::State> {
+        self.controllers
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|manager| manager.snapshot())
+    }
     pub fn manager(&self, id: &SandboxId) -> Result<Arc<Manager>> {
         let mut controllers = self.controllers.lock().unwrap();
         if let Some(manager) = controllers.get(id) {

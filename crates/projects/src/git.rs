@@ -147,6 +147,17 @@ impl Git {
             .map(str::to_owned)
             .collect())
     }
+    pub fn local_branches(&self, root: &Path, cancel: &AtomicBool) -> Result<Vec<String>> {
+        Ok(self
+            .run(
+                root,
+                &strings(&["for-each-ref", "--format=%(refname:short)", "refs/heads"]),
+                cancel,
+            )?
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    }
     pub fn prepare(
         &self,
         catalog: &Catalog,

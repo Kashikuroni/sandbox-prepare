@@ -95,6 +95,15 @@ impl TextInput {
         input.compact = true;
         input
     }
+    pub fn picker_search_with_placeholder(
+        placeholder: &str,
+        theme: ThemeMode,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut input = Self::picker_search(theme, cx);
+        input.placeholder = placeholder.to_owned().into();
+        input
+    }
     pub fn picker_search(theme: ThemeMode, cx: &mut Context<Self>) -> Self {
         let mut input = Self::search(theme, cx);
         input.placeholder = "Search…".into();

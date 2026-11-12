@@ -20,5 +20,7 @@ these assets.
 | Refresh logs | `rotate_cw.svg` |
 | Filter dropdown | `chevron_down.svg` |
 | Selected filter option | `check.svg` |
+| Titlebar branch | `git_branch.svg` |
+| Titlebar worktree | `git_worktree.svg` |
 
 Debug/logging button: `debug.svg` (same upstream commit and license).

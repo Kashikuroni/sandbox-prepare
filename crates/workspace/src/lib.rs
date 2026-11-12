@@ -7,10 +7,11 @@ pub use sandbox_telemetry::logging;
 pub use sandbox_telemetry::process_log;
 pub use sandbox_ui::{icons, text_input, theme};
 use std::sync::Arc;
+mod context_bar;
 mod logs_view;
 mod projects_view;
 use sandbox_core::models::{ProjectId, SandboxId};
-use sandbox_ui::select::{OptionItem, Select, Selected};
+use sandbox_ui::context_picker::ContextPicker;
 use std::collections::BTreeMap;
 mod sandboxes_view;
 mod settings_view;
@@ -76,8 +77,11 @@ struct Workspace {
     application: Arc<Runtime>,
     project_id: ProjectId,
     sandbox_id: Option<SandboxId>,
-    project_picker: gpui::Entity<Select>,
-    sandbox_picker: gpui::Entity<Select>,
+    project_picker: gpui::Entity<ContextPicker>,
+    sandbox_picker: gpui::Entity<ContextPicker>,
+    worktree_picker: gpui::Entity<ContextPicker>,
+    branch_picker: gpui::Entity<ContextPicker>,
+    context_bar: context_bar::ContextBar,
     projects: gpui::Entity<projects_view::ProjectsView>,
     backup_views: BTreeMap<ProjectId, gpui::Entity<backups_view::BackupsView>>,
     context_error: Option<String>,
@@ -110,6 +114,8 @@ impl Workspace {
                 this.projects.update(cx, |_, cx| cx.notify());
                 this.project_picker.update(cx, |_, cx| cx.notify());
                 this.sandbox_picker.update(cx, |_, cx| cx.notify());
+                this.branch_picker.update(cx, |_, cx| cx.notify());
+                this.worktree_picker.update(cx, |_, cx| cx.notify());
                 this.logs.update(cx, |logs, cx| logs.remeasure(cx));
                 cx.notify();
             }
@@ -126,6 +132,10 @@ impl Workspace {
             this.project_picker
                 .update(cx, |view, cx| view.set_theme(this.settings.theme, cx));
             this.sandbox_picker
+                .update(cx, |view, cx| view.set_theme(this.settings.theme, cx));
+            this.branch_picker
+                .update(cx, |view, cx| view.set_theme(this.settings.theme, cx));
+            this.worktree_picker
                 .update(cx, |view, cx| view.set_theme(this.settings.theme, cx));
             this.application.configure(&this.settings);
             let theme = this.settings.theme;
@@ -178,28 +188,29 @@ impl Workspace {
                 cx,
             )
         });
-        let project_picker = cx.new(|cx| Select::new("Project", settings.theme, cx));
-        let sandbox_picker =
-            cx.new(|cx| Select::new("Choose or create a sandbox", settings.theme, cx));
-        cx.subscribe(&project_picker, |this, _, event: &Selected, cx| {
-            if let Ok(id) = ProjectId::try_from(event.0.clone()) {
-                let sandbox = this
-                    .application
-                    .catalog
-                    .sandboxes()
-                    .ok()
-                    .and_then(|rows| rows.into_iter().find(|s| s.project_id == id))
-                    .map(|s| s.id);
-                this.select_context(id, sandbox, cx);
-            }
-        })
-        .detach();
-        cx.subscribe(&sandbox_picker, |this, _, event: &Selected, cx| {
-            if let Ok(id) = SandboxId::try_from(event.0.clone()) {
-                this.select_context(this.project_id.clone(), Some(id), cx);
-            }
-        })
-        .detach();
+        let project_picker =
+            Self::new_context_picker("Project", "Search projects…", None, settings.theme, cx);
+        let worktree_picker = Self::new_context_picker(
+            "Worktree",
+            "Search worktrees…",
+            Some(Icon::Worktree),
+            settings.theme,
+            cx,
+        );
+        let branch_picker = Self::new_context_picker(
+            "Branch",
+            "Search branches…",
+            Some(Icon::Branch),
+            settings.theme,
+            cx,
+        );
+        let sandbox_picker = Self::new_context_picker(
+            "Sandbox",
+            "Search sandboxes…",
+            Some(Icon::Box),
+            settings.theme,
+            cx,
+        );
         cx.subscribe(&projects, |this, _, event: &projects_view::Changed, cx| {
             this.select_context(event.project.clone(), event.sandbox.clone(), cx);
         })
@@ -229,6 +240,7 @@ impl Workspace {
                 gpui::Timer::after(std::time::Duration::from_millis(200)).await;
                 if workspace
                     .update(cx, |workspace, cx| {
+                        workspace.poll_context_events(cx);
                         if choices.elapsed() > std::time::Duration::from_secs(2)
                             && !workspace.application.is_stopping()
                         {
@@ -259,6 +271,9 @@ impl Workspace {
             sandbox_id,
             project_picker,
             sandbox_picker,
+            worktree_picker,
+            branch_picker,
+            context_bar: Default::default(),
             projects,
             backup_views,
             context_error: None,
@@ -275,38 +290,27 @@ impl Workspace {
             logs_width: 420.,
             resizing_logs: None,
         };
+        workspace.configure_context_actions(cx);
+        workspace.bind_context_pickers(cx);
         workspace.refresh_choices(cx);
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SANDBOX_PREPARE_TEST_DATA_DIR").is_some()
+            && std::env::var_os("SANDBOX_PREPARE_UI_PREVIEW").is_some()
+            && let Ok(menu) = std::env::var("SANDBOX_PREPARE_UI_PREVIEW_MENU")
+        {
+            cx.defer_in(window, move |workspace, window, cx| {
+                let picker = match menu.as_str() {
+                    "project" => &workspace.project_picker,
+                    "branch" => &workspace.branch_picker,
+                    "worktree" => &workspace.worktree_picker,
+                    _ => &workspace.sandbox_picker,
+                };
+                picker.update(cx, |picker, cx| picker.open(window, cx));
+            });
+        }
         workspace
     }
 
-    fn refresh_choices(&mut self, cx: &mut Context<Self>) {
-        if let Ok(rows) = self.application.catalog.projects() {
-            self.project_picker.update(cx, |picker, cx| {
-                picker.set(
-                    rows.into_iter()
-                        .map(|p| OptionItem::new(p.id.to_string(), p.name))
-                        .collect(),
-                    self.project_id.to_string(),
-                    cx,
-                )
-            });
-        }
-        if let Ok(rows) = self.application.catalog.sandboxes() {
-            self.sandbox_picker.update(cx, |picker, cx| {
-                picker.set(
-                    rows.into_iter()
-                        .filter(|s| s.project_id == self.project_id)
-                        .map(|s| OptionItem::new(s.id.to_string(), s.name))
-                        .collect(),
-                    self.sandbox_id
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_default(),
-                    cx,
-                )
-            });
-        }
-    }
     fn select_context(
         &mut self,
         project: ProjectId,
@@ -336,6 +340,12 @@ impl Workspace {
             self.backups = backups;
             self.sandbox
                 .update(cx, |view, cx| view.set_manager(manager, cx));
+            self.context_bar
+                .last_sandbox
+                .insert(self.project_id.clone(), self.sandbox_id.clone());
+            self.context_bar
+                .last_sandbox
+                .insert(project.clone(), sandbox.clone());
             self.project_id = project.clone();
             self.sandbox_id = sandbox.clone();
             self.projects
@@ -407,11 +417,6 @@ impl Workspace {
             .bg(rgb(palette.panel_background))
             .border_r_1()
             .border_color(rgb(palette.border))
-            .child(div().text_sm().text_color(rgb(palette.text_muted)).px_2().pt_2().child("Project"))
-            .child(self.project_picker.clone())
-            .child(div().text_sm().text_color(rgb(palette.text_muted)).px_2().pt_2().child("Sandbox"))
-            .child(self.sandbox_picker.clone())
-            .child(div().h(px(12.)))
             .children(
                 Section::ALL
                     .into_iter()
@@ -532,6 +537,12 @@ impl Render for Workspace {
                     .h(px(40.))
                     .flex_shrink_0()
                     .px_2()
+                    .child(
+                        div()
+                            .w(px(if window.is_fullscreen() { 0. } else { 76. }))
+                            .flex_shrink_0(),
+                    )
+                    .child(self.render_context_bar(window))
                     .child(
                         div()
                             .id("titlebar-drag")
@@ -773,7 +784,15 @@ pub fn run() {
                 KeyBinding::new("shift-tab", FocusPrevious, Some("Settings")),
             ]);
 
-            let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
+            let mut initial_size = size(px(1100.0), px(720.0));
+            if cfg!(debug_assertions)
+                && std::env::var_os("SANDBOX_PREPARE_TEST_DATA_DIR").is_some()
+                && std::env::var_os("SANDBOX_PREPARE_UI_PREVIEW").is_some()
+                && std::env::var("SANDBOX_PREPARE_UI_PREVIEW_SIZE").as_deref() == Ok("minimum")
+            {
+                initial_size = size(px(640.), px(400.));
+            }
+            let bounds = Bounds::centered(None, initial_size, cx);
 
             let workspace_window = cx
                 .open_window(

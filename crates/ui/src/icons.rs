@@ -4,6 +4,8 @@ use gpui::{AssetSource, SharedString, Styled, Svg, px, svg};
 
 #[derive(Clone, Copy)]
 pub enum Icon {
+    Branch,
+    Worktree,
     Archive,
     Search,
     Debug,
@@ -20,6 +22,8 @@ pub enum Icon {
 impl Icon {
     fn path(self) -> &'static str {
         match self {
+            Self::Branch => "icons/zed/git_branch.svg",
+            Self::Worktree => "icons/zed/git_worktree.svg",
             Self::Search => "icons/zed/magnifying_glass.svg",
             Self::Refresh => "icons/zed/rotate_cw.svg",
             Self::ChevronDown => "icons/zed/chevron_down.svg",
@@ -45,6 +49,14 @@ impl Icon {
 
 // Embed assets so the executable also works outside the project directory.
 const ASSETS: &[(&str, &[u8])] = &[
+    (
+        "icons/zed/git_branch.svg",
+        include_bytes!("../../../assets/icons/zed/git_branch.svg"),
+    ),
+    (
+        "icons/zed/git_worktree.svg",
+        include_bytes!("../../../assets/icons/zed/git_worktree.svg"),
+    ),
     (
         "icons/zed/magnifying_glass.svg",
         include_bytes!("../../../assets/icons/zed/magnifying_glass.svg"),
