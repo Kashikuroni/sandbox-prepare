@@ -258,13 +258,15 @@ impl Workspace {
                 "This Window",
             ));
         }
-        projects.extend(
-            self.context_bar
-                .projects
-                .iter()
-                .filter(|p| p.id != self.project_id)
-                .map(|p| ContextItem::new(p.id.to_string(), p.name.clone(), "Projects")),
-        );
+        if let Ok(recent) = self.application.catalog.recent_project_ids() {
+            projects.extend(
+                recent
+                    .iter()
+                    .filter(|id| **id != self.project_id)
+                    .filter_map(|id| self.context_bar.projects.iter().find(|p| &p.id == id))
+                    .map(|p| ContextItem::new(p.id.to_string(), p.name.clone(), "Recent Projects")),
+            );
+        }
         let label = project
             .map(|p| p.name.clone())
             .unwrap_or_else(|| "Select project".into());
@@ -803,7 +805,8 @@ impl Workspace {
             .flex()
             .items_center()
             .min_w_0()
-            .gap_1()
+            .gap(px(2.))
+            .text_size(px(13.))
             .child(
                 div()
                     .max_w(px((available * 0.30).min(210.)))
@@ -830,7 +833,7 @@ impl Workspace {
             )
             .child(
                 div()
-                    .ml_2()
+                    .ml(px(6.))
                     .max_w(px((available * 0.28).min(190.)))
                     .child(self.sandbox_picker.clone()),
             )

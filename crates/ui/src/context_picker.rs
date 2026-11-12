@@ -70,8 +70,7 @@ impl ContextPicker {
         theme: ThemeMode,
         cx: &mut Context<Self>,
     ) -> Self {
-        let search =
-            cx.new(|cx| TextInput::picker_search_with_placeholder(search_label, theme, cx));
+        let search = cx.new(|cx| TextInput::context_search(search_label, theme, cx));
         cx.subscribe(&search, |this, _, _: &Edited, cx| {
             this.index = 0;
             this.scroll.scroll_to_item(0);
@@ -253,7 +252,7 @@ impl Render for ContextPicker {
                         .px_2()
                         .pt_2()
                         .pb_1()
-                        .text_xs()
+                        .text_size(px(12.))
                         .text_color(rgb(p.text_muted))
                         .child(item.group.clone())
                         .into_any_element(),
@@ -293,13 +292,13 @@ impl Render for ContextPicker {
                                     .gap_2()
                                     .child(div().min_w_0().truncate().child(item.label.clone()))
                                     .when(selected, |d| {
-                                        d.child(Icon::Check.render(p.icon_accent).size(px(14.)))
+                                        d.child(Icon::Check.render(p.icon_accent).size(px(12.)))
                                     }),
                             )
                             .when(!item.detail.is_empty(), |d| {
                                 d.child(
                                     div()
-                                        .text_xs()
+                                        .text_size(px(12.))
                                         .text_color(rgb(p.text_muted))
                                         .truncate()
                                         .child(item.detail.clone()),
@@ -310,7 +309,7 @@ impl Render for ContextPicker {
                         d.child(
                             div()
                                 .flex_shrink_0()
-                                .text_xs()
+                                .text_size(px(12.))
                                 .text_color(rgb(p.text_muted))
                                 .child(item.status.clone()),
                         )
@@ -332,7 +331,7 @@ impl Render for ContextPicker {
             .border_color(rgb(p.border))
             .bg(rgb(p.panel_background))
             .shadow_md()
-            .text_sm()
+            .text_size(px(13.))
             .text_color(rgb(p.text))
             .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
                 if !this
@@ -367,7 +366,6 @@ impl Render for ContextPicker {
             .child(
                 div()
                     .flex_shrink_0()
-                    .p_1()
                     .border_b_1()
                     .border_color(rgb(p.border))
                     .child(self.search.clone()),
@@ -381,7 +379,7 @@ impl Render for ContextPicker {
                         .overflow_y_scroll()
                         .px_3()
                         .py_2()
-                        .text_sm()
+                        .text_size(px(13.))
                         .text_color(rgb(p.text_muted))
                         .child(message),
                 )
@@ -435,17 +433,17 @@ impl Render for ContextPicker {
         div()
             .relative()
             .min_w_0()
-            .text_sm()
+            .text_size(px(13.))
             .text_color(rgb(p.text))
             .child(
                 div()
                     .id("context-trigger")
                     .track_focus(&self.focus)
-                    .h(px(28.))
+                    .h(px(24.))
                     .px_1()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap(px(2.))
                     .min_w_0()
                     .rounded_sm()
                     .cursor_pointer()
@@ -470,7 +468,7 @@ impl Render for ContextPicker {
                             } else {
                                 p.icon_muted
                             })
-                            .size(px(14.)),
+                            .size(px(12.)),
                         )
                     })
                     .child(div().min_w_0().truncate().child(self.label.clone())),
@@ -488,7 +486,7 @@ impl Render for ContextPicker {
                     div().absolute().top_0().left_0().child(
                         deferred(
                             anchored()
-                                .offset(point(px(0.), px(32.)))
+                                .offset(point(px(0.), px(28.)))
                                 .snap_to_window_with_margin(px(8.))
                                 .child(menu),
                         )

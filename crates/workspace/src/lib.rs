@@ -151,11 +151,16 @@ impl Workspace {
         })
         .detach();
         let logs = cx.new(|cx| logs_view::LogsView::new(settings.theme, cx));
-        let project = application
+        let mut projects = application.catalog.projects().expect("Opened catalog");
+        let recent = application
             .catalog
-            .projects()
-            .expect("Opened catalog")
-            .remove(0);
+            .recent_project_ids()
+            .expect("Opened project history");
+        let index = recent
+            .iter()
+            .find_map(|id| projects.iter().position(|p| &p.id == id))
+            .unwrap_or(0);
+        let project = projects.remove(index);
         let service = application
             .backups(&project.id)
             .expect("Opened backup service");
@@ -349,7 +354,8 @@ impl Workspace {
             self.project_id = project.clone();
             self.sandbox_id = sandbox.clone();
             self.projects
-                .update(cx, |view, cx| view.context(project, sandbox, cx));
+                .update(cx, |view, cx| view.context(project.clone(), sandbox, cx));
+            self.application.catalog.record_project_open(&project)?;
             Ok::<_, anyhow::Error>(())
         })();
         self.context_error = result.err().map(|e| e.to_string());
@@ -534,7 +540,7 @@ impl Render for Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .h(px(40.))
+                    .h(px(34.))
                     .flex_shrink_0()
                     .px_2()
                     .child(
@@ -564,7 +570,7 @@ impl Render for Workspace {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .size(px(28.))
+                            .size(px(24.))
                             .rounded_sm()
                             .cursor_pointer()
                             .hover(|el| el.bg(rgb(palette.element_hover)))

@@ -10,7 +10,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const VERSION: i64 = 2;
+const VERSION: i64 = 3;
 #[derive(Clone)]
 pub struct Catalog {
     pub database: PathBuf,
@@ -172,6 +172,12 @@ impl Catalog {
             tx.pragma_update(None, "user_version", 2)?;
             tx.commit()?;
         }
+        if version < 3 {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute_batch("CREATE TABLE project_open_history(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,opened_sequence INTEGER NOT NULL);")?;
+            tx.pragma_update(None, "user_version", 3)?;
+            tx.commit()?;
+        }
         db.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
         )?;
@@ -197,6 +203,21 @@ impl Catalog {
         let mut statement = db.prepare(sql)?;
         let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+    /// Record an explicit successful open; catalog discovery and startup do not populate history.
+    pub fn record_project_open(&self, project: &ProjectId) -> Result<()> {
+        self.db()?.execute("INSERT INTO project_open_history(project_id,opened_sequence) VALUES (?1,(SELECT COALESCE(MAX(opened_sequence),0)+1 FROM project_open_history)) ON CONFLICT(project_id) DO UPDATE SET opened_sequence=excluded.opened_sequence", [project.as_str()])?;
+        Ok(())
+    }
+    pub fn recent_project_ids(&self) -> Result<Vec<ProjectId>> {
+        let db = self.db()?;
+        let mut statement = db.prepare(
+            "SELECT project_id FROM project_open_history ORDER BY opened_sequence DESC,project_id",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| ProjectId::try_from(row?).map_err(anyhow::Error::msg))
+            .collect()
     }
     pub fn projects(&self) -> Result<Vec<Project>> {
         self.all("SELECT json FROM projects ORDER BY rowid")
@@ -384,6 +405,65 @@ fn private(path: &Path, directory: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn project_history_is_explicit_unique_ordered_and_durable() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("sandbox-history-{}", crate::docker::nonce()?));
+        let path = root.join("application.sqlite3");
+        let catalog = Catalog::open(path.clone())?;
+        let a = catalog.projects()?.remove(0);
+        let b = catalog.create_project("Second".into(), None, StorageConfig::default())?;
+        assert!(catalog.recent_project_ids()?.is_empty());
+        for id in [&a.id, &b.id, &a.id] {
+            catalog.record_project_open(id)?;
+        }
+        let expected = vec![a.id.clone(), b.id.clone()];
+        assert_eq!(catalog.recent_project_ids()?, expected);
+        assert!(
+            catalog
+                .record_project_open(&ProjectId::try_from("missing".to_owned()).unwrap())
+                .is_err()
+        );
+        assert_eq!(catalog.recent_project_ids()?, expected);
+        drop(catalog);
+        let reopened = Catalog::open(path)?;
+        assert_eq!(reopened.recent_project_ids()?, expected);
+        drop(reopened);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
+    fn v2_upgrade_preserves_catalog_without_inventing_history() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sandbox-history-upgrade-{}",
+            crate::docker::nonce()?
+        ));
+        let path = root.join("application.sqlite3");
+        let catalog = Catalog::open(path.clone())?;
+        let project = catalog.projects()?.remove(0);
+        let owner = catalog.owner.clone();
+        drop(catalog);
+        let db = Connection::open(&path)?;
+        db.execute_batch("DROP TABLE project_open_history; PRAGMA user_version=2;")?;
+        drop(db);
+        let catalog = Catalog::open(path)?;
+        assert_eq!(catalog.owner, owner);
+        assert_eq!(
+            catalog.project(&project.id)?.backup_root,
+            project.backup_root
+        );
+        assert!(catalog.recent_project_ids()?.is_empty());
+        assert_eq!(
+            catalog
+                .db()?
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?,
+            VERSION
+        );
+        assert!(root.join("migrations").read_dir()?.next().is_some());
+        drop(catalog);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
     #[test]
     fn concurrent_metadata_writers_share_one_connection() -> Result<()> {
         let root = std::env::temp_dir().join(format!(

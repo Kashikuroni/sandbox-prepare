@@ -40,6 +40,7 @@ pub struct TextInput {
     secret: bool,
     multiline: bool,
     compact: bool,
+    plain_search: bool,
     last_lines: Vec<(usize, ShapedLine)>,
     scroll: gpui::ScrollHandle,
     viewport_height: Pixels,
@@ -61,6 +62,7 @@ impl TextInput {
             secret,
             multiline: false,
             compact: false,
+            plain_search: false,
             last_lines: vec![],
             scroll: gpui::ScrollHandle::new(),
             viewport_height: px(200.),
@@ -93,6 +95,12 @@ impl TextInput {
         let mut input = Self::new(String::new(), false, theme, cx);
         input.placeholder = "Search settings…".into();
         input.compact = true;
+        input
+    }
+    /// Search row integrated into a titlebar popup, without a nested input frame.
+    pub fn context_search(placeholder: &str, theme: ThemeMode, cx: &mut Context<Self>) -> Self {
+        let mut input = Self::picker_search_with_placeholder(placeholder, theme, cx);
+        input.plain_search = true;
         input
     }
     pub fn picker_search_with_placeholder(
@@ -701,7 +709,11 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    rgb(input.theme.palette(window.appearance()).text_muted),
+                    rgb(if input.plain_search {
+                        input.theme.palette(window.appearance()).icon_accent
+                    } else {
+                        input.theme.palette(window.appearance()).text_muted
+                    }),
                 )),
             )
         } else {
@@ -860,7 +872,9 @@ fn multiline_prepaint(
 impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.theme.palette(window.appearance());
-        let background = if self.placeholder.is_empty() {
+        let background = if self.plain_search {
+            palette.panel_background
+        } else if self.placeholder.is_empty() {
             palette.element_background
         } else {
             palette.editor_background
@@ -895,11 +909,13 @@ impl Render for TextInput {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .bg(rgb(background))
             .text_color(rgb(palette.text))
-            .rounded_sm()
             .overflow_hidden()
-            .border_1()
-            .border_color(rgb(palette.border))
-            .focus(|style| style.border_color(rgb(palette.border_focused)))
+            .when(!self.plain_search, |el| {
+                el.rounded_sm()
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .focus(|style| style.border_color(rgb(palette.border_focused)))
+            })
             .line_height(px(if self.multiline {
                 22.
             } else if self.compact {
@@ -908,13 +924,16 @@ impl Render for TextInput {
                 30.
             }))
             .when(self.compact, |el| {
-                el.h(px(28.)).items_center().px_2().gap_1()
+                el.h(px(if self.plain_search { 36. } else { 28. }))
+                    .items_center()
+                    .px(px(if self.plain_search { 12. } else { 8. }))
+                    .gap_1()
             })
             .when(self.multiline, |el| {
                 el.flex_col().size_full().min_h_0().font_family("Menlo")
             })
-            .text_size(px(14.))
-            .when(self.compact, |el| {
+            .text_size(px(if self.plain_search { 13. } else { 14. }))
+            .when(self.compact && !self.plain_search, |el| {
                 el.child(Icon::Search.render(palette.icon_muted).size(px(14.)))
             })
             .child(
