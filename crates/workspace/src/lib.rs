@@ -8,6 +8,10 @@ pub use sandbox_telemetry::process_log;
 pub use sandbox_ui::{icons, text_input, theme};
 use std::sync::Arc;
 mod logs_view;
+mod projects_view;
+use sandbox_core::models::{ProjectId, SandboxId};
+use sandbox_ui::select::{OptionItem, Select, Selected};
+use std::collections::BTreeMap;
 mod sandboxes_view;
 mod settings_view;
 use crate::theme::ThemePalette as _;
@@ -38,16 +42,23 @@ enum Section {
     Backups,
     Processes,
     Sandboxes,
+    Projects,
 }
 
 impl Section {
-    const ALL: [Self; 3] = [Self::Backups, Self::Processes, Self::Sandboxes];
+    const ALL: [Self; 4] = [
+        Self::Backups,
+        Self::Processes,
+        Self::Sandboxes,
+        Self::Projects,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Backups => "Backups",
             Self::Processes => "Processes",
             Self::Sandboxes => "Sandboxes",
+            Self::Projects => "Projects",
         }
     }
 
@@ -56,12 +67,20 @@ impl Section {
             Self::Backups => Icon::Archive,
             Self::Processes => Icon::Terminal,
             Self::Sandboxes => Icon::Box,
+            Self::Projects => Icon::Settings,
         }
     }
 }
 
 struct Workspace {
     application: Arc<Runtime>,
+    project_id: ProjectId,
+    sandbox_id: Option<SandboxId>,
+    project_picker: gpui::Entity<Select>,
+    sandbox_picker: gpui::Entity<Select>,
+    projects: gpui::Entity<projects_view::ProjectsView>,
+    backup_views: BTreeMap<ProjectId, gpui::Entity<backups_view::BackupsView>>,
+    context_error: Option<String>,
     active_section: Section,
     sidebar_open: bool,
     focus_handle: FocusHandle,
@@ -88,6 +107,9 @@ impl Workspace {
         cx.observe_window_appearance(window, |this, _, cx| {
             if this.settings.theme == ThemeMode::System {
                 this.backups.update(cx, |_, cx| cx.notify());
+                this.projects.update(cx, |_, cx| cx.notify());
+                this.project_picker.update(cx, |_, cx| cx.notify());
+                this.sandbox_picker.update(cx, |_, cx| cx.notify());
                 this.logs.update(cx, |logs, cx| logs.remeasure(cx));
                 cx.notify();
             }
@@ -99,6 +121,12 @@ impl Workspace {
         let settings = settings_model.read(cx).value.clone();
         cx.observe(&settings_model, |this, model, cx| {
             this.settings = model.read(cx).value.clone();
+            this.projects
+                .update(cx, |view, cx| view.set_theme(this.settings.theme, cx));
+            this.project_picker
+                .update(cx, |view, cx| view.set_theme(this.settings.theme, cx));
+            this.sandbox_picker
+                .update(cx, |view, cx| view.set_theme(this.settings.theme, cx));
             this.application.configure(&this.settings);
             let theme = this.settings.theme;
             this.logs.update(cx, |logs, cx| logs.set_theme(theme, cx));
@@ -139,6 +167,44 @@ impl Workspace {
         let manager = application.manager(&record.id).ok();
         let backups = cx.new(|cx| backups_view::BackupsView::new(service, settings.theme, cx));
         let sandbox = cx.new(|cx| sandboxes_view::SandboxesView::new(manager, &settings, cx));
+        let project_id = project.id.clone();
+        let sandbox_id = Some(record.id.clone());
+        let projects = cx.new(|cx| {
+            projects_view::ProjectsView::new(
+                application.clone(),
+                project_id.clone(),
+                sandbox_id.clone(),
+                settings.theme,
+                cx,
+            )
+        });
+        let project_picker = cx.new(|cx| Select::new("Project", settings.theme, cx));
+        let sandbox_picker =
+            cx.new(|cx| Select::new("Choose or create a sandbox", settings.theme, cx));
+        cx.subscribe(&project_picker, |this, _, event: &Selected, cx| {
+            if let Ok(id) = ProjectId::try_from(event.0.clone()) {
+                let sandbox = this
+                    .application
+                    .catalog
+                    .sandboxes()
+                    .ok()
+                    .and_then(|rows| rows.into_iter().find(|s| s.project_id == id))
+                    .map(|s| s.id);
+                this.select_context(id, sandbox, cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&sandbox_picker, |this, _, event: &Selected, cx| {
+            if let Ok(id) = SandboxId::try_from(event.0.clone()) {
+                this.select_context(this.project_id.clone(), Some(id), cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&projects, |this, _, event: &projects_view::Changed, cx| {
+            this.select_context(event.project.clone(), event.sandbox.clone(), cx);
+        })
+        .detach();
+        let backup_views = BTreeMap::from([(project_id.clone(), backups.clone())]);
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
             weak.update(cx, |workspace, _cx| {
@@ -158,10 +224,17 @@ impl Workspace {
         .detach();
 
         cx.spawn(async move |workspace, cx| {
+            let mut choices = std::time::Instant::now();
             loop {
                 gpui::Timer::after(std::time::Duration::from_millis(200)).await;
                 if workspace
                     .update(cx, |workspace, cx| {
+                        if choices.elapsed() > std::time::Duration::from_secs(2)
+                            && !workspace.application.is_stopping()
+                        {
+                            choices = std::time::Instant::now();
+                            workspace.refresh_choices(cx);
+                        }
                         if workspace.application.exit_ready() {
                             cx.quit();
                             return;
@@ -180,8 +253,15 @@ impl Workspace {
             }
         })
         .detach();
-        Self {
+        let mut workspace = Self {
             application,
+            project_id,
+            sandbox_id,
+            project_picker,
+            sandbox_picker,
+            projects,
+            backup_views,
+            context_error: None,
             active_section: Section::Backups,
             sidebar_open: true,
             focus_handle,
@@ -194,9 +274,78 @@ impl Workspace {
             logs_open: false,
             logs_width: 420.,
             resizing_logs: None,
-        }
+        };
+        workspace.refresh_choices(cx);
+        workspace
     }
 
+    fn refresh_choices(&mut self, cx: &mut Context<Self>) {
+        if let Ok(rows) = self.application.catalog.projects() {
+            self.project_picker.update(cx, |picker, cx| {
+                picker.set(
+                    rows.into_iter()
+                        .map(|p| OptionItem::new(p.id.to_string(), p.name))
+                        .collect(),
+                    self.project_id.to_string(),
+                    cx,
+                )
+            });
+        }
+        if let Ok(rows) = self.application.catalog.sandboxes() {
+            self.sandbox_picker.update(cx, |picker, cx| {
+                picker.set(
+                    rows.into_iter()
+                        .filter(|s| s.project_id == self.project_id)
+                        .map(|s| OptionItem::new(s.id.to_string(), s.name))
+                        .collect(),
+                    self.sandbox_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    cx,
+                )
+            });
+        }
+    }
+    fn select_context(
+        &mut self,
+        project: ProjectId,
+        sandbox: Option<SandboxId>,
+        cx: &mut Context<Self>,
+    ) {
+        let result = (|| {
+            let service = self.application.backups(&project)?;
+            if let Some(handle) = self.settings_window {
+                handle
+                    .update(cx, |view, _, cx| view.switch_project(service.clone(), cx))
+                    .unwrap_or(Ok(()))?;
+            }
+            let manager = sandbox
+                .as_ref()
+                .map(|id| self.application.manager(id))
+                .transpose()?;
+            let backups = if let Some(view) = self.backup_views.get(&project) {
+                view.clone()
+            } else {
+                let view =
+                    cx.new(|cx| backups_view::BackupsView::new(service, self.settings.theme, cx));
+                self.backup_views.insert(project.clone(), view.clone());
+                view
+            };
+            backups.update(cx, |view, cx| view.set_theme(self.settings.theme, cx));
+            self.backups = backups;
+            self.sandbox
+                .update(cx, |view, cx| view.set_manager(manager, cx));
+            self.project_id = project.clone();
+            self.sandbox_id = sandbox.clone();
+            self.projects
+                .update(cx, |view, cx| view.context(project, sandbox, cx));
+            Ok::<_, anyhow::Error>(())
+        })();
+        self.context_error = result.err().map(|e| e.to_string());
+        self.refresh_choices(cx);
+        cx.notify();
+    }
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_open = !self.sidebar_open;
         tracing::debug!(target:"app::ui",open=self.sidebar_open,"Navigation toggled");
@@ -258,6 +407,11 @@ impl Workspace {
             .bg(rgb(palette.panel_background))
             .border_r_1()
             .border_color(rgb(palette.border))
+            .child(div().text_sm().text_color(rgb(palette.text_muted)).px_2().pt_2().child("Project"))
+            .child(self.project_picker.clone())
+            .child(div().text_sm().text_color(rgb(palette.text_muted)).px_2().pt_2().child("Sandbox"))
+            .child(self.sandbox_picker.clone())
+            .child(div().h(px(12.)))
             .children(
                 Section::ALL
                     .into_iter()
@@ -450,8 +604,19 @@ impl Render for Workspace {
                             .when(self.active_section == Section::Backups, |content| {
                                 content.child(self.backups.clone())
                             })
-                            .when(self.active_section != Section::Backups, |content| {
-                                content.child(self.sandbox.clone())
+                            .when(
+                                matches!(
+                                    self.active_section,
+                                    Section::Sandboxes | Section::Processes
+                                ),
+                                |content| content.child(self.sandbox.clone()),
+                            )
+                            .when(self.active_section == Section::Projects, |content| {
+                                content.child(self.projects.clone())
+                            })
+                            .when_some(self.context_error.clone(), |content, error| {
+                                content
+                                    .child(div().p_3().text_color(rgb(palette.error)).child(error))
                             }),
                     )
                     .when(self.logs_open, |row| {

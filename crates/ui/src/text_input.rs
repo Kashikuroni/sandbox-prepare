@@ -95,6 +95,11 @@ impl TextInput {
         input.compact = true;
         input
     }
+    pub fn picker_search(theme: ThemeMode, cx: &mut Context<Self>) -> Self {
+        let mut input = Self::search(theme, cx);
+        input.placeholder = "Search…".into();
+        input
+    }
     pub fn focus(&self, window: &mut Window) {
         self.focus_handle.focus(window);
     }

@@ -64,6 +64,34 @@ pub struct SettingsWindow {
     log_errors: [Option<String>; 5],
 }
 impl SettingsWindow {
+    pub fn switch_project(
+        &mut self,
+        backups: Arc<Service>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        if self.backups.project().id == backups.project().id {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.has_unsaved(cx),
+            "Save or discard edits in Settings before switching projects"
+        );
+        self.backups = backups;
+        let config = self.backups.project().storage;
+        self.saved_storage = [
+            config.endpoint,
+            config.bucket,
+            config.region,
+            config.access_key,
+            config.secret_key,
+        ];
+        for (field, value) in self.storage.iter().zip(&self.saved_storage) {
+            field.update(cx, |input, cx| input.set_value(value.clone(), cx));
+        }
+        self.message = None;
+        cx.notify();
+        Ok(())
+    }
     pub fn new(
         model: Entity<SettingsModel>,
         backups: Arc<Service>,
@@ -442,6 +470,14 @@ impl SettingsWindow {
             }
         }
         if storage_visible {
+            rows.insert(
+                0,
+                div()
+                    .pb_3()
+                    .text_sm()
+                    .text_color(rgb(palette.text_muted))
+                    .child(format!("Project: {}", self.backups.project().name)),
+            );
             rows.push(div().flex().justify_end().py_4().child(button(
                 "save-storage",
                 "Save connection",

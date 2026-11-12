@@ -27,7 +27,9 @@ pub struct SandboxesView {
     log_revision: u64,
     lines: Vec<Line>,
     list: ListState,
-    filter: usize,
+    filter: String,
+    process_picker: gpui::Entity<sandbox_ui::select::Select>,
+    process_options: Vec<String>,
     confirmation: Option<Confirmation>,
     focus: FocusHandle,
     modal_focus: [FocusHandle; 2],
@@ -48,6 +50,17 @@ impl SandboxesView {
                 .logs
                 .configure(settings.current_log_limit, settings.logging);
         }
+        let process_picker =
+            cx.new(|cx| sandbox_ui::select::Select::new("All processes", theme, cx));
+        cx.subscribe(
+            &process_picker,
+            |view, _, event: &sandbox_ui::select::Selected, cx| {
+                view.filter = event.0.clone();
+                view.refresh_lines();
+                cx.notify();
+            },
+        )
+        .detach();
         let error = None;
         cx.spawn(async move |view, cx| {
             loop {
@@ -64,6 +77,7 @@ impl SandboxesView {
                             view.revision = revision;
                             if !view.paused {
                                 view.refresh_lines();
+                                view.process_choices(cx);
                             }
                             cx.notify();
                         }
@@ -84,7 +98,9 @@ impl SandboxesView {
             log_revision: 0,
             lines: vec![],
             list: ListState::new(0, ListAlignment::Bottom, px(400.)),
-            filter: 0,
+            filter: "*".into(),
+            process_picker,
+            process_options: vec![],
             confirmation: None,
             focus: cx.focus_handle(),
             modal_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
@@ -93,6 +109,21 @@ impl SandboxesView {
             paused: false,
             copied: false,
         }
+    }
+    pub fn set_manager(&mut self, manager: Option<Arc<Manager>>, cx: &mut Context<Self>) {
+        self.manager = manager;
+        self.error = None;
+        self.revision = u64::MAX;
+        self.log_revision = u64::MAX;
+        self.lines.clear();
+        self.list.reset(0);
+        self.filter = "*".into();
+        self.process_options.clear();
+        self.confirmation = None;
+        self.copied = false;
+        self.refresh_lines();
+        self.process_choices(cx);
+        cx.notify();
     }
     pub fn configure_logs(&self, settings: &crate::settings::Settings) {
         if let Some(manager) = &self.manager {
@@ -103,6 +134,8 @@ impl SandboxesView {
     }
     pub fn set_theme(&mut self, theme: ThemeMode, cx: &mut Context<Self>) {
         self.theme = theme;
+        self.process_picker
+            .update(cx, |picker, cx| picker.set_theme(theme, cx));
         cx.notify();
     }
     pub fn show_processes(&mut self, show: bool, cx: &mut Context<Self>) {
@@ -113,6 +146,35 @@ impl SandboxesView {
         self.exit_requested = stopping;
         cx.notify();
     }
+    fn process_choices(&mut self, cx: &mut Context<Self>) {
+        let mut names: Vec<_> = self
+            .manager
+            .as_ref()
+            .map(|manager| {
+                manager
+                    .logs
+                    .snapshot()
+                    .into_iter()
+                    .map(|line| line.process)
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.extend(["mysql".into(), "clickhouse".into()]);
+        names.sort();
+        names.dedup();
+        if names != self.process_options {
+            let mut options = vec![sandbox_ui::select::OptionItem::new("*", "All processes")];
+            options.extend(
+                names
+                    .iter()
+                    .map(|name| sandbox_ui::select::OptionItem::new(name.clone(), name.clone())),
+            );
+            self.process_options = names;
+            self.process_picker.update(cx, |picker, cx| {
+                picker.set(options, self.filter.clone(), cx)
+            });
+        }
+    }
     fn refresh_lines(&mut self) {
         let Some(manager) = &self.manager else {
             return;
@@ -122,12 +184,7 @@ impl SandboxesView {
             .logs
             .snapshot()
             .into_iter()
-            .filter(|line| match self.filter {
-                1 => line.process == "mysql",
-                2 => line.process == "clickhouse",
-                3 => line.process != "mysql" && line.process != "clickhouse",
-                _ => true,
-            })
+            .filter(|line| self.filter == "*" || line.process == self.filter)
             .collect();
         if let Some(first) = lines.first() {
             let removed = self
@@ -364,16 +421,35 @@ impl SandboxesView {
                         ),
                 );
             }
-            page=page.child(div().flex().child(button("copy-sandbox",if self.copied{"Copied"}else{"Copy connection details"},palette,true,cx,|view,_,cx|{
-                if let Some(manager)=&view.manager&&let Some(instance)=manager.snapshot().active{
-                    cx.write_to_clipboard(ClipboardItem::new_string(format!("MYSQL_HOST=127.0.0.1\nMYSQL_PORT={}\nMYSQL_USER=sandbox\nMYSQL_PASSWORD={}\nCLICKHOUSE_HOST=127.0.0.1\nCLICKHOUSE_HTTP_PORT={}\nCLICKHOUSE_NATIVE_PORT={}\nCLICKHOUSE_USER=sandbox\nCLICKHOUSE_PASSWORD={}\nDOCKER_NETWORK={}_default\nDOCKER_MYSQL_HOST=mysql\nDOCKER_CLICKHOUSE_HOST=clickhouse\n",instance.ports[0],manager.store.password,instance.ports[1],instance.ports[2],manager.store.password,instance.project)));
-                    view.copied=true;cx.notify();
-                }
-            })));
+            page = page.child(div().flex().child(button(
+                "copy-sandbox",
+                if self.copied {
+                    "Copied"
+                } else {
+                    "Copy connection details"
+                },
+                palette,
+                true,
+                cx,
+                |view, _, cx| {
+                    if let Some(manager) = &view.manager
+                        && let Some(instance) = manager.snapshot().active
+                    {
+                        match manager.connection_environment(&instance) {
+                            Ok(text) => {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                view.copied = true;
+                            }
+                            Err(error) => view.error = Some(format!("{error:#}")),
+                        };
+                        cx.notify();
+                    }
+                },
+            )));
         } else {
             page=page.child(div().py_4().text_sm().child("Create MySQL and ClickHouse from the current local backup pair. Download both backups on the Backups page first."));
         }
-        page.child(div().text_sm().text_color(rgb(palette.text_muted)).child("Databases stop when Sandbox Prepare closes. Stopping preserves data; Delete removes both database volumes."))
+        page.child(div().text_sm().text_color(rgb(palette.text_muted)).child("Databases stop when Sandbox Prepare closes. Stopping preserves data; Delete removes database volumes and private application data."))
     }
     fn processes_page(&self, palette: Palette, cx: &mut Context<Self>) -> Div {
         div()
@@ -389,28 +465,7 @@ impl SandboxesView {
                     .items_center()
                     .flex_wrap()
                     .gap_1()
-                    .children(
-                        ["All", "MySQL", "ClickHouse", "Restore"]
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, label)| {
-                                button(
-                                    ("process-filter", index),
-                                    label,
-                                    palette,
-                                    true,
-                                    cx,
-                                    move |view, _, cx| {
-                                        view.filter = index;
-                                        view.refresh_lines();
-                                        cx.notify();
-                                    },
-                                )
-                                .when(self.filter == index, |button| {
-                                    button.bg(rgb(palette.element_selected))
-                                })
-                            }),
-                    )
+                    .child(div().w(px(240.)).child(self.process_picker.clone()))
                     .child(div().flex_1())
                     .child(button(
                         "pause-process-logs",
@@ -465,7 +520,7 @@ impl SandboxesView {
             }))
             .child(div().w(px(440.)).max_w_full().p_5().gap_4().flex().flex_col().rounded_md().border_1().border_color(rgb(palette.border)).bg(rgb(palette.editor_background)).shadow_lg()
                 .child(div().text_lg().child(if recreate{"Recreate databases?"}else{"Delete sandbox data?"}))
-                .child(div().text_sm().child(if recreate{"Both databases will be restored into new volumes. After validation succeeds, the previous databases and their local changes will be deleted."}else{"Both database volumes and their local changes will be permanently deleted. Downloaded backup archives are preserved."}))
+                .child(div().text_sm().child(if recreate{"Both databases will be restored into new volumes. After validation succeeds, the previous databases and their local changes will be deleted."}else{"Database volumes and private application data will be permanently deleted. Downloaded backups and Git sources are preserved."}))
                 .child(div().flex().justify_end().gap_2()
                     .child(button("cancel-sandbox-confirmation","Cancel",palette,true,cx,|view,_,cx|{view.confirmation=None;cx.notify();}).track_focus(&self.modal_focus[0]))
                     .child(button("confirm-sandbox-action",if recreate{"Recreate"}else{"Delete"},palette,true,cx,move|view,_,cx|{view.confirmation=None;view.act(if recreate{Action::Create}else{Action::Delete},cx);}).track_focus(&self.modal_focus[1]).text_color(rgb(palette.error)))))

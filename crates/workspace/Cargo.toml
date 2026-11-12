@@ -19,3 +19,4 @@ sandbox_backups.workspace = true
 sandbox_sandboxes.workspace = true
 sandbox_runtime.workspace = true
 sandbox_core.workspace = true
+sandbox_projects.workspace = true
