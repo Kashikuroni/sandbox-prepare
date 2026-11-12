@@ -265,7 +265,37 @@ impl Catalog {
     }
     pub fn save_sandbox(&self, sandbox: &Sandbox) -> Result<()> {
         ensure!(!sandbox.name.trim().is_empty(), "Enter a sandbox name");
-        self.db()?.execute("INSERT INTO sandboxes VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET json=excluded.json",params![sandbox.id.as_str(),sandbox.project_id.as_str(),serde_json::to_string(sandbox)?])?;
+        let db = self.db()?;
+        if let Some(source) = &sandbox.source {
+            let mut statement = db.prepare("SELECT json FROM sandboxes")?;
+            let records: Vec<Sandbox> = statement
+                .query_map([], |r| r.get::<_, String>(0))?
+                .map(|row| Ok(serde_json::from_str(&row?)?))
+                .collect::<Result<_>>()?;
+            let unchanged = records
+                .iter()
+                .find(|s| s.id == sandbox.id)
+                .and_then(|s| s.source.as_ref())
+                .is_some_and(|s| s.directory == source.directory);
+            // Existing conflicting legacy bindings remain editable, but new duplicates are refused.
+            if !unchanged {
+                let canonical = source.directory.canonicalize().ok();
+                ensure!(
+                    !records.iter().filter(|s| s.id != sandbox.id).any(|s| s
+                        .source
+                        .as_ref()
+                        .is_some_and(|s| s.directory == source.directory
+                            || canonical.as_ref().is_some_and(|path| s
+                                .directory
+                                .canonicalize()
+                                .ok()
+                                .as_ref()
+                                == Some(path)))),
+                    "This working directory already belongs to a sandbox"
+                );
+            }
+        }
+        db.execute("INSERT INTO sandboxes VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET json=excluded.json",params![sandbox.id.as_str(),sandbox.project_id.as_str(),serde_json::to_string(sandbox)?])?;
         Ok(())
     }
     pub fn create_sandbox(&self, project_id: ProjectId, name: String) -> Result<Sandbox> {
@@ -405,6 +435,55 @@ fn private(path: &Path, directory: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn directory_binding_refuses_new_duplicates_and_preserves_legacy_records() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sandbox-directory-binding-{}",
+            crate::docker::nonce()?
+        ));
+        let path = root.join("application.sqlite3");
+        let directory = root.join("repo");
+        fs::create_dir_all(&directory)?;
+        let catalog = Catalog::open(path.clone())?;
+        let project = catalog.projects()?.remove(0);
+        let mut first = catalog.create_sandbox(project.id.clone(), "First".into())?;
+        first.source = Some(SourceSelection {
+            mode: SourceMode::CurrentCheckout,
+            directory: directory.canonicalize()?,
+            owned: false,
+            revision: "fixture".into(),
+        });
+        catalog.save_sandbox(&first)?;
+        let mut second = catalog.create_sandbox(project.id.clone(), "Legacy".into())?;
+        let password = second.password.clone();
+        second.source = first.source.clone();
+        assert!(catalog.save_sandbox(&second).is_err());
+        #[cfg(unix)]
+        {
+            let alias = root.join("alias");
+            std::os::unix::fs::symlink(&directory, &alias)?;
+            second.source.as_mut().unwrap().directory = alias;
+            assert!(catalog.save_sandbox(&second).is_err());
+        }
+        second.source = first.source.clone();
+        // Simulate a pre-upgrade catalog containing two environments for one directory.
+        catalog.db()?.execute(
+            "UPDATE sandboxes SET json=?1 WHERE id=?2",
+            params![serde_json::to_string(&second)?, second.id.as_str()],
+        )?;
+        drop(catalog);
+        let catalog = Catalog::open(path)?;
+        assert_eq!(catalog.sandboxes()?.len(), 2);
+        assert_eq!(catalog.sandbox(&second.id)?.password, password);
+        first.name = "Updated settings".into();
+        catalog.save_sandbox(&first)?;
+        let mut third = catalog.create_sandbox(project.id, "Third".into())?;
+        third.source = first.source.clone();
+        assert!(catalog.save_sandbox(&third).is_err());
+        drop(catalog);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
     #[test]
     fn project_history_is_explicit_unique_ordered_and_durable() -> Result<()> {
         let root =

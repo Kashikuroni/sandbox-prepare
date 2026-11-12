@@ -166,6 +166,18 @@ impl Git {
         mode: SourceMode,
         cancel: &AtomicBool,
     ) -> Result<SourceSelection> {
+        self.prepare_from(catalog, project, sandbox, mode, None, cancel)
+    }
+    /// A new branch starts at the selected working copy, without switching its checkout.
+    pub fn prepare_from(
+        &self,
+        catalog: &Catalog,
+        project: &Project,
+        sandbox: &mut Sandbox,
+        mode: SourceMode,
+        base_revision: Option<&str>,
+        cancel: &AtomicBool,
+    ) -> Result<SourceSelection> {
         let repository = project
             .repository
             .as_ref()
@@ -227,8 +239,19 @@ impl Git {
                     !target.exists(),
                     "Worktree directory already exists; select it as an existing worktree"
                 );
+                let base = base_revision.unwrap_or("HEAD");
+                ensure!(
+                    base == "HEAD"
+                        || (matches!(base.len(), 40 | 64)
+                            && base.bytes().all(|b| b.is_ascii_hexdigit())),
+                    "Invalid source revision"
+                );
                 let revision = self
-                    .run(&main.directory, &strings(&["rev-parse", "HEAD"]), cancel)?
+                    .run(
+                        &main.directory,
+                        &strings(&["rev-parse", "--verify", &format!("{base}^{{commit}}")]),
+                        cancel,
+                    )?
                     .trim()
                     .to_owned();
                 // Persist ownership before Git creates anything; interrupted creation is visible.
@@ -395,17 +418,44 @@ mod tests {
             )
             .is_err()
         );
-        let existing = git.prepare(
+        // A second record may not attach to a directory that already has its environment.
+        assert!(
+            git.prepare(
+                &catalog,
+                &project,
+                &mut other,
+                SourceMode::ExistingWorktree {
+                    directory: managed.directory.clone()
+                },
+                &cancel
+            )
+            .is_err()
+        );
+        other.source = None;
+        fs::write(managed.directory.join("file"), "linked commit")?;
+        command(&managed.directory, &["add", "file"])?;
+        command(&managed.directory, &["commit", "-m", "linked change"])?;
+        let base = command(&managed.directory, &["rev-parse", "HEAD"])?;
+        let mut derived = catalog.create_sandbox(project.id.clone(), "Derived".into())?;
+        let derived_source = git.prepare_from(
             &catalog,
             &project,
-            &mut other,
-            SourceMode::ExistingWorktree {
-                directory: managed.directory.clone(),
+            &mut derived,
+            SourceMode::ManagedWorktree {
+                branch: "feature/derived".into(),
             },
+            Some(base.trim()),
             &cancel,
         )?;
-        assert!(!existing.owned);
-        assert!(!git.remove_owned(&catalog, &project, &other, &cancel)?);
+        assert_eq!(
+            fs::read_to_string(derived_source.directory.join("file"))?,
+            "linked commit"
+        );
+        assert_eq!(
+            command(&repo, &["branch", "--show-current"])?.trim(),
+            "main"
+        );
+        assert!(git.remove_owned(&catalog, &project, &derived, &cancel)?);
         fs::write(managed.directory.join("untracked"), "preserve")?;
         assert!(!git.remove_owned(&catalog, &project, &sandbox, &cancel)?);
         fs::remove_file(managed.directory.join("untracked"))?;

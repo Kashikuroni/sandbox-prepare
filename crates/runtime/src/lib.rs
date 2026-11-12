@@ -44,6 +44,7 @@ pub struct Runtime {
     watchdog: Mutex<Option<Watchdog>>,
     _lock: File,
     shutdown_gate: Mutex<()>,
+    source_gate: Mutex<()>,
 }
 impl Runtime {
     pub fn open(handle: tokio::runtime::Handle, settings: &Settings) -> Result<Arc<Self>> {
@@ -96,6 +97,7 @@ impl Runtime {
             watchdog: Mutex::new(guard),
             _lock: lock,
             shutdown_gate: Mutex::new(()),
+            source_gate: Mutex::new(()),
         });
         // Opening a backup service only registers secrets; it does not reread archives.
         for project in runtime.catalog.projects()? {
@@ -153,18 +155,137 @@ impl Runtime {
         mode: Option<SourceMode>,
         cancel: &AtomicBool,
     ) -> Result<Sandbox> {
-        ensure!(!self.is_stopping(), "Application is shutting down");
+        self.create_source(project, name, mode, None, cancel)
+    }
+    /// Open the environment attached to a directory, or prepare its first environment.
+    pub fn open_working_copy(
+        &self,
+        project: &ProjectId,
+        mode: SourceMode,
+        base_revision: Option<&str>,
+        cancel: &AtomicBool,
+    ) -> Result<Sandbox> {
+        let project_record = self.catalog.project(project)?;
+        let name = match &mode {
+            SourceMode::ManagedWorktree { branch } => branch.trim().to_owned(),
+            _ => {
+                let repo = project_record
+                    .repository
+                    .as_ref()
+                    .context("Open a Git project first")?;
+                let trees =
+                    sandbox_projects::git::Git::default().worktrees(&repo.directory, cancel)?;
+                let tree = match &mode {
+                    SourceMode::ExistingWorktree { directory } => {
+                        let path = directory.canonicalize()?;
+                        trees
+                            .iter()
+                            .find(|t| t.directory.canonicalize().ok().as_ref() == Some(&path))
+                    }
+                    _ => trees.first(),
+                }
+                .context("Working copy is unavailable")?;
+                tree.branch.clone().unwrap_or_else(|| {
+                    tree.directory
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+            }
+        };
+        self.create_source(project, name, Some(mode), base_revision, cancel)
+    }
+    fn create_source(
+        &self,
+        project: &ProjectId,
+        name: String,
+        mode: Option<SourceMode>,
+        base_revision: Option<&str>,
+        cancel: &AtomicBool,
+    ) -> Result<Sandbox> {
+        let _gate = self
+            .source_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Source preparation lock was poisoned"))?;
+        ensure!(
+            !self.is_stopping() && !cancel.load(Ordering::Acquire),
+            "Source preparation cancelled"
+        );
         let project = self.catalog.project(project)?;
+        let git = sandbox_projects::git::Git::default();
+        let directory = match &mode {
+            Some(SourceMode::CurrentCheckout) => {
+                let repo = project
+                    .repository
+                    .as_ref()
+                    .context("Open a Git project first")?;
+                Some(
+                    git.worktrees(&repo.directory, cancel)?
+                        .first()
+                        .context("Main checkout missing")?
+                        .directory
+                        .canonicalize()?,
+                )
+            }
+            Some(SourceMode::ExistingWorktree { directory }) => {
+                let path = directory.canonicalize()?;
+                let repo = project
+                    .repository
+                    .as_ref()
+                    .context("Open a Git project first")?;
+                ensure!(
+                    git.worktrees(&repo.directory, cancel)?
+                        .iter()
+                        .any(|t| !t.prunable
+                            && t.directory.canonicalize().ok().as_ref() == Some(&path)),
+                    "Worktree does not belong to this project"
+                );
+                Some(path)
+            }
+            _ => None,
+        };
+        if let Some(directory) = directory {
+            let matching: Vec<_> = self
+                .catalog
+                .sandboxes()?
+                .into_iter()
+                .filter(|s| {
+                    s.source.as_ref().is_some_and(|source| {
+                        source.directory == directory
+                            || source.directory.canonicalize().ok().as_ref() == Some(&directory)
+                    })
+                })
+                .collect();
+            ensure!(
+                matching.len() <= 1,
+                "Multiple legacy environments use this working copy. Remove the redundant environments explicitly before opening it."
+            );
+            if let Some(existing) = matching.into_iter().next() {
+                ensure!(
+                    existing.project_id == project.id,
+                    "This working copy belongs to another project"
+                );
+                self.manager(&existing.id)?;
+                return Ok(existing);
+            }
+        }
         let mut sandbox = self.catalog.create_sandbox(project.id.clone(), name)?;
         if let Some(mode) = mode {
-            // Ownership is recorded before Git creates anything. Failed preparations remain visible for retry/cleanup.
-            sandbox_projects::git::Git::default().prepare(
+            if let Err(error) = git.prepare_from(
                 &self.catalog,
                 &project,
                 &mut sandbox,
                 mode,
+                base_revision,
                 cancel,
-            )?;
+            ) {
+                // Keep owned worktrees for reconciliation; an empty failed draft owns no resources.
+                if sandbox.source.is_none() {
+                    self.catalog.remove_sandbox(&sandbox.id)?;
+                }
+                return Err(error);
+            }
         }
         self.manager(&sandbox.id)?;
         Ok(sandbox)
@@ -375,6 +496,126 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn working_copy_open_is_idempotent_concurrent_and_preserves_the_checkout() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("sandbox-source-runtime-{}", docker::nonce()?));
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo)?;
+        let git = |args: &[&str]| -> Result<String> {
+            let result = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()?;
+            ensure!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            Ok(String::from_utf8(result.stdout)?)
+        };
+        git(&["init", "-b", "dev"])?;
+        git(&["config", "user.name", "Fixture"])?;
+        git(&["config", "user.email", "fixture@example.invalid"])?;
+        git(&["config", "commit.gpgsign", "false"])?;
+        git(&["config", "core.hooksPath", "/dev/null"])?;
+        fs::write(repo.join("file"), "committed")?;
+        git(&["add", "file"])?;
+        git(&["commit", "-m", "fixture"])?;
+        fs::write(repo.join("file"), "dirty local checkout")?;
+        git(&["branch", "free"])?;
+        let executor = tokio::runtime::Runtime::new()?;
+        let app = Runtime::at(
+            root.join("data/application.sqlite3"),
+            executor.handle().clone(),
+            &Settings::default(),
+            false,
+        )?;
+        let repository =
+            sandbox_projects::git::Git::default().repository(&repo, &AtomicBool::new(false))?;
+        let project =
+            app.catalog
+                .create_project("Fixture".into(), Some(repository), Default::default())?;
+        let ids = std::thread::scope(|scope| -> Result<Vec<SandboxId>> {
+            let jobs: Vec<_> = (0..4)
+                .map(|_| {
+                    let app = app.clone();
+                    let project = project.id.clone();
+                    scope.spawn(move || {
+                        app.open_working_copy(
+                            &project,
+                            SourceMode::CurrentCheckout,
+                            None,
+                            &AtomicBool::new(false),
+                        )
+                        .map(|s| s.id)
+                    })
+                })
+                .collect();
+            jobs.into_iter().map(|j| j.join().unwrap()).collect()
+        })?;
+        assert!(ids.iter().all(|id| id == &ids[0]));
+        assert_eq!(app.catalog.sandboxes()?.len(), 1);
+        #[cfg(unix)]
+        {
+            let alias = root.join("alias");
+            std::os::unix::fs::symlink(&repo, &alias)?;
+            let same = app.open_working_copy(
+                &project.id,
+                SourceMode::ExistingWorktree { directory: alias },
+                None,
+                &AtomicBool::new(false),
+            )?;
+            assert_eq!(same.id, ids[0]);
+            assert_eq!(same.name, "dev");
+        }
+        let isolated = app.open_working_copy(
+            &project.id,
+            SourceMode::ManagedWorktree {
+                branch: "free".into(),
+            },
+            None,
+            &AtomicBool::new(false),
+        )?;
+        assert_ne!(isolated.id, ids[0]);
+        assert!(isolated.source.as_ref().unwrap().owned);
+        let reopened = app.open_working_copy(
+            &project.id,
+            SourceMode::ExistingWorktree {
+                directory: isolated.source.unwrap().directory,
+            },
+            None,
+            &AtomicBool::new(false),
+        )?;
+        assert_eq!(reopened.id, isolated.id);
+        assert!(reopened.source.unwrap().owned);
+        assert_eq!(git(&["branch", "--show-current"])?.trim(), "dev");
+        assert_eq!(
+            fs::read_to_string(repo.join("file"))?,
+            "dirty local checkout"
+        );
+        let count = app.catalog.sandboxes()?.len();
+        assert!(
+            app.open_working_copy(
+                &project.id,
+                SourceMode::ManagedWorktree {
+                    branch: "invalid..branch".into()
+                },
+                None,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        assert_eq!(app.catalog.sandboxes()?.len(), count);
+        app.shutdown_blocking()?;
+        drop(app);
+        let reopened = Catalog::open(root.join("data/application.sqlite3"))?;
+        assert_eq!(reopened.sandboxes()?.len(), count);
+        drop(reopened);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
     #[test]
     fn runtime_rejects_a_second_owner_and_shuts_down_without_docker_resources() -> Result<()> {
         let root = std::env::temp_dir().join(format!("sandbox-runtime-{}", docker::nonce()?));
