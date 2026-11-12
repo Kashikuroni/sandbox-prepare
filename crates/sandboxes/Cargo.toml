@@ -1,0 +1,19 @@
+[package]
+name = "sandbox_sandboxes"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+chrono.workspace = true
+zstd.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+sandbox_platform.workspace = true
+sandbox_telemetry.workspace = true
+sandbox_backups.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "sandbox-prepare"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+sandbox_workspace.workspace = true
+sandbox_sandboxes.workspace = true

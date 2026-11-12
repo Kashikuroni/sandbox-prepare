@@ -47,51 +47,51 @@ impl Icon {
 const ASSETS: &[(&str, &[u8])] = &[
     (
         "icons/zed/magnifying_glass.svg",
-        include_bytes!("../assets/icons/zed/magnifying_glass.svg"),
+        include_bytes!("../../../assets/icons/zed/magnifying_glass.svg"),
     ),
     (
         "icons/zed/rotate_cw.svg",
-        include_bytes!("../assets/icons/zed/rotate_cw.svg"),
+        include_bytes!("../../../assets/icons/zed/rotate_cw.svg"),
     ),
     (
         "icons/zed/chevron_down.svg",
-        include_bytes!("../assets/icons/zed/chevron_down.svg"),
+        include_bytes!("../../../assets/icons/zed/chevron_down.svg"),
     ),
     (
         "icons/zed/check.svg",
-        include_bytes!("../assets/icons/zed/check.svg"),
+        include_bytes!("../../../assets/icons/zed/check.svg"),
     ),
     (
         "icons/zed/debug.svg",
-        include_bytes!("../assets/icons/zed/debug.svg"),
+        include_bytes!("../../../assets/icons/zed/debug.svg"),
     ),
     (
         "icons/zed/archive.svg",
-        include_bytes!("../assets/icons/zed/archive.svg"),
+        include_bytes!("../../../assets/icons/zed/archive.svg"),
     ),
     (
         "icons/zed/terminal.svg",
-        include_bytes!("../assets/icons/zed/terminal.svg"),
+        include_bytes!("../../../assets/icons/zed/terminal.svg"),
     ),
     (
         "icons/zed/box.svg",
-        include_bytes!("../assets/icons/zed/box.svg"),
+        include_bytes!("../../../assets/icons/zed/box.svg"),
     ),
     (
         "icons/zed/settings.svg",
-        include_bytes!("../assets/icons/zed/settings.svg"),
+        include_bytes!("../../../assets/icons/zed/settings.svg"),
     ),
     (
         "icons/zed/threads_sidebar_left_open.svg",
-        include_bytes!("../assets/icons/zed/threads_sidebar_left_open.svg"),
+        include_bytes!("../../../assets/icons/zed/threads_sidebar_left_open.svg"),
     ),
     (
         "icons/zed/threads_sidebar_left_closed.svg",
-        include_bytes!("../assets/icons/zed/threads_sidebar_left_closed.svg"),
+        include_bytes!("../../../assets/icons/zed/threads_sidebar_left_closed.svg"),
     ),
     (
         "icons/zed/LICENSES",
-        include_bytes!("../assets/icons/zed/LICENSES"),
+        include_bytes!("../../../assets/icons/zed/LICENSES"),
     ),
 ];
 

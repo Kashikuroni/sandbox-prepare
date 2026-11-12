@@ -1,29 +1,20 @@
+pub use sandbox_backups::{backup_cache, backups};
+pub use sandbox_platform::database;
+pub use sandbox_sandboxes::sandbox;
+pub use sandbox_settings::settings;
+pub use sandbox_telemetry::logging;
+pub use sandbox_telemetry::process_log;
+pub use sandbox_ui::{icons, text_input, theme};
+mod logs_view;
+mod sandboxes_view;
+mod settings_view;
 use crate::theme::ThemePalette as _;
 use gpui::{
     App, Application, Bounds, Context, Div, FocusHandle, KeyBinding, TitlebarOptions, Window,
     WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
 
-mod archive_check;
-mod backup_cache;
-mod backups;
 mod backups_view;
-mod core;
-mod database;
-mod docker;
-mod icons;
-mod log_files;
-mod logging;
-mod logs_view;
-mod process_log;
-mod sandbox;
-mod sandbox_store;
-mod sandboxes_view;
-mod settings;
-mod settings_view;
-mod text_input;
-mod theme;
-
 use icons::{Assets, Icon};
 use settings::{Settings, SettingsModel};
 use theme::{Palette, ThemeMode};
@@ -504,10 +495,7 @@ impl Render for Workspace {
     }
 }
 
-fn main() {
-    if sandbox::watchdog_mode() {
-        return;
-    }
+pub fn run() {
     let preferences = Settings::load();
     let logging_directory = database::database_path()
         .ok()

@@ -1,9 +1,14 @@
-[package]
-name = "sandbox-prepare"
+[workspace]
+members = ["crates/*"]
+default-members = ["crates/app"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+publish = false
 
-[dependencies]
+[workspace.dependencies]
 anyhow = "1.0.104"
 aws-config = "1.13.1"
 aws-sdk-s3 = "1.158.0"
@@ -23,3 +28,11 @@ sha2 = "0.10.9"
 crc32fast = "1.5"
 zstd = "0.13.3"
 tar = "0.4.44"
+sandbox_core = { path = "crates/core" }
+sandbox_platform = { path = "crates/platform" }
+sandbox_telemetry = { path = "crates/telemetry" }
+sandbox_ui = { path = "crates/ui" }
+sandbox_settings = { path = "crates/settings" }
+sandbox_backups = { path = "crates/backups" }
+sandbox_sandboxes = { path = "crates/sandboxes" }
+sandbox_workspace = { path = "crates/workspace" }

@@ -240,8 +240,7 @@ impl LogStore {
         let entry = Arc::new(Entry {
             session_id: self.session_id.clone(),
             seq: state.seq,
-            timestamp: aws_sdk_s3::primitives::DateTime::from_millis(now().as_millis() as i64)
-                .to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             level: level.into(),
             category: category.into(),
             message,

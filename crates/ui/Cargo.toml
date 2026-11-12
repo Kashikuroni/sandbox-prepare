@@ -1,0 +1,11 @@
+[package]
+name = "sandbox_ui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+unicode-segmentation.workspace = true
+sandbox_core.workspace = true

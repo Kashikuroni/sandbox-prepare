@@ -1,0 +1,9 @@
+[package]
+name = "sandbox_core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true

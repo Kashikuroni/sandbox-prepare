@@ -35,7 +35,6 @@ impl<R: Read, F: FnMut(u64)> Read for CheckedReader<R, F> {
     }
 }
 
-#[cfg(test)]
 pub fn verify(path: &Path, index: usize, cancel: &watch::Receiver<bool>) -> Result<String> {
     verify_with_progress(path, index, cancel, |_| {})
 }
