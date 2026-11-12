@@ -47,6 +47,16 @@ impl Git {
             .capture(&command, &BTreeMap::new(), cancel, Duration::from_secs(60))
             .context("Git operation failed")
     }
+    pub fn head_revision(&self, directory: &Path, cancel: &AtomicBool) -> Result<String> {
+        Ok(self
+            .run(
+                directory,
+                &strings(&["rev-parse", "--verify", "HEAD^{commit}"]),
+                cancel,
+            )?
+            .trim()
+            .to_owned())
+    }
     pub fn repository(&self, path: &Path, cancel: &AtomicBool) -> Result<Repository> {
         let root = self.run(path, &strings(&["rev-parse", "--show-toplevel"]), cancel)?;
         let directory = PathBuf::from(root.trim()).canonicalize()?;
@@ -435,7 +445,7 @@ mod tests {
         fs::write(managed.directory.join("file"), "linked commit")?;
         command(&managed.directory, &["add", "file"])?;
         command(&managed.directory, &["commit", "-m", "linked change"])?;
-        let base = command(&managed.directory, &["rev-parse", "HEAD"])?;
+        let base = git.head_revision(&managed.directory, &cancel)?;
         let mut derived = catalog.create_sandbox(project.id.clone(), "Derived".into())?;
         let derived_source = git.prepare_from(
             &catalog,

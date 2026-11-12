@@ -1,4 +1,5 @@
 //! Workspace selection. Menus never checkout branches or stop another sandbox.
+use super::source_menu::SourceEvent;
 use super::*;
 use sandbox_core::{
     models::{Project, Sandbox, Scope, SourceMode},
@@ -22,6 +23,7 @@ pub(super) struct RepositoryState {
 pub(super) enum NavigationEvent {
     Git(ProjectId, anyhow::Result<RepositoryState>),
     Project(anyhow::Result<ProjectId>),
+    Source(ProjectId, Option<SandboxId>, anyhow::Result<SandboxId>),
 }
 pub(super) struct ContextBar {
     projects: Vec<Project>,
@@ -30,6 +32,8 @@ pub(super) struct ContextBar {
     last_query: BTreeMap<ProjectId, Instant>,
     jobs: BTreeMap<ProjectId, Arc<Operation>>,
     errors: BTreeMap<ProjectId, String>,
+    source_jobs: BTreeMap<ProjectId, Arc<Operation>>,
+    source_errors: BTreeMap<ProjectId, String>,
     pub last_sandbox: BTreeMap<ProjectId, Option<SandboxId>>,
     sender: mpsc::Sender<NavigationEvent>,
     receiver: mpsc::Receiver<NavigationEvent>,
@@ -44,6 +48,8 @@ impl Default for ContextBar {
             last_query: BTreeMap::new(),
             jobs: BTreeMap::new(),
             errors: BTreeMap::new(),
+            source_jobs: BTreeMap::new(),
+            source_errors: BTreeMap::new(),
             last_sandbox: BTreeMap::new(),
             sender,
             receiver,
@@ -57,84 +63,6 @@ fn same_path(left: &Path, right: &Path) -> bool {
             .ok()
             .zip(right.canonicalize().ok())
             .is_some_and(|(a, b)| a == b)
-}
-fn tree_name(tree: &Worktree, main: bool, records: &[Sandbox]) -> String {
-    if main {
-        return "main".into();
-    }
-    records
-        .iter()
-        .find(|s| {
-            s.source
-                .as_ref()
-                .is_some_and(|source| source.owned && same_path(&source.directory, &tree.directory))
-        })
-        .map(|s| s.name.clone())
-        .unwrap_or_else(|| {
-            tree.directory
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        })
-}
-fn matching_sandbox<'a>(
-    records: &'a [Sandbox],
-    directory: &Path,
-    current: Option<&SandboxId>,
-) -> Option<&'a Sandbox> {
-    records
-        .iter()
-        .filter(|s| {
-            s.source
-                .as_ref()
-                .is_some_and(|source| same_path(&source.directory, directory))
-        })
-        .min_by_key(|s| if Some(&s.id) == current { 0 } else { 1 })
-}
-enum SourceTarget {
-    Sandbox(SandboxId),
-    Create(SourceMode),
-}
-fn worktree_target(
-    records: &[Sandbox],
-    trees: &[Worktree],
-    directory: PathBuf,
-    current: Option<&SandboxId>,
-) -> SourceTarget {
-    if let Some(sandbox) = matching_sandbox(records, &directory, current) {
-        return SourceTarget::Sandbox(sandbox.id.clone());
-    }
-    let main = trees
-        .first()
-        .is_some_and(|tree| same_path(&tree.directory, &directory));
-    SourceTarget::Create(if main {
-        SourceMode::CurrentCheckout
-    } else {
-        SourceMode::ExistingWorktree { directory }
-    })
-}
-fn branch_target(
-    records: &[Sandbox],
-    trees: &[Worktree],
-    branch: &str,
-    current: Option<&SandboxId>,
-) -> Option<SourceTarget> {
-    if branch == "@detached" {
-        return None;
-    }
-    Some(
-        if let Some(tree) = trees
-            .iter()
-            .find(|tree| tree.branch.as_deref() == Some(branch))
-        {
-            worktree_target(records, trees, tree.directory.clone(), current)
-        } else {
-            SourceTarget::Create(SourceMode::ManagedWorktree {
-                branch: branch.into(),
-            })
-        },
-    )
 }
 impl Workspace {
     pub(super) fn new_context_picker(
@@ -151,7 +79,7 @@ impl Workspace {
             &self.project_picker,
             |this, _, event: &PickerEvent, cx| match event {
                 PickerEvent::Opened => {
-                    this.close_context_pickers(0, cx);
+                    this.source_menu.update(cx, |menu, cx| menu.close(cx));
                     this.refresh_choices(cx);
                 }
                 PickerEvent::Selected(value) => {
@@ -166,77 +94,40 @@ impl Workspace {
         )
         .detach();
         cx.subscribe(
-            &self.sandbox_picker,
-            |this, _, event: &PickerEvent, cx| match event {
-                PickerEvent::Opened => {
-                    this.close_context_pickers(3, cx);
-                    this.refresh_choices(cx);
-                }
-                PickerEvent::Selected(value) => {
-                    if let Ok(id) = SandboxId::try_from(value.clone()) {
-                        this.select_context(this.project_id.clone(), Some(id), cx);
-                    }
-                }
-                PickerEvent::Action("new-sandbox") => this.sandbox_form(None, cx),
-                _ => {}
-            },
-        )
-        .detach();
-        cx.subscribe(
-            &self.worktree_picker,
-            |this, _, event: &PickerEvent, cx| match event {
-                PickerEvent::Opened => {
-                    this.close_context_pickers(1, cx);
+            &self.source_menu,
+            |this, _, event: &SourceEvent, cx| match event {
+                SourceEvent::Opened => {
+                    this.project_picker.update(cx, |p, cx| p.close(cx));
                     this.query_git(true, cx);
                 }
-                PickerEvent::Selected(path) => this.choose_worktree(PathBuf::from(path), cx),
-                PickerEvent::Action("new-worktree") => this.sandbox_form(
-                    Some(SourceMode::ManagedWorktree {
-                        branch: String::new(),
-                    }),
+                SourceEvent::Open(mode) => this.open_working_copy(mode.clone(), false, cx),
+                SourceEvent::NewBranch(branch) => this.open_working_copy(
+                    SourceMode::ManagedWorktree {
+                        branch: branch.clone(),
+                    },
+                    true,
                     cx,
                 ),
-                PickerEvent::Action("refresh-git") => this.query_git(true, cx),
-                PickerEvent::Action("open-local") => this.open_local_project(cx),
-                PickerEvent::Action("clone") => this.project_form(true, cx),
-                _ => {}
+                SourceEvent::Legacy(id) => {
+                    this.select_context(this.project_id.clone(), Some(id.clone()), cx)
+                }
+                SourceEvent::Cancel => {
+                    if let Some(job) = this.context_bar.source_jobs.get(&this.project_id) {
+                        job.cancel();
+                    }
+                }
+                SourceEvent::Configure => {
+                    if this.sandbox_id.is_some() {
+                        this.active_section = Section::Projects;
+                        this.projects.update(cx, |view, cx| view.show_launch(cx));
+                    } else {
+                        this.context_error = Some("Choose a working copy first.".into());
+                        cx.notify();
+                    }
+                }
             },
         )
         .detach();
-        cx.subscribe(
-            &self.branch_picker,
-            |this, _, event: &PickerEvent, cx| match event {
-                PickerEvent::Opened => {
-                    this.close_context_pickers(2, cx);
-                    this.query_git(true, cx);
-                }
-                PickerEvent::Selected(branch) => this.choose_branch(branch, cx),
-                PickerEvent::Action("new-branch") => {
-                    let branch = this.branch_picker.read(cx).query(cx);
-                    this.sandbox_form(Some(SourceMode::ManagedWorktree { branch }), cx);
-                }
-                PickerEvent::Action("refresh-git") => this.query_git(true, cx),
-                PickerEvent::Action("open-local") => this.open_local_project(cx),
-                PickerEvent::Action("clone") => this.project_form(true, cx),
-                _ => {}
-            },
-        )
-        .detach();
-    }
-    fn close_context_pickers(&self, except: usize, cx: &mut Context<Self>) {
-        for (index, picker) in [
-            &self.project_picker,
-            &self.worktree_picker,
-            &self.branch_picker,
-            &self.sandbox_picker,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if index != except {
-                picker.update(cx, |p, cx| p.close(cx));
-            }
-        }
     }
     pub(super) fn refresh_choices(&mut self, cx: &mut Context<Self>) {
         if let Ok(records) = self.application.catalog.projects() {
@@ -273,216 +164,273 @@ impl Workspace {
         self.project_picker.update(cx, |picker, cx| {
             picker.set(projects, self.project_id.to_string(), label, cx)
         });
-        let sandboxes: Vec<_> = self
-            .context_bar
-            .sandboxes
-            .iter()
-            .filter(|s| s.project_id == self.project_id)
-            .collect();
-        let mut items = vec![];
-        for record in &sandboxes {
-            let state = self.application.sandbox_status(&record.id);
-            let status = match state {
-                Some(s) if s.busy => {
-                    if s.stage.starts_with("Waiting") {
-                        "Queued"
-                    } else {
-                        "Busy"
-                    }
-                }
-                Some(s) if s.error.is_some() => "Error",
-                Some(s) if s.running.iter().any(|v| *v) => "Running",
-                Some(s) if s.active.is_some() => "Stopped",
-                Some(_) => "Not created",
-                None => "Not checked",
-            };
-            items.push(
-                ContextItem::new(
-                    record.id.to_string(),
-                    record.name.clone(),
-                    if Some(&record.id) == self.sandbox_id.as_ref() {
-                        "This Window"
-                    } else {
-                        "Sandboxes"
-                    },
-                )
-                .status(status),
-            );
-        }
-        items.sort_by_key(|item| {
-            if Some(item.value.as_str()) == self.sandbox_id.as_ref().map(SandboxId::as_str) {
-                0
-            } else {
-                1
-            }
-        });
-        let label = sandboxes
-            .iter()
-            .find(|s| Some(&s.id) == self.sandbox_id.as_ref())
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| "Select sandbox".into());
-        self.sandbox_picker.update(cx, |picker, cx| {
-            picker.set(
-                items,
-                self.sandbox_id
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
-                label,
-                cx,
-            )
-        });
         self.refresh_source_choices(cx);
         self.query_git(false, cx);
     }
     fn refresh_source_choices(&self, cx: &mut Context<Self>) {
         let snapshot = self.context_bar.snapshots.get(&self.project_id);
-        let current = self
+        let records: Vec<_> = self
             .context_bar
             .sandboxes
             .iter()
+            .filter(|s| s.project_id == self.project_id)
+            .collect();
+        let current = records
+            .iter()
             .find(|s| Some(&s.id) == self.sandbox_id.as_ref());
-        let directory = current
-            .and_then(|s| s.source.as_ref().map(|s| &s.directory))
+        let source = current.and_then(|s| s.source.as_ref());
+        let selected = source.and_then(|s| {
+            snapshot.and_then(|snapshot| {
+                snapshot
+                    .trees
+                    .iter()
+                    .find(|t| same_path(&t.directory, &s.directory))
+            })
+        });
+        let label = selected
+            .map(|tree| {
+                tree.branch
+                    .clone()
+                    .unwrap_or_else(|| tree.revision.chars().take(8).collect())
+            })
+            .map(|branch| {
+                format!(
+                    "{} / {branch}",
+                    if source.is_some_and(|s| s.owned) {
+                        "Isolated worktree"
+                    } else if source.is_some_and(|s| matches!(s.mode, SourceMode::CurrentCheckout))
+                    {
+                        "Local checkout"
+                    } else {
+                        "Existing worktree"
+                    }
+                )
+            })
+            .unwrap_or_else(|| {
+                if source.is_some() {
+                    "Working copy unavailable".into()
+                } else if current.is_some() {
+                    "Legacy environment".into()
+                } else {
+                    "Choose working copy".into()
+                }
+            });
+        let mut branches = vec![];
+        let mut worktrees = vec![];
+        if let Some(snapshot) = snapshot {
+            for branch in &snapshot.branches {
+                let local = if snapshot.local.contains(branch) {
+                    branch.as_str()
+                } else {
+                    branch.split_once('/').map(|(_, b)| b).unwrap_or(branch)
+                };
+                if !snapshot
+                    .trees
+                    .iter()
+                    .any(|t| t.branch.as_deref() == Some(local))
+                {
+                    branches.push(ContextItem::new(
+                        branch.clone(),
+                        branch.clone(),
+                        "Free branches",
+                    ));
+                }
+            }
+            for tree in snapshot.trees.iter().skip(1).filter(|t| !t.prunable) {
+                let label = tree
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| tree.revision.chars().take(8).collect());
+                worktrees.push(
+                    ContextItem::new(tree.directory.display().to_string(), label, "Worktrees")
+                        .detail(tree.directory.display().to_string()),
+                );
+            }
+        }
+        let status = current
+            .and_then(|s| self.application.sandbox_status(&s.id))
+            .map(|state| {
+                if state.busy {
+                    state.stage
+                } else if state.error.is_some() {
+                    "Environment needs attention".into()
+                } else if state.running.iter().any(|r| *r) {
+                    "Running".into()
+                } else if state.active.is_some() {
+                    "Stopped".into()
+                } else {
+                    "Databases not created".into()
+                }
+            })
+            .unwrap_or_else(|| "Choose a working copy, then configure launch".into());
+        let message = self
+            .context_bar
+            .source_errors
+            .get(&self.project_id)
+            .or_else(|| self.context_bar.errors.get(&self.project_id))
+            .cloned()
+            .or_else(|| {
+                if self.context_bar.source_jobs.contains_key(&self.project_id) {
+                    Some("Preparing working copy…".into())
+                } else if snapshot.is_none() {
+                    Some(
+                        if self.context_bar.jobs.contains_key(&self.project_id) {
+                            "Reading Git…"
+                        } else {
+                            "Open a Git project to choose a working copy."
+                        }
+                        .into(),
+                    )
+                } else {
+                    None
+                }
+            });
+        // Legacy records remain reachable until the user explicitly removes or resolves them.
+        let legacy = records
+            .iter()
+            .filter(|s| {
+                s.source.as_ref().is_none_or(|source| {
+                    records
+                        .iter()
+                        .filter(|other| {
+                            other
+                                .source
+                                .as_ref()
+                                .is_some_and(|v| same_path(&v.directory, &source.directory))
+                        })
+                        .count()
+                        > 1
+                        || snapshot.is_none_or(|snapshot| {
+                            !snapshot
+                                .trees
+                                .iter()
+                                .any(|t| same_path(&t.directory, &source.directory))
+                        })
+                })
+            })
+            .map(|s| (s.id.clone(), s.name.clone()))
+            .collect();
+        self.source_menu.update(cx, |menu, cx| {
+            menu.set(
+                label,
+                source.map(|s| s.mode.clone()),
+                source
+                    .map(|s| s.directory.display().to_string())
+                    .unwrap_or_default(),
+                status,
+                snapshot.is_some(),
+                self.context_bar.source_jobs.contains_key(&self.project_id),
+                message,
+                branches,
+                worktrees,
+                legacy,
+                cx,
+            )
+        });
+    }
+    fn open_working_copy(&mut self, mode: SourceMode, new_branch: bool, cx: &mut Context<Self>) {
+        if self.context_bar.source_jobs.contains_key(&self.project_id) {
+            return;
+        }
+        if new_branch {
+            let SourceMode::ManagedWorktree { branch } = &mode else {
+                return;
+            };
+            if branch.trim().is_empty() {
+                self.context_bar.source_errors.insert(
+                    self.project_id.clone(),
+                    "Enter a name for the new branch.".into(),
+                );
+                self.context_error = self
+                    .context_bar
+                    .source_errors
+                    .get(&self.project_id)
+                    .cloned();
+                self.refresh_source_choices(cx);
+                return;
+            }
+            if self
+                .context_bar
+                .snapshots
+                .get(&self.project_id)
+                .is_some_and(|s| s.branches.iter().any(|b| b == branch))
+            {
+                self.context_bar.source_errors.insert(
+                    self.project_id.clone(),
+                    "Branch already exists. Select a free branch from the list.".into(),
+                );
+                self.context_error = self
+                    .context_bar
+                    .source_errors
+                    .get(&self.project_id)
+                    .cloned();
+                self.refresh_source_choices(cx);
+                return;
+            }
+        }
+        let base = self
+            .context_bar
+            .sandboxes
+            .iter()
+            .find(|s| Some(&s.id) == self.sandbox_id.as_ref())
+            .and_then(|s| s.source.as_ref())
+            .map(|source| source.directory.clone())
             .or_else(|| {
                 self.context_bar
                     .projects
                     .iter()
                     .find(|p| p.id == self.project_id)
-                    .and_then(|p| p.repository.as_ref().map(|r| &r.directory))
+                    .and_then(|p| p.repository.as_ref())
+                    .map(|r| r.directory.clone())
             });
-        let has_repository = self
-            .context_bar
-            .projects
-            .iter()
-            .find(|p| p.id == self.project_id)
-            .is_some_and(|p| p.repository.is_some());
-        let mut worktree_value = directory
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let mut worktrees = vec![];
-        let mut branches = vec![];
-        let mut worktree_label = "No worktree".to_owned();
-        let mut branch_label = "No branch".to_owned();
-        let mut branch_value = String::new();
-        if let Some(snapshot) = snapshot {
-            for (index, tree) in snapshot.trees.iter().enumerate() {
-                if tree.prunable {
-                    continue;
-                }
-                let selected = directory.is_some_and(|path| same_path(path, &tree.directory));
-                let name = tree_name(tree, index == 0, &self.context_bar.sandboxes);
-                if selected {
-                    worktree_label = name.clone();
-                    worktree_value = tree.directory.display().to_string();
-                    branch_label = tree.branch.clone().unwrap_or_else(|| {
-                        format!(
-                            "{} (detached)",
-                            tree.revision.chars().take(8).collect::<String>()
-                        )
-                    });
-                    branch_value = tree.branch.clone().unwrap_or_else(|| "@detached".into());
-                }
-                worktrees.push(
-                    ContextItem::new(
-                        tree.directory.display().to_string(),
-                        name,
-                        if selected {
-                            "This Sandbox"
+        self.context_error = None;
+        self.context_bar.source_errors.remove(&self.project_id);
+        let app = self.application.clone();
+        let project = self.project_id.clone();
+        let previous = self.sandbox_id.clone();
+        let sender = self.context_bar.sender.clone();
+        let flag = Arc::new(AtomicBool::new(false));
+        let cancel = flag.clone();
+        let id = project.clone();
+        match self.application.operations.spawn_blocking(
+            Scope {
+                project: Some(project.clone()),
+                ..Default::default()
+            },
+            "Open sandbox working copy",
+            flag,
+            move |_| {
+                let result = (|| {
+                    let revision =
+                        if new_branch {
+                            Some(Git::default().head_revision(
+                                base.as_deref().ok_or_else(|| {
+                                    anyhow::anyhow!("Choose a working copy first")
+                                })?,
+                                &cancel,
+                            )?)
                         } else {
-                            "Worktrees"
-                        },
-                    )
-                    .detail(tree.directory.display().to_string())
-                    .status(if tree.locked { "Locked" } else { "" }),
-                );
+                            None
+                        };
+                    app.open_working_copy(&project, mode, revision.as_deref(), &cancel)
+                        .map(|s| s.id)
+                })();
+                let outcome = result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|e| anyhow::anyhow!("{e:#}"));
+                let _ = sender.send(NavigationEvent::Source(project, previous, result));
+                outcome
+            },
+        ) {
+            Ok(job) => {
+                self.context_bar.source_jobs.insert(id, job);
             }
-            if branch_value == "@detached" {
-                branches.push(ContextItem::new(
-                    "@detached",
-                    branch_label.clone(),
-                    "This Sandbox",
-                ));
+            Err(error) => {
+                self.context_bar.source_errors.insert(id, error.to_string());
             }
-            for branch in &snapshot.branches {
-                branches.push(
-                    ContextItem::new(
-                        branch.clone(),
-                        branch.clone(),
-                        if *branch == branch_value {
-                            "This Sandbox"
-                        } else if snapshot.local.contains(branch) {
-                            "Branches"
-                        } else {
-                            "Remote Branches"
-                        },
-                    )
-                    .status(
-                        if snapshot
-                            .trees
-                            .iter()
-                            .any(|t| t.branch.as_ref() == Some(branch))
-                        {
-                            "Worktree"
-                        } else {
-                            ""
-                        },
-                    ),
-                );
-            }
-            branches.sort_by_key(|item| match item.group.as_str() {
-                "This Sandbox" => 0,
-                "Branches" => 1,
-                _ => 2,
-            });
-            worktrees.sort_by_key(|item| if item.group == "This Sandbox" { 0 } else { 1 });
-        } else if directory.is_some() {
-            worktree_label = "Loading…".into();
-            branch_label = "Loading…".into();
         }
-        let message = if let Some(error) = self.context_bar.errors.get(&self.project_id) {
-            Some(error.clone())
-        } else if self.context_bar.jobs.contains_key(&self.project_id) {
-            Some("Reading Git…".into())
-        } else if snapshot.is_none() {
-            Some("Open a Git project to choose a source.".into())
-        } else {
-            None
-        };
-        self.worktree_picker.update(cx, |picker, cx| {
-            picker.set(worktrees, worktree_value, worktree_label, cx);
-            picker.message(message.clone(), cx);
-        });
-        self.branch_picker.update(cx, |picker, cx| {
-            picker.set(branches, branch_value, branch_label, cx);
-            picker.message(message, cx);
-        });
-        for (picker, kind, label) in [
-            (&self.worktree_picker, "new-worktree", "New Worktree…"),
-            (&self.branch_picker, "new-branch", "New Branch…"),
-        ] {
-            let actions = if has_repository {
-                vec![
-                    ContextAction { id: kind, label },
-                    ContextAction {
-                        id: "refresh-git",
-                        label: "Refresh Git",
-                    },
-                ]
-            } else {
-                vec![
-                    ContextAction {
-                        id: "open-local",
-                        label: "Open Local Folder…",
-                    },
-                    ContextAction {
-                        id: "clone",
-                        label: "Clone Repository…",
-                    },
-                ]
-            };
-            picker.update(cx, |picker, cx| picker.actions(actions, cx));
-        }
+        self.refresh_source_choices(cx);
     }
     fn query_git(&mut self, force: bool, cx: &mut Context<Self>) {
         let id = self.project_id.clone();
@@ -555,6 +503,30 @@ impl Workspace {
     pub(super) fn poll_context_events(&mut self, cx: &mut Context<Self>) {
         while let Ok(event) = self.context_bar.receiver.try_recv() {
             match event {
+                NavigationEvent::Source(project, previous, result) => {
+                    self.context_bar.source_jobs.remove(&project);
+                    match result {
+                        Ok(id) => {
+                            self.context_bar.source_errors.remove(&project);
+                            self.context_bar
+                                .last_sandbox
+                                .insert(project.clone(), Some(id.clone()));
+                            if self.project_id == project && self.sandbox_id == previous {
+                                self.select_context(project, Some(id), cx);
+                                self.active_section = Section::Projects;
+                                self.projects.update(cx, |view, cx| view.show_launch(cx));
+                            }
+                        }
+                        Err(error) => {
+                            let message = logging::redact(&format!("{error:#}"));
+                            if self.project_id == project {
+                                self.context_error = Some(message.clone());
+                            }
+                            self.context_bar.source_errors.insert(project, message);
+                        }
+                    }
+                    self.refresh_choices(cx);
+                }
                 NavigationEvent::Git(id, result) => {
                     self.context_bar.jobs.remove(&id);
                     match result {
@@ -585,9 +557,6 @@ impl Workspace {
                     Ok(id) => {
                         self.refresh_choices(cx);
                         self.choose_project(id.clone(), cx);
-                        if self.project_id == id && self.sandbox_id.is_none() {
-                            self.sandbox_form(None, cx);
-                        }
                     }
                     Err(error) => {
                         self.context_error = Some(logging::redact(&format!("{error:#}")));
@@ -614,57 +583,10 @@ impl Workspace {
             });
         self.select_context(id, sandbox, cx);
     }
-    fn apply_source_target(&mut self, target: SourceTarget, cx: &mut Context<Self>) {
-        match target {
-            SourceTarget::Sandbox(id) => self.select_context(self.project_id.clone(), Some(id), cx),
-            SourceTarget::Create(mode) => self.sandbox_form(Some(mode), cx),
-        }
-    }
-    fn choose_worktree(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
-        let records: Vec<_> = self
-            .context_bar
-            .sandboxes
-            .iter()
-            .filter(|s| s.project_id == self.project_id)
-            .cloned()
-            .collect();
-        let trees = self
-            .context_bar
-            .snapshots
-            .get(&self.project_id)
-            .map(|s| s.trees.as_slice())
-            .unwrap_or_default();
-        let target = worktree_target(&records, trees, directory, self.sandbox_id.as_ref());
-        self.apply_source_target(target, cx);
-    }
-    fn choose_branch(&mut self, branch: &str, cx: &mut Context<Self>) {
-        let records: Vec<_> = self
-            .context_bar
-            .sandboxes
-            .iter()
-            .filter(|s| s.project_id == self.project_id)
-            .cloned()
-            .collect();
-        let trees = self
-            .context_bar
-            .snapshots
-            .get(&self.project_id)
-            .map(|s| s.trees.as_slice())
-            .unwrap_or_default();
-        if let Some(target) = branch_target(&records, trees, branch, self.sandbox_id.as_ref()) {
-            self.apply_source_target(target, cx);
-        }
-    }
     fn project_form(&mut self, clone: bool, cx: &mut Context<Self>) {
         self.active_section = Section::Projects;
         self.projects
             .update(cx, |view, cx| view.prepare_project_form(clone, cx));
-        cx.notify();
-    }
-    fn sandbox_form(&mut self, mode: Option<SourceMode>, cx: &mut Context<Self>) {
-        self.active_section = Section::Projects;
-        self.projects
-            .update(cx, |view, cx| view.prepare_sandbox_form(mode, cx));
         cx.notify();
     }
     fn open_local_project(&mut self, cx: &mut Context<Self>) {
@@ -746,9 +668,8 @@ impl Workspace {
         }
     }
     pub(super) fn configure_context_actions(&self, cx: &mut Context<Self>) {
-        for (picker, actions) in [
-            (
-                &self.project_picker,
+        self.project_picker.update(cx, |p, cx| {
+            p.actions(
                 vec![
                     ContextAction {
                         id: "open-local",
@@ -759,146 +680,28 @@ impl Workspace {
                         label: "Clone Repository…",
                     },
                 ],
-            ),
-            (
-                &self.worktree_picker,
-                vec![
-                    ContextAction {
-                        id: "new-worktree",
-                        label: "New Worktree…",
-                    },
-                    ContextAction {
-                        id: "refresh-git",
-                        label: "Refresh Git",
-                    },
-                ],
-            ),
-            (
-                &self.branch_picker,
-                vec![
-                    ContextAction {
-                        id: "new-branch",
-                        label: "New Branch…",
-                    },
-                    ContextAction {
-                        id: "refresh-git",
-                        label: "Refresh Git",
-                    },
-                ],
-            ),
-            (
-                &self.sandbox_picker,
-                vec![ContextAction {
-                    id: "new-sandbox",
-                    label: "New Sandbox…",
-                }],
-            ),
-        ] {
-            picker.update(cx, |picker, cx| picker.actions(actions, cx));
-        }
+                cx,
+            )
+        });
     }
     pub(super) fn render_context_bar(&self, window: &Window) -> Div {
         let available = (f32::from(window.viewport_size().width)
-            - if window.is_fullscreen() { 100. } else { 180. })
-        .max(220.);
-        let palette = self.settings.theme.palette(window.appearance());
+            - if window.is_fullscreen() { 40. } else { 120. })
+        .max(200.);
         div()
             .flex()
             .items_center()
             .min_w_0()
-            .gap(px(2.)) // Zed title_bar: gap_0p5
-            .font_family(sandbox_ui::titlebar_style::FONT_FAMILY)
-            .text_size(px(sandbox_ui::titlebar_style::LABEL_SIZE))
+            .gap(px(2.))
             .child(
                 div()
-                    .max_w(px((available * 0.30).min(210.)))
+                    .max_w(px((available * 0.4).min(210.)))
                     .child(self.project_picker.clone()),
             )
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .min_w_0()
-                    .gap(px(1.)) // Zed Git context: gap_px
-                    .child(
-                        div()
-                            .max_w(px((available * 0.19).min(135.)))
-                            .child(self.worktree_picker.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_color(rgb(palette.text_muted))
-                            .opacity(0.25)
-                            .child("/"),
-                    )
-                    .child(
-                        div()
-                            .max_w(px((available * 0.23).min(170.)))
-                            .child(self.branch_picker.clone()),
-                    ),
+                    .max_w(px((available * 0.6).min(360.)))
+                    .child(self.source_menu.clone()),
             )
-            .child(
-                div()
-                    .ml(px(6.))
-                    .max_w(px((available * 0.28).min(190.)))
-                    .child(self.sandbox_picker.clone()),
-            )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn sandbox(id: &str, directory: &str) -> Sandbox {
-        Sandbox {
-            id: SandboxId::try_from(id.to_owned()).unwrap(),
-            project_id: ProjectId::try_from("project".to_owned()).unwrap(),
-            name: id.into(),
-            root: "/data".into(),
-            password: String::new(),
-            root_password: String::new(),
-            source: Some(sandbox_core::models::SourceSelection {
-                mode: SourceMode::CurrentCheckout,
-                directory: directory.into(),
-                owned: false,
-                revision: "revision".into(),
-            }),
-            compose: None,
-        }
-    }
-    fn tree(branch: &str, directory: &str) -> Worktree {
-        Worktree {
-            directory: directory.into(),
-            branch: Some(branch.into()),
-            revision: "revision".into(),
-            locked: false,
-            prunable: false,
-        }
-    }
-    #[test]
-    fn source_selection_prefers_current_sandbox_and_never_checkout_a_busy_branch() {
-        let records = vec![sandbox("first", "/repo"), sandbox("second", "/repo")];
-        let trees = vec![tree("main", "/repo"), tree("feature", "/worktree")];
-        assert!(
-            matches!(branch_target(&records,&trees,"main",Some(&records[1].id)),Some(SourceTarget::Sandbox(id))if id==records[1].id)
-        );
-        assert!(
-            matches!(branch_target(&records,&trees,"feature",None),Some(SourceTarget::Create(SourceMode::ExistingWorktree{directory}))if directory==Path::new("/worktree"))
-        );
-        assert!(matches!(
-            branch_target(&[], &trees, "main", None),
-            Some(SourceTarget::Create(SourceMode::CurrentCheckout))
-        ));
-        assert!(
-            matches!(branch_target(&records,&trees,"new-feature",None),Some(SourceTarget::Create(SourceMode::ManagedWorktree{branch}))if branch=="new-feature")
-        );
-        assert!(branch_target(&records, &trees, "@detached", None).is_none());
-    }
-    #[test]
-    fn nonexistent_different_directories_do_not_match() {
-        assert!(!same_path(
-            Path::new("/absent-one"),
-            Path::new("/absent-two")
-        ));
     }
 }

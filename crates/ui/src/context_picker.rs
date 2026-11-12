@@ -46,6 +46,7 @@ pub enum PickerEvent {
     Opened,
     Selected(String),
     Action(&'static str),
+    Dismissed(Point<Pixels>),
 }
 pub struct ContextPicker {
     items: Vec<ContextItem>,
@@ -61,6 +62,8 @@ pub struct ContextPicker {
     scroll: ScrollHandle,
     bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     message: Option<String>,
+    submenu: bool,
+    submenu_selected: bool,
 }
 impl EventEmitter<PickerEvent> for ContextPicker {}
 impl ContextPicker {
@@ -92,7 +95,21 @@ impl ContextPicker {
             scroll: ScrollHandle::new(),
             bounds: Default::default(),
             message: None,
+            submenu: false,
+            submenu_selected: false,
         }
+    }
+    pub fn as_submenu(&mut self) {
+        self.submenu = true;
+    }
+    pub fn set_submenu_selected(&mut self, selected: bool, cx: &mut Context<Self>) {
+        if self.submenu_selected != selected {
+            self.submenu_selected = selected;
+            cx.notify();
+        }
+    }
+    pub fn is_open(&self) -> bool {
+        self.open
     }
     pub fn set(
         &mut self,
@@ -225,8 +242,8 @@ impl ContextPicker {
         }
     }
 }
-impl Render for ContextPicker {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl ContextPicker {
+    fn render_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let p = self.theme.palette(window.appearance());
         let entries = self.entries(cx);
         let max_menu_height = (window.viewport_size().height - px(48.)).max(px(0.));
@@ -341,11 +358,16 @@ impl Render for ContextPicker {
                     .is_some_and(|b| b.contains(&event.position))
                 {
                     this.close(cx);
+                    cx.emit(PickerEvent::Dismissed(event.position));
                 }
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let len = this.total(cx);
                 match event.keystroke.key.as_str() {
+                    "left" if this.submenu => {
+                        this.open = false;
+                        this.focus.focus(window);
+                    }
                     "escape" => {
                         this.open = false;
                         this.focus.focus(window);
@@ -430,13 +452,58 @@ impl Render for ContextPicker {
                         })),
                 )
             });
+        menu
+    }
+    /// Render at the owning menu's overlay layer: GPUI cannot defer a draw inside another deferred draw.
+    pub fn submenu_popup(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.submenu || !self.open {
+            return None;
+        }
+        let bounds = self.bounds.get()?;
+        let x = if window.viewport_size().width - bounds.right() < px(328.) {
+            bounds.left() - px(326.)
+        } else {
+            bounds.right() + px(6.)
+        };
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .child(
+                    deferred(
+                        anchored()
+                            .position(point(x, bounds.top()))
+                            .snap_to_window_with_margin(px(8.))
+                            .child(self.render_menu(window, cx)),
+                    )
+                    .with_priority(4),
+                )
+                .into_any_element(),
+        )
+    }
+}
+impl Render for ContextPicker {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.theme.palette(window.appearance());
+        let menu = if self.submenu {
+            None
+        } else {
+            Some(self.render_menu(window, cx))
+        };
         let bounds = self.bounds.clone();
+        let offset = point(px(0.), px(titlebar::BUTTON_HEIGHT + 4.));
         div()
             .relative()
             .min_w_0()
+            .when(self.submenu, |d| d.w_full())
             .font_family(titlebar::FONT_FAMILY)
             .text_size(px(titlebar::LABEL_SIZE))
-            .text_color(rgb(if self.icon.is_some() {
+            .text_color(rgb(if self.icon.is_some() && !self.submenu {
                 p.text_muted
             } else {
                 p.text
@@ -445,7 +512,12 @@ impl Render for ContextPicker {
                 div()
                     .id("context-trigger")
                     .track_focus(&self.focus)
-                    .h(px(titlebar::BUTTON_HEIGHT))
+                    .h(px(if self.submenu {
+                        30.
+                    } else {
+                        titlebar::BUTTON_HEIGHT
+                    }))
+                    .when(self.submenu, |d| d.w_full().text_size(px(13.)))
                     .px(px(titlebar::BUTTON_PADDING))
                     .flex()
                     .items_center()
@@ -475,7 +547,26 @@ impl Render for ContextPicker {
                             .size(px(titlebar::ICON_SIZE)),
                         )
                     })
-                    .child(div().min_w_0().truncate().child(self.label.clone())),
+                    .child(
+                        div()
+                            .min_w_0()
+                            .when(self.submenu, |d| d.flex_1())
+                            .truncate()
+                            .child(self.label.clone()),
+                    )
+                    .when(self.submenu_selected, |d| {
+                        d.child(Icon::Check.render(p.icon_accent).size(px(12.)))
+                    })
+                    .when(self.submenu, |d| {
+                        d.child(
+                            Icon::ChevronDown
+                                .render(p.icon_muted)
+                                .size(px(12.))
+                                .with_transformation(Transformation::rotate(radians(
+                                    -std::f32::consts::FRAC_PI_2,
+                                ))),
+                        )
+                    }),
             )
             .child(
                 canvas(
@@ -483,16 +574,18 @@ impl Render for ContextPicker {
                     |_, _, _, _| {},
                 )
                 .absolute()
+                .top_0()
+                .left_0()
                 .size_full(),
             )
-            .when(self.open, |d| {
+            .when(self.open && !self.submenu, |d| {
                 d.child(
                     div().absolute().top_0().left_0().child(
                         deferred(
                             anchored()
-                                .offset(point(px(0.), px(titlebar::BUTTON_HEIGHT + 4.)))
+                                .offset(offset)
                                 .snap_to_window_with_margin(px(8.))
-                                .child(menu),
+                                .child(menu.expect("Standalone picker menu")),
                         )
                         .with_priority(3),
                     ),

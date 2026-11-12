@@ -4,9 +4,9 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use sandbox_core::{models::*, operations::Operation};
-use sandbox_projects::{compose, git::Git};
+use sandbox_projects::compose;
 use sandbox_runtime::Runtime;
-use sandbox_ui::select::{OptionItem, Select, Selected};
+use sandbox_ui::select::{OptionItem, Select};
 use std::{
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool, mpsc},
@@ -18,7 +18,6 @@ pub struct Changed {
 }
 enum Event {
     Created(ProjectId, Option<SandboxId>),
-    Sources(Vec<String>, Vec<sandbox_projects::git::Worktree>),
     Discovered(Vec<compose::Candidate>),
     Inspected(serde_json::Value),
     Saved(String),
@@ -36,7 +35,7 @@ struct LaunchDraft {
     profiles: Vec<String>,
     services: Vec<String>,
     mounts: Vec<Mount>,
-    inputs: [Entity<TextInput>; 6],
+    inputs: [Entity<TextInput>; 5],
     selects: [Entity<Select>; 4],
 }
 pub struct ProjectsView {
@@ -47,11 +46,6 @@ pub struct ProjectsView {
     project_name: Entity<TextInput>,
     location: Entity<TextInput>,
     clone_remote: bool,
-    sandbox_name: Entity<TextInput>,
-    mode: Entity<Select>,
-    branch: Entity<TextInput>,
-    branches: Entity<Select>,
-    worktree: Entity<Select>,
     candidates: Vec<compose::Candidate>,
     spec: ComposeLaunchSpec,
     profiles: Vec<String>,
@@ -76,7 +70,7 @@ pub struct ProjectsView {
     tab: usize,
     remove_confirmation: bool,
     drafts: std::collections::BTreeMap<SandboxId, LaunchDraft>,
-    form_focus: Option<bool>,
+    form_focus: Option<()>,
     binding_error: Option<String>,
     save_error: Option<String>,
 }
@@ -147,12 +141,6 @@ impl ProjectsView {
                     s
                 })
             };
-        let branches = select("Existing branch", &[], "", cx);
-        cx.subscribe(&branches, |this, _, event: &Selected, cx| {
-            this.branch
-                .update(cx, |input, cx| input.set_value(event.0.clone(), cx));
-        })
-        .detach();
         let mut view = Self {
             app,
             project,
@@ -161,20 +149,6 @@ impl ProjectsView {
             project_name: input("", cx),
             location: input("", cx),
             clone_remote: false,
-            sandbox_name: input("", cx),
-            mode: select(
-                "Source",
-                &[
-                    ("managed", "New isolated worktree"),
-                    ("current", "Current checkout"),
-                    ("existing", "Existing worktree"),
-                ],
-                "managed",
-                cx,
-            ),
-            branch: input("", cx),
-            branches,
-            worktree: select("Choose a worktree", &[], "", cx),
             candidates: vec![],
             spec: Default::default(),
             profiles: vec![],
@@ -213,15 +187,13 @@ impl ProjectsView {
             request: 0,
             error: None,
             notice: None,
-            tab: 1,
+            tab: 0,
             remove_confirmation: false,
             drafts: Default::default(),
             form_focus: None,
             binding_error: None,
             save_error: None,
         };
-        cx.subscribe(&view.mode, |_, _, _: &Selected, cx| cx.notify())
-            .detach();
         view.load(cx);
         view
     }
@@ -234,57 +206,14 @@ impl ProjectsView {
                 .update(cx, |input, cx| input.set_value(String::new(), cx));
         }
         self.clone_remote = clone_remote;
-        self.form_focus = Some(false);
+        self.form_focus = Some(());
         cx.notify();
     }
-    pub fn prepare_sandbox_form(&mut self, mode: Option<SourceMode>, cx: &mut Context<Self>) {
-        self.tab = 1;
-        self.error = None;
-        self.notice = None;
-        let mut name = "Sandbox".to_owned();
-        if let Some(mode) = mode {
-            let value = match mode {
-                SourceMode::ManagedWorktree { branch } => {
-                    if !branch.is_empty() {
-                        name = branch.clone();
-                    }
-                    self.branch
-                        .update(cx, |input, cx| input.set_value(branch, cx));
-                    "managed"
-                }
-                SourceMode::CurrentCheckout => "current",
-                SourceMode::ExistingWorktree { directory } => {
-                    let path = directory.display().to_string();
-                    name = directory
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or(name);
-                    self.worktree.update(cx, |s, cx| {
-                        s.set(vec![OptionItem::new(path.clone(), path.clone())], path, cx)
-                    });
-                    "existing"
-                }
-            };
-            self.mode.update(cx, |s, cx| {
-                s.set(
-                    [
-                        ("managed", "New isolated worktree"),
-                        ("current", "Current checkout"),
-                        ("existing", "Existing worktree"),
-                    ]
-                    .into_iter()
-                    .map(|(v, l)| OptionItem::new(v, l))
-                    .collect(),
-                    value.into(),
-                    cx,
-                )
-            });
-        }
-        self.sandbox_name
-            .update(cx, |input, cx| input.set_value(name, cx));
-        self.form_focus = Some(true);
+    pub fn show_launch(&mut self, cx: &mut Context<Self>) {
+        self.tab = 2;
         cx.notify();
     }
+
     pub fn context(
         &mut self,
         project: ProjectId,
@@ -322,7 +251,6 @@ impl ProjectsView {
                         self.env_path.clone(),
                         self.variable.clone(),
                         self.database_name.clone(),
-                        self.sandbox_name.clone(),
                     ],
                     selects: [
                         self.env_service.clone(),
@@ -369,7 +297,6 @@ impl ProjectsView {
         self.env_path = input("", cx);
         self.variable = input("", cx);
         self.database_name = input("", cx);
-        self.sandbox_name = input("", cx);
         self.env_service = self.launch_select("Import for", &[("*", "All services")], "*", cx);
         self.binding_service = self.launch_select("Service", &[], "", cx);
         self.binding_db = self.launch_select(
@@ -391,12 +318,6 @@ impl ProjectsView {
             "host",
             cx,
         );
-        self.branches
-            .update(cx, |s, cx| s.set(vec![], String::new(), cx));
-        self.worktree
-            .update(cx, |s, cx| s.set(vec![], String::new(), cx));
-        self.branch
-            .update(cx, |input, cx| input.set_value(String::new(), cx));
         self.candidates.clear();
         self.profiles.clear();
         self.services.clear();
@@ -449,7 +370,6 @@ impl ProjectsView {
                 self.env_path,
                 self.variable,
                 self.database_name,
-                self.sandbox_name,
             ] = draft.inputs;
             [
                 self.env_service,
@@ -467,8 +387,6 @@ impl ProjectsView {
         for field in [
             &self.project_name,
             &self.location,
-            &self.sandbox_name,
-            &self.branch,
             &self.mysql,
             &self.clickhouse,
             &self.env_path,
@@ -480,9 +398,6 @@ impl ProjectsView {
             field.update(cx, |input, cx| input.set_theme(theme, cx));
         }
         for field in [
-            &self.mode,
-            &self.branches,
-            &self.worktree,
             &self.env_service,
             &self.binding_service,
             &self.binding_db,
@@ -546,46 +461,15 @@ impl ProjectsView {
                 // Workspace owns selection and may refuse a project switch with unsaved Settings.
                 // Its context() call saves the outgoing draft before loading the new sandbox.
                 let created_sandbox = sandbox.is_some();
-                self.tab = if created_sandbox { 2 } else { 1 };
+                self.tab = if created_sandbox { 2 } else { 0 };
                 cx.emit(Changed { project, sandbox });
                 self.notice = Some(
                     if created_sandbox {
                         "Sandbox created. Configure Launch, then create the databases in Sandboxes."
                     } else {
-                        "Project created. Choose its source and create a sandbox."
+                        "Project opened. Choose a working copy from the titlebar."
                     }
                     .into(),
-                );
-            }
-            Event::Sources(branches, trees) => {
-                self.branches.update(cx, |s, cx| {
-                    s.set(
-                        branches
-                            .into_iter()
-                            .map(|v| OptionItem::new(v.clone(), v))
-                            .collect(),
-                        String::new(),
-                        cx,
-                    )
-                });
-                let options = trees
-                    .into_iter()
-                    .filter(|t| !t.prunable)
-                    .map(|t| {
-                        OptionItem::new(
-                            t.directory.display().to_string(),
-                            format!(
-                                "{} · {}",
-                                t.branch.unwrap_or_else(|| "detached".into()),
-                                t.directory.display()
-                            ),
-                        )
-                    })
-                    .collect();
-                self.worktree
-                    .update(cx, |s, cx| s.set(options, String::new(), cx));
-                self.notice = Some(
-                    "Branches and worktrees loaded. You can also type a new branch name.".into(),
                 );
             }
             Event::Discovered(candidates) => {
@@ -694,40 +578,7 @@ impl ProjectsView {
             cx,
         );
     }
-    fn sources(&mut self, cx: &mut Context<Self>) {
-        let id = self.project.clone();
-        self.run("Read Git sources",move |app,cancel|{let project=app.catalog.project(&id)?;let repo=project.repository.as_ref().ok_or_else(||anyhow::anyhow!("This project has no Git repository. Add a project with a local directory or clone URL."))?;let git=Git::default();Ok(Event::Sources(git.branches(&repo.directory,&cancel)?,git.worktrees(&repo.directory,&cancel)?))},cx);
-    }
-    fn create_sandbox(&mut self, cx: &mut Context<Self>) {
-        let project = self.project.clone();
-        let name = self.sandbox_name.read(cx).value();
-        let has_repo = self
-            .app
-            .catalog
-            .project(&project)
-            .is_ok_and(|p| p.repository.is_some());
-        let mode = if !has_repo {
-            None
-        } else {
-            Some(match self.mode.read(cx).value() {
-                "current" => SourceMode::CurrentCheckout,
-                "existing" => SourceMode::ExistingWorktree {
-                    directory: self.worktree.read(cx).value().into(),
-                },
-                _ => SourceMode::ManagedWorktree {
-                    branch: self.branch.read(cx).value(),
-                },
-            })
-        };
-        self.run(
-            "Prepare sandbox source",
-            move |app, cancel| {
-                let sandbox = app.create_sandbox(&project, name, mode, &cancel)?;
-                Ok(Event::Created(project, Some(sandbox.id)))
-            },
-            cx,
-        );
-    }
+
     fn discover(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.sandbox.clone() else {
             return;
@@ -911,13 +762,10 @@ fn button(
 }
 impl Render for ProjectsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(sandbox) = self.form_focus.take() {
-            if sandbox {
-                self.sandbox_name.read(cx).focus(window);
-            } else {
-                self.project_name.read(cx).focus(window);
-            }
+        if self.form_focus.take().is_some() {
+            self.project_name.read(cx).focus(window);
         }
+
         let p = self.theme.palette(window.appearance());
         let ready = self.operation.is_none() && !self.app.is_stopping();
         let sandbox = self
@@ -935,7 +783,7 @@ impl Render for ProjectsView {
             .flex_col()
             .gap_3()
             .text_color(rgb(p.text))
-            .child(div().text_xl().child("Projects & sandboxes"))
+            .child(div().text_xl().child("Project settings"))
             .child(
                 div()
                     .text_sm()
@@ -943,25 +791,27 @@ impl Render for ProjectsView {
                     .child(project.as_ref().map(|p| p.name.clone()).unwrap_or_default()),
             );
         page = page.child(
-            div().flex().gap_1().children(
-                ["Project", "New sandbox", "Launch"]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, label)| {
-                        button(
-                            ("setup-tab", index),
-                            label,
-                            ready,
-                            p,
-                            cx,
-                            move |this, _, cx| {
-                                this.tab = index;
-                                cx.notify();
-                            },
-                        )
-                        .when(self.tab == index, |d| d.bg(rgb(p.element_selected)))
-                    }),
-            ),
+            div()
+                .flex()
+                .gap_1()
+                .children(
+                    [(0, "Project"), (2, "Launch")]
+                        .into_iter()
+                        .map(|(index, label)| {
+                            button(
+                                ("setup-tab", index),
+                                label,
+                                ready,
+                                p,
+                                cx,
+                                move |this, _, cx| {
+                                    this.tab = index;
+                                    cx.notify();
+                                },
+                            )
+                            .when(self.tab == index, |d| d.bg(rgb(p.element_selected)))
+                        }),
+                ),
         );
         if let Some(error) = &self.error {
             page = page.child(
@@ -1086,45 +936,13 @@ impl Render for ProjectsView {
                     },
                 )));
         }
-        if self.tab == 1 {
-            page = page.child(heading("New sandbox", p)).child(row(
-                "Name",
-                self.sandbox_name.clone(),
-                p,
-            ));
-            if project.as_ref().is_some_and(|p| p.repository.is_some()) {
-                page = page
-                    .child(row("Source", self.mode.clone(), p))
-                    .child(div().flex().child(button(
-                        "load-sources",
-                        "Load branches & worktrees",
-                        ready,
-                        p,
-                        cx,
-                        |this, _, cx| this.sources(cx),
-                    )));
-                match self.mode.read(cx).value() {
-                    "managed" => {
-                        page = page
-                            .child(row("Existing branch", self.branches.clone(), p))
-                            .child(row("Branch name (existing or new)", self.branch.clone(), p));
-                    }
-                    "existing" => page = page.child(row("Worktree", self.worktree.clone(), p)),
-                    _ => {
-                        page = page.child(div().text_sm().text_color(rgb(p.text_muted)).child(
-                            "Uses the main checkout as it is. Uncommitted files remain in place.",
-                        ))
-                    }
-                }
-            }
-            page = page.child(div().flex().child(button(
-                "new-sandbox",
-                "Create sandbox",
-                ready,
-                p,
-                cx,
-                |this, _, cx| this.create_sandbox(cx),
-            )));
+        if self.tab == 2 && sandbox.is_none() {
+            page = page.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(p.text_muted))
+                    .child("Choose a working copy in the titlebar to configure its launch."),
+            );
         }
         if self.tab == 2
             && let Some(sandbox) = sandbox
@@ -1378,7 +1196,7 @@ impl Render for ProjectsView {
                         |this, _, cx| this.save(cx),
                     )));
             } else {
-                page=page.child(div().text_sm().text_color(rgb(p.text_muted)).child("Database-only sandbox. Create a sandbox with a Git source to attach project services."));
+                page=page.child(div().text_sm().text_color(rgb(p.text_muted)).child("Legacy database-only environment. Choose a working copy in the titlebar to run project services."));
             }
         }
         div().flex().flex_col().size_full().min_h_0().child(page)

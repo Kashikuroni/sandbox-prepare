@@ -10,6 +10,7 @@ use std::sync::Arc;
 mod context_bar;
 mod logs_view;
 mod projects_view;
+mod source_menu;
 use sandbox_core::models::{ProjectId, SandboxId};
 use sandbox_ui::{context_picker::ContextPicker, titlebar_style as titlebar};
 use std::collections::BTreeMap;
@@ -78,9 +79,7 @@ struct Workspace {
     project_id: ProjectId,
     sandbox_id: Option<SandboxId>,
     project_picker: gpui::Entity<ContextPicker>,
-    sandbox_picker: gpui::Entity<ContextPicker>,
-    worktree_picker: gpui::Entity<ContextPicker>,
-    branch_picker: gpui::Entity<ContextPicker>,
+    source_menu: gpui::Entity<source_menu::SourceMenu>,
     context_bar: context_bar::ContextBar,
     projects: gpui::Entity<projects_view::ProjectsView>,
     backup_views: BTreeMap<ProjectId, gpui::Entity<backups_view::BackupsView>>,
@@ -113,9 +112,7 @@ impl Workspace {
                 this.backups.update(cx, |_, cx| cx.notify());
                 this.projects.update(cx, |_, cx| cx.notify());
                 this.project_picker.update(cx, |_, cx| cx.notify());
-                this.sandbox_picker.update(cx, |_, cx| cx.notify());
-                this.branch_picker.update(cx, |_, cx| cx.notify());
-                this.worktree_picker.update(cx, |_, cx| cx.notify());
+                this.source_menu.update(cx, |_, cx| cx.notify());
                 this.logs.update(cx, |logs, cx| logs.remeasure(cx));
                 cx.notify();
             }
@@ -131,11 +128,7 @@ impl Workspace {
                 .update(cx, |view, cx| view.set_theme(this.settings.theme, cx));
             this.project_picker
                 .update(cx, |view, cx| view.set_theme(this.settings.theme, cx));
-            this.sandbox_picker
-                .update(cx, |view, cx| view.set_theme(this.settings.theme, cx));
-            this.branch_picker
-                .update(cx, |view, cx| view.set_theme(this.settings.theme, cx));
-            this.worktree_picker
+            this.source_menu
                 .update(cx, |view, cx| view.set_theme(this.settings.theme, cx));
             this.application.configure(&this.settings);
             let theme = this.settings.theme;
@@ -168,22 +161,16 @@ impl Workspace {
             .catalog
             .sandboxes()
             .expect("Opened sandbox catalog");
-        let record = if let Some(record) = rows
+        let record = rows
             .into_iter()
-            .find(|sandbox| sandbox.project_id == project.id)
-        {
-            record
-        } else {
-            application
-                .catalog
-                .create_sandbox(project.id.clone(), "Sandbox".into())
-                .expect("Create initial sandbox")
-        };
-        let manager = application.manager(&record.id).ok();
+            .find(|sandbox| sandbox.project_id == project.id);
+        let manager = record
+            .as_ref()
+            .and_then(|record| application.manager(&record.id).ok());
         let backups = cx.new(|cx| backups_view::BackupsView::new(service, settings.theme, cx));
         let sandbox = cx.new(|cx| sandboxes_view::SandboxesView::new(manager, &settings, cx));
         let project_id = project.id.clone();
-        let sandbox_id = Some(record.id.clone());
+        let sandbox_id = record.as_ref().map(|record| record.id.clone());
         let projects = cx.new(|cx| {
             projects_view::ProjectsView::new(
                 application.clone(),
@@ -195,27 +182,7 @@ impl Workspace {
         });
         let project_picker =
             Self::new_context_picker("Project", "Search projects…", None, settings.theme, cx);
-        let worktree_picker = Self::new_context_picker(
-            "Worktree",
-            "Search worktrees…",
-            Some(Icon::Worktree),
-            settings.theme,
-            cx,
-        );
-        let branch_picker = Self::new_context_picker(
-            "Branch",
-            "Search branches…",
-            Some(Icon::Branch),
-            settings.theme,
-            cx,
-        );
-        let sandbox_picker = Self::new_context_picker(
-            "Sandbox",
-            "Search sandboxes…",
-            Some(Icon::Box),
-            settings.theme,
-            cx,
-        );
+        let source_menu = cx.new(|cx| source_menu::SourceMenu::new(settings.theme, cx));
         cx.subscribe(&projects, |this, _, event: &projects_view::Changed, cx| {
             this.select_context(event.project.clone(), event.sandbox.clone(), cx);
         })
@@ -275,9 +242,7 @@ impl Workspace {
             project_id,
             sandbox_id,
             project_picker,
-            sandbox_picker,
-            worktree_picker,
-            branch_picker,
+            source_menu,
             context_bar: Default::default(),
             projects,
             backup_views,
@@ -304,13 +269,13 @@ impl Workspace {
             && let Ok(menu) = std::env::var("SANDBOX_PREPARE_UI_PREVIEW_MENU")
         {
             cx.defer_in(window, move |workspace, window, cx| {
-                let picker = match menu.as_str() {
-                    "project" => &workspace.project_picker,
-                    "branch" => &workspace.branch_picker,
-                    "worktree" => &workspace.worktree_picker,
-                    _ => &workspace.sandbox_picker,
-                };
-                picker.update(cx, |picker, cx| picker.open(window, cx));
+                if menu == "project" {
+                    workspace
+                        .project_picker
+                        .update(cx, |p, cx| p.open(window, cx));
+                } else {
+                    workspace.source_menu.update(cx, |p, cx| p.open(window, cx));
+                }
             });
         }
         workspace
