@@ -265,9 +265,12 @@ impl Manager {
         let Some(active) = self.store.load()?.active else {
             return Ok(false);
         };
-        let names = self
-            .docker
-            .output(&strings(&["volume", "ls", "--format", "{{.Name}}"]), SHORT)?;
+        let names = self.docker.capture(
+            &strings(&["volume", "ls", "--format", "{{.Name}}"]),
+            &Default::default(),
+            &self.cancel,
+            SHORT,
+        )?;
         let mut found = 0;
         for index in 0..2 {
             let name = self.store.volume(&active, index);
@@ -1176,9 +1179,12 @@ impl Manager {
             args.extend(ids.iter().map(|id| (*id).into()));
             self.docker.output(&args, SHORT)?;
         }
-        let volumes = self
-            .docker
-            .output(&strings(&["volume", "ls", "--format", "{{.Name}}"]), SHORT)?;
+        let volumes = self.docker.capture(
+            &strings(&["volume", "ls", "--format", "{{.Name}}"]),
+            &Default::default(),
+            &self.cancel,
+            SHORT,
+        )?;
         for index in 0..2 {
             let volume = self.store.volume(instance, index);
             if volumes.lines().any(|name| name == volume) {
