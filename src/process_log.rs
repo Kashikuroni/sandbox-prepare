@@ -1,5 +1,5 @@
 //! Container/helper output, deliberately separate from the application's debug log.
-use crate::{log_files::LogFiles, settings::LogSettings};
+use crate::{core::LogSettings, log_files::LogFiles};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,

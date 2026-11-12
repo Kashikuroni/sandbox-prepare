@@ -7,7 +7,8 @@ use std::{
 use anyhow::{Context as _, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::theme::ThemeMode;
+pub use crate::core::LogSettings;
+use crate::core::ThemeMode;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -127,49 +128,6 @@ fn settings_path() -> Result<PathBuf> {
         }
     };
     Ok(config_dir.join("sandbox-prepare/settings.json"))
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
-pub struct LogSettings {
-    pub max_file_mib: u32,
-    pub retention_days: u32,
-    pub check_interval_hours: u32,
-}
-impl Default for LogSettings {
-    fn default() -> Self {
-        Self {
-            max_file_mib: 10,
-            retention_days: 7,
-            check_interval_hours: 24,
-        }
-    }
-}
-impl LogSettings {
-    fn validate(self) -> Result<()> {
-        anyhow::ensure!(
-            (1..=10240).contains(&self.max_file_mib),
-            "File size must be between 1 and 10240 MiB"
-        );
-        anyhow::ensure!(
-            (1..=36500).contains(&self.retention_days),
-            "Retention must be between 1 and 36500 days"
-        );
-        anyhow::ensure!(
-            (1..=87600).contains(&self.check_interval_hours),
-            "Check interval must be between 1 and 87600 hours"
-        );
-        Ok(())
-    }
-    pub fn max_bytes(self) -> u64 {
-        u64::from(self.max_file_mib) * 1024 * 1024
-    }
-    pub fn retention(self) -> std::time::Duration {
-        std::time::Duration::from_secs(u64::from(self.retention_days) * 86400)
-    }
-    pub fn interval_seconds(self) -> u64 {
-        u64::from(self.check_interval_hours) * 3600
-    }
 }
 
 pub struct SettingsModel {

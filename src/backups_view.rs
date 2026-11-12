@@ -1,6 +1,7 @@
+use crate::theme::ThemePalette as _;
 use crate::{
     backup_cache::{self, Cache, Progress, SOURCES, Snapshot},
-    backups::{self, Backup, DownloadError, StorageConfig, format_size},
+    backups::{self, Backup, DownloadError, StorageClient, StorageConfig, format_size},
     icons::Icon,
     theme::{Palette, ThemeMode},
 };

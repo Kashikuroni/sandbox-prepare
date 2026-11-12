@@ -1,6 +1,6 @@
 use crate::{
     archive_check,
-    backups::{self, Backup, DownloadError, StorageConfig},
+    backups::{self, Backup, DownloadError, StorageClient, StorageConfig},
 };
 use anyhow::{Context as _, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};

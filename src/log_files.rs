@@ -1,4 +1,4 @@
-use crate::settings::LogSettings;
+use crate::core::LogSettings;
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use std::{

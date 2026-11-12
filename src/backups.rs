@@ -13,27 +13,12 @@ use aws_sdk_s3::{
 };
 use tokio::{fs, io::AsyncWriteExt, sync::watch};
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct StorageConfig {
-    pub endpoint: String,
-    pub bucket: String,
-    pub region: String,
-    pub access_key: String,
-    pub secret_key: String,
+pub use crate::core::StorageConfig;
+pub trait StorageClient {
+    fn client(&self) -> impl std::future::Future<Output = Result<Client>> + Send;
 }
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: "https://services.mentormarketplace.ru:9443".into(),
-            bucket: "ms-bucket".into(),
-            region: "us-east-1".into(),
-            access_key: String::new(),
-            secret_key: String::new(),
-        }
-    }
-}
-impl StorageConfig {
-    pub async fn client(&self) -> Result<Client> {
+impl StorageClient for StorageConfig {
+    async fn client(&self) -> Result<Client> {
         crate::logging::register_credentials(&self.access_key, &self.secret_key);
         tracing::debug!(target:"app::s3","Preparing S3 connection");
         if self.access_key.is_empty() || self.secret_key.is_empty() {

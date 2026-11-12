@@ -1,4 +1,4 @@
-use crate::backups::StorageConfig;
+use crate::core::StorageConfig;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
@@ -37,9 +37,6 @@ fn open(path: &Path) -> Result<Connection> {
 
 pub fn load_storage() -> Result<Option<StorageConfig>> {
     let result = (|| read(&open(&database_path()?)?))();
-    if let Ok(Some(config)) = &result {
-        crate::logging::register_credentials(&config.access_key, &config.secret_key);
-    }
     match &result {
         Ok(config) => {
             tracing::debug!(target:"app::storage",configured=config.is_some(),"Storage settings loaded")
@@ -51,7 +48,6 @@ pub fn load_storage() -> Result<Option<StorageConfig>> {
     result
 }
 pub fn save_storage(config: &StorageConfig) -> Result<()> {
-    crate::logging::register_credentials(&config.access_key, &config.secret_key);
     let result = (|| write(&open(&database_path()?)?, config))();
     match &result {
         Ok(()) => tracing::info!(target:"app::storage","Storage connection saved"),

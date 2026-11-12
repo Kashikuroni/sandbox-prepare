@@ -1,3 +1,4 @@
+use crate::theme::ThemePalette as _;
 // Text editing adapted from the GPUI 0.2.2 input example (Apache-2.0).
 use std::ops::Range;
 

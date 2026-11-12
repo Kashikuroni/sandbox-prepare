@@ -1,3 +1,4 @@
+use crate::theme::ThemePalette as _;
 use crate::{
     backups::StorageConfig,
     backups_view::BackupsView,

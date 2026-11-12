@@ -1,3 +1,4 @@
+use crate::theme::ThemePalette as _;
 use gpui::{
     App, Application, Bounds, Context, Div, FocusHandle, KeyBinding, TitlebarOptions, Window,
     WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
@@ -7,6 +8,7 @@ mod archive_check;
 mod backup_cache;
 mod backups;
 mod backups_view;
+mod core;
 mod database;
 mod docker;
 mod icons;
@@ -506,7 +508,22 @@ fn main() {
     if sandbox::watchdog_mode() {
         return;
     }
-    logging::init();
+    let preferences = Settings::load();
+    let logging_directory = database::database_path()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.join("logs")));
+    let initial = preferences.as_ref().cloned().unwrap_or_default();
+    logging::init(
+        logging_directory,
+        initial.current_log_limit,
+        initial.logging,
+    );
+    if let Err(error) = preferences {
+        tracing::error!(target:"app::settings", %error, "Could not load settings; defaults applied");
+    }
+    if let Ok(Some(config)) = database::load_storage() {
+        logging::register_credentials(&config.access_key, &config.secret_key);
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

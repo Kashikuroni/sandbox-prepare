@@ -1,3 +1,4 @@
+use crate::theme::ThemePalette as _;
 use crate::{
     icons::Icon,
     logging::{self, Cursor, Entry, Filter, LogStore, Page},

@@ -1,27 +1,10 @@
+pub use crate::core::ThemeMode;
 use gpui::WindowAppearance;
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ThemeMode {
-    Light,
-    Dark,
-    #[default]
-    System,
+pub trait ThemePalette {
+    fn palette(self, appearance: WindowAppearance) -> Palette;
 }
-
-impl ThemeMode {
-    pub const ALL: [Self; 3] = [Self::Light, Self::Dark, Self::System];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Light => "Light",
-            Self::Dark => "Dark",
-            Self::System => "System",
-        }
-    }
-
-    pub fn palette(self, appearance: WindowAppearance) -> Palette {
+impl ThemePalette for ThemeMode {
+    fn palette(self, appearance: WindowAppearance) -> Palette {
         match self {
             Self::Light => Palette::AYU_LIGHT,
             Self::Dark => Palette::AYU_MIRAGE,

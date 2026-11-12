@@ -46,7 +46,7 @@ enum WriteEvent {
     Entry(Arc<Entry>),
     Flush(mpsc::Sender<()>),
     Shutdown,
-    Configure(crate::settings::LogSettings),
+    Configure(crate::core::LogSettings),
     Maintain {
         clear: bool,
         done: mpsc::Sender<crate::log_files::MaintenanceReport>,
@@ -75,12 +75,12 @@ fn now() -> std::time::Duration {
 impl LogStore {
     #[cfg(test)]
     pub fn new(directory: Option<PathBuf>, limit: usize) -> Arc<Self> {
-        Self::with_policy(directory, limit, crate::settings::LogSettings::default())
+        Self::with_policy(directory, limit, crate::core::LogSettings::default())
     }
     pub fn with_policy(
         directory: Option<PathBuf>,
         limit: usize,
-        policy: crate::settings::LogSettings,
+        policy: crate::core::LogSettings,
     ) -> Arc<Self> {
         let session_id = format!("{}-{}", now().as_nanos(), std::process::id());
         let disk_error = Arc::new(Mutex::new(None));
@@ -162,7 +162,7 @@ impl LogStore {
             writer: Some(writer),
         })
     }
-    pub fn configure(&self, policy: crate::settings::LogSettings) -> Result<()> {
+    pub fn configure(&self, policy: crate::core::LogSettings) -> Result<()> {
         self.sender
             .send(WriteEvent::Configure(policy))
             .context("Log writer stopped")
@@ -353,16 +353,7 @@ impl<S: Subscriber> Layer<S> for AppLayer {
         );
     }
 }
-pub fn init() {
-    let settings = crate::settings::Settings::load();
-    let limit = settings
-        .as_ref()
-        .map(|s| s.current_log_limit)
-        .unwrap_or(2000);
-    let directory = crate::database::database_path()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.join("logs")));
-    let policy = settings.as_ref().map(|s| s.logging).unwrap_or_default();
+pub fn init(directory: Option<PathBuf>, limit: usize, policy: crate::core::LogSettings) {
     let logger = LogStore::with_policy(directory, limit, policy);
     let _ = STORE.set(logger.clone());
     tracing_subscriber::registry().with(AppLayer(logger)).init();
@@ -372,9 +363,6 @@ pub fn init() {
         eprintln!("Application panicked; see application logs");
     }));
     tracing::info!(target:"app::startup",version=env!("CARGO_PKG_VERSION"),"Application started");
-    if let Err(error) = settings {
-        tracing::error!(target:"app::settings",%error,"Could not load settings; defaults applied");
-    }
 }
 
 #[derive(Clone, Default)]
