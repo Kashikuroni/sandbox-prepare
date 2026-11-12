@@ -380,6 +380,7 @@ impl UpdateControl {
 pub enum Progress {
     Started(usize),
     Bytes(usize, u64),
+    WaitingForVerification(usize),
     Verifying(usize),
     VerificationBytes(usize, u64, u64),
     VerificationFailed(usize),
@@ -397,68 +398,100 @@ pub async fn update(
     let result = async {
         let pending = tokio::task::spawn_blocking(move || cache.begin()).await??;
         let client = config.client().await?;
-        let mut records = Vec::new();
-        for (index, backup) in remote.iter().enumerate() {
-            anyhow::ensure!(!*cancel.borrow(), "Cancelled");
-            progress(Progress::Started(index));
+        let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let verifier = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, backup) in remote.into_iter().enumerate() {
             let path = pending.directory.join(FILES[index]);
-            backups::download(
-                &client,
-                &config.bucket,
-                backup,
-                &path,
-                cancel.clone(),
-                |bytes| progress(Progress::Bytes(index, bytes)),
-            )
-            .await
-            .map_err(|error| match error {
-                DownloadError::Cancelled => anyhow::anyhow!("Cancelled"),
-                DownloadError::Failed(error) => anyhow::anyhow!(error),
-            })?;
-            progress(Progress::Verifying(index));
+            let client = client.clone();
+            let bucket = config.bucket.clone();
+            let events = events.clone();
             let check_cancel = cancel.clone();
-            let size = backup.size;
-            let (verification_events, mut verification_receiver) =
-                tokio::sync::mpsc::unbounded_channel();
-            // Forward throttled verification updates while the blocking worker runs.
-            let verification =
-                tokio::task::spawn_blocking(move || -> Result<(String, FileTime)> {
+            let verifier = verifier.clone();
+            tasks.spawn(async move {
+                let _ = events.send(Progress::Started(index));
+                backups::download(
+                    &client,
+                    &bucket,
+                    &backup,
+                    &path,
+                    check_cancel.clone(),
+                    |bytes| {
+                        let _ = events.send(Progress::Bytes(index, bytes));
+                    },
+                )
+                .await
+                .map_err(|error| match error {
+                    DownloadError::Cancelled => anyhow::anyhow!("Cancelled"),
+                    DownloadError::Failed(error) => anyhow::anyhow!(error),
+                })?;
+                let _ = events.send(Progress::WaitingForVerification(index));
+                // Downloads overlap, but only one archive consumes verification CPU/I/O.
+                let permit = verifier.acquire_owned().await?;
+                let size = backup.size;
+                let record = tokio::task::spawn_blocking(move || -> Result<Record> {
+                    let _permit = permit;
+                    ensure!(!*check_cancel.borrow(), "Cancelled");
+                    let _ = events.send(Progress::Verifying(index));
                     let before = file_time(&path, size)?;
                     let digest = archive_check::verify_with_progress(
                         &path,
                         index,
                         &check_cancel,
                         |bytes| {
-                            let _ = verification_events
-                                .send(Progress::VerificationBytes(index, bytes, size));
+                            let _ = events.send(Progress::VerificationBytes(index, bytes, size));
                         },
                     )?;
                     let after = file_time(&path, size)?;
                     ensure!(before == after, "File changed during verification");
-                    Ok((digest, after))
-                });
-            while let Some(event) = verification_receiver.recv().await {
-                progress(event);
-            }
-            let (digest, local_modified) = verification.await??;
-            records.push(Record {
-                key: backup.key.clone(),
-                size: backup.size,
-                modified: backup.modified.to_string(),
-                etag: backup.etag.clone(),
-                sha256: digest,
-                local_modified: Some(local_modified),
-                verification_error: None,
+                    let _ = events.send(Progress::Verified(index));
+                    Ok(Record {
+                        key: backup.key,
+                        size,
+                        modified: backup.modified.to_string(),
+                        etag: backup.etag,
+                        sha256: digest,
+                        local_modified: Some(after),
+                        verification_error: None,
+                    })
+                })
+                .await??;
+                Ok::<_, anyhow::Error>((index, record))
             });
-            progress(Progress::Verified(index));
+        }
+        drop(events);
+        let mut records = [None, None];
+        let mut failure = None;
+        // Cooperatively stop and join every worker before Pending can remove its
+        // directory. Aborting a task would leave its blocking verifier running.
+        while !tasks.is_empty() {
+            tokio::select! {
+                Some(event) = receiver.recv() => progress(event),
+                Some(result) = tasks.join_next() => {
+                    match result.map_err(anyhow::Error::from).and_then(|result| result) {
+                        Ok((index, record)) => records[index] = Some(record),
+                        Err(error) => {
+                            if failure.is_none() {
+                                failure = Some(error);
+                                // Stop siblings without marking an internal error as user cancellation.
+                                control.sender.send_replace(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        while let Some(event) = receiver.recv().await {
+            progress(event);
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         anyhow::ensure!(!*cancel.borrow(), "Cancelled");
         let pair = Pair {
             generation: pending.generation.clone(),
             origin: Origin::new(&config),
-            records: records
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("Incomplete backup pair"))?,
+            records: records.map(|record| record.expect("Both backup workers succeeded")),
         };
         control.begin_publish()?;
         progress(Progress::Publishing);
@@ -806,54 +839,249 @@ mod tests {
         fs::remove_dir_all(cache.database.parent().unwrap())?;
         Ok(())
     }
-    fn server(bodies: Vec<Vec<u8>>) -> (String, std::thread::JoinHandle<()>) {
-        use std::io::{Read, Write};
+    fn scripted_server(
+        respond: impl FnOnce([std::net::TcpStream; 2]) -> Result<()> + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<Result<()>>) {
+        use std::io::Read;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let task = std::thread::spawn(move || {
-            for body in bodies {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                    .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut streams = [None, None];
+            // Neither request gets a response until BOTH arrive. Sequential
+            // downloads cannot pass this barrier, even with tiny fixtures.
+            for _ in 0..2 {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            ensure!(
+                                std::time::Instant::now() < deadline,
+                                "Both downloads must start in parallel"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+                stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
                 let mut bytes = Vec::new();
                 let mut byte = [0];
                 while !bytes.ends_with(b"\r\n\r\n") {
-                    if stream.read(&mut byte).unwrap() == 0 {
-                        break;
-                    }
+                    ensure!(stream.read(&mut byte)? != 0, "Incomplete request");
                     bytes.push(byte[0]);
                 }
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                )
-                .unwrap();
-                stream.write_all(&body).unwrap();
+                let index = if bytes.starts_with(b"GET /test/ch/") {
+                    0
+                } else {
+                    ensure!(bytes.starts_with(b"GET /test/mysql/"), "Unexpected request");
+                    1
+                };
+                ensure!(
+                    streams[index].replace(stream).is_none(),
+                    "Duplicate request"
+                );
             }
+            respond(streams.map(Option::unwrap))
         });
         (format!("http://{addr}"), task)
     }
-    #[tokio::test]
-    async fn accepted_cancel_after_first_verified_file_preserves_old_pair() -> Result<()> {
-        let cache = cache("cancel");
-        let bodies = vec![fixtures::compress(&fixtures::tar_bytes())];
-        let (endpoint, server) = server(bodies.clone());
-        let config = StorageConfig {
+    fn response(stream: &mut std::net::TcpStream, body: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let result = (|| -> std::io::Result<()> {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )?;
+            stream.write_all(body)
+        })();
+        match result {
+            // Fail-fast cancellation may close the sibling before its response.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Ok(())
+            }
+            result => Ok(result?),
+        }
+    }
+    fn server(bodies: [Vec<u8>; 2]) -> (String, std::thread::JoinHandle<Result<()>>) {
+        scripted_server(move |streams| {
+            for (mut stream, body) in streams.into_iter().zip(bodies) {
+                response(&mut stream, &body)?;
+            }
+            Ok(())
+        })
+    }
+    fn stall(stream: &mut std::net::TcpStream, body: &[u8]) -> Result<()> {
+        use std::io::Write;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )?;
+        stream.write_all(&body[..1])?;
+        Ok(())
+    }
+    fn expect_disconnect(stream: &mut std::net::TcpStream) -> Result<()> {
+        use std::io::Read;
+        match stream.read(&mut [0]) {
+            Ok(0) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => Ok(()),
+            result => anyhow::bail!("Sibling connection was not cancelled: {result:?}"),
+        }
+    }
+    fn mock_config(endpoint: String) -> StorageConfig {
+        StorageConfig {
             endpoint,
             bucket: "test".into(),
             region: "test".into(),
             access_key: "test".into(),
             secret_key: "test".into(),
-        };
-        let old = install(&cache, &config)?.pair.unwrap();
-        let remote = std::array::from_fn(|index| Backup {
+        }
+    }
+    fn mock_remote(bodies: &[Vec<u8>; 2]) -> [Backup; 2] {
+        std::array::from_fn(|index| Backup {
             key: format!("{}new", SOURCES[index].1),
-            size: bodies[0].len() as u64,
+            size: bodies[index].len() as u64,
             modified: aws_sdk_s3::primitives::DateTime::from_secs(10),
             etag: None,
+        })
+    }
+    fn assert_no_pending(cache: &Cache) -> Result<()> {
+        for entry in fs::read_dir(&cache.root)? {
+            assert!(
+                !entry?
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".pending-")
+            );
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn parallel_downloads_verify_as_they_finish_and_keep_source_order() -> Result<()> {
+        let cache = cache("parallel");
+        let bodies = [
+            fixtures::compress(&fixtures::tar_bytes()),
+            fixtures::compress(&fixtures::xb_bytes()),
+        ];
+        let remote = mock_remote(&bodies);
+        let (release, wait) = std::sync::mpsc::channel();
+        let (endpoint, server) = scripted_server(move |[mut clickhouse, mut mysql]| {
+            response(&mut mysql, &bodies[1])?;
+            // ClickHouse remains in flight until MySQL is fully verified.
+            wait.recv_timeout(std::time::Duration::from_secs(5))?;
+            response(&mut clickhouse, &bodies[0])
         });
+        let config = mock_config(endpoint);
+        let mut checking = None;
+        let mut verified = Vec::new();
+        let mut started = [false; 2];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            update(
+                cache.clone(),
+                config.clone(),
+                remote.clone(),
+                UpdateControl::new(),
+                |event| match event {
+                    Progress::Started(index) => started[index] = true,
+                    Progress::Verifying(index) => {
+                        assert!(started.iter().all(|started| *started));
+                        assert!(
+                            checking.replace(index).is_none(),
+                            "Only one verifier may run"
+                        );
+                    }
+                    Progress::Verified(index) => {
+                        assert_eq!(checking.take(), Some(index));
+                        verified.push(index);
+                        if index == 1 {
+                            release.send(()).unwrap();
+                        }
+                    }
+                    Progress::Publishing => assert_eq!(verified, [1, 0]),
+                    _ => {}
+                },
+            ),
+        )
+        .await?;
+        server.join().unwrap()?;
+        let snapshot = result.map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        assert_eq!(verified, [1, 0]);
+        assert!(snapshot.current(&config, &remote));
+        assert_no_pending(&cache)?;
+        fs::remove_dir_all(cache.database.parent().unwrap())?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn download_or_verification_failure_stops_stalled_sibling_and_preserves_old_pair()
+    -> Result<()> {
+        use std::io::Write;
+        for download_failure in [false, true] {
+            let cache = cache("fail-fast");
+            let bodies = [
+                fixtures::compress(b"invalid clickhouse"),
+                fixtures::compress(&fixtures::xb_bytes()),
+            ];
+            let remote = mock_remote(&bodies);
+            let (endpoint, server) = scripted_server(move |[mut clickhouse, mut mysql]| {
+                stall(&mut mysql, &bodies[1])?;
+                if download_failure {
+                    clickhouse.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )?;
+                } else {
+                    response(&mut clickhouse, &bodies[0])?;
+                }
+                // The body never completes: the updater must close this connection.
+                expect_disconnect(&mut mysql)
+            });
+            let config = mock_config(endpoint);
+            let old = install(&cache, &config)?.pair.unwrap();
+            let control = UpdateControl::new();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                update(cache.clone(), config, remote, control.clone(), |event| {
+                    assert!(!matches!(event, Progress::Publishing));
+                }),
+            )
+            .await?;
+            server.join().unwrap()?;
+            let Err(DownloadError::Failed(error)) = result else {
+                anyhow::bail!("Expected the original failure");
+            };
+            assert!(!error.contains("Cancelled"), "{error}");
+            assert!(!control.cancelled());
+            assert_no_pending(&cache)?;
+            assert_eq!(cache.load()?.pair.unwrap().generation, old.generation);
+            fs::remove_dir_all(cache.database.parent().unwrap())?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn accepted_cancel_after_first_verified_file_preserves_old_pair() -> Result<()> {
+        let cache = cache("cancel");
+        let bodies = [
+            fixtures::compress(&fixtures::tar_bytes()),
+            fixtures::compress(&fixtures::xb_bytes()),
+        ];
+        let remote = mock_remote(&bodies);
+        let (endpoint, server) = scripted_server(move |[mut clickhouse, mut mysql]| {
+            stall(&mut mysql, &bodies[1])?;
+            response(&mut clickhouse, &bodies[0])?;
+            expect_disconnect(&mut mysql)
+        });
+        let config = mock_config(endpoint);
+        let old = install(&cache, &config)?.pair.unwrap();
         let control = UpdateControl::new();
         let action = control.clone();
         let result = tokio::time::timeout(
@@ -865,8 +1093,9 @@ mod tests {
             }),
         )
         .await?;
-        server.join().unwrap();
+        server.join().unwrap()?;
         assert!(matches!(result, Err(DownloadError::Cancelled)));
+        assert_no_pending(&cache)?;
         assert_eq!(cache.load()?.pair.unwrap().generation, old.generation);
         fs::remove_dir_all(cache.database.parent().unwrap())?;
         Ok(())
@@ -875,7 +1104,7 @@ mod tests {
     async fn failed_pair_preserves_old_and_success_replaces_both_then_cleans_old() -> Result<()> {
         let cache = cache("update");
         for valid in [false, true] {
-            let bodies = vec![
+            let bodies = [
                 fixtures::compress(&fixtures::tar_bytes()),
                 if valid {
                     fixtures::compress(&fixtures::xb_bytes())
@@ -884,25 +1113,14 @@ mod tests {
                 },
             ];
             let (endpoint, server) = server(bodies.clone());
-            let config = StorageConfig {
-                endpoint,
-                bucket: "test".into(),
-                region: "test".into(),
-                access_key: "test".into(),
-                secret_key: "test".into(),
-            };
+            let config = mock_config(endpoint);
             let before = if cache.load()?.pair.is_none() {
                 install(&cache, &config)?
             } else {
                 cache.load()?
             };
             let old = before.pair.unwrap();
-            let remote = std::array::from_fn(|index| Backup {
-                key: format!("{}new", SOURCES[index].1),
-                size: bodies[index].len() as u64,
-                modified: aws_sdk_s3::primitives::DateTime::from_secs(10),
-                etag: None,
-            });
+            let remote = mock_remote(&bodies);
             let control = UpdateControl::new();
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
@@ -916,7 +1134,7 @@ mod tests {
             )
             .await
             .context("Mock S3 test timed out")?;
-            server.join().unwrap();
+            server.join().unwrap()?;
             if valid {
                 let snapshot = result.map_err(|e| anyhow::anyhow!("{e:?}"))?;
                 assert!(snapshot.current(&config, &remote));

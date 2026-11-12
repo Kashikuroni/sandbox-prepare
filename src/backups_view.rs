@@ -22,6 +22,7 @@ enum Transfer {
         bytes: u64,
         total: u64,
     },
+    WaitingForVerification,
     VerificationFailed,
     Verified,
 }
@@ -300,6 +301,9 @@ impl BackupsView {
                         *speed = (bytes as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
                     }
                 }
+                Progress::WaitingForVerification(index) => {
+                    self.rows[index].transfer = Transfer::WaitingForVerification;
+                }
                 Progress::Verifying(index) => {
                     let total = if self.integrity_check {
                         self.local
@@ -395,6 +399,7 @@ impl BackupsView {
         let row = &self.rows[index];
         match row.transfer {
             Transfer::Running { .. } => return "Downloading…",
+            Transfer::WaitingForVerification => return "Downloaded · waiting for verification",
             Transfer::Verifying { .. } => return "Verifying archive…",
             Transfer::VerificationFailed => return "Verification failed",
             Transfer::Verified => {
