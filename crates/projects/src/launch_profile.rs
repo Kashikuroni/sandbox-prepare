@@ -181,6 +181,12 @@ pub fn prepare(
         source.directory.is_dir(),
         "The selected working copy is unavailable"
     );
+    crate::local_environment::prepare(
+        catalog,
+        &catalog.project(&sandbox.project_id)?,
+        sandbox,
+        cancel,
+    )?;
     spec = resolve_paths(spec, &source.directory);
     let global = catalog.environment(&sandbox.project_id, "*")?;
     let document = crate::compose::inspect(&source.directory, &spec, &global, cancel, false)?;

@@ -302,6 +302,7 @@ impl Git {
         };
         sandbox.source = Some(selection.clone());
         catalog.save_sandbox(sandbox)?;
+        crate::local_environment::prepare(catalog, project, sandbox, cancel)?;
         Ok(selection)
     }
     /// False means the user's work was retained. Branches are never deleted here.
@@ -483,6 +484,85 @@ mod tests {
                 .contains(&"feature/local".to_owned())
         );
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
+    fn managed_worktrees_receive_local_environment_without_replacing_branch_files() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sandbox-env-git-{}",
+            sandbox_platform::docker::nonce()?
+        ));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo)?;
+        command(&repo, &["init", "-b", "main"])?;
+        command(&repo, &["config", "user.email", "fixture@example.invalid"])?;
+        command(&repo, &["config", "user.name", "Fixture"])?;
+        command(&repo, &["config", "commit.gpgsign", "false"])?;
+        command(&repo, &["config", "core.hooksPath", "/dev/null"])?;
+        fs::write(repo.join(".gitignore"), ".env\n.env.local\nenvs/\n")?;
+        fs::write(repo.join(".env.example"), "committed template")?;
+        command(&repo, &["add", ".gitignore", ".env.example"])?;
+        command(&repo, &["commit", "-m", "fixture"])?;
+        fs::write(repo.join(".env.example"), "dirty template in main")?;
+        fs::create_dir_all(repo.join("envs"))?;
+        fs::write(repo.join("envs/.env"), "TOKEN=local-secret")?;
+        fs::write(repo.join(".env.local"), "DB_NAME=fixture")?;
+        let catalog = Catalog::open(root.join("data/application.sqlite3"))?;
+        let git = Git::default();
+        let cancel = AtomicBool::new(false);
+        let project = catalog.create_project(
+            "Fixture".into(),
+            Some(git.repository(&repo, &cancel)?),
+            Default::default(),
+        )?;
+        let mut sandbox = catalog.create_sandbox(project.id.clone(), "Worktree".into())?;
+        let selected = git.prepare(
+            &catalog,
+            &project,
+            &mut sandbox,
+            SourceMode::ManagedWorktree {
+                branch: "feature/env".into(),
+            },
+            &cancel,
+        )?;
+        assert_eq!(
+            fs::read_to_string(selected.directory.join("envs/.env"))?,
+            "TOKEN=local-secret"
+        );
+        assert_eq!(
+            fs::read_to_string(selected.directory.join(".env.local"))?,
+            "DB_NAME=fixture"
+        );
+        assert_eq!(
+            fs::read_to_string(selected.directory.join(".env.example"))?,
+            "committed template"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join(".env.example"))?,
+            "dirty template in main"
+        );
+        assert!(command(&selected.directory, &["status", "--porcelain"])?.is_empty());
+        fs::write(
+            selected.directory.join(".env.local"),
+            "own worktree settings",
+        )?;
+        fs::remove_file(selected.directory.join("envs/.env"))?;
+        crate::local_environment::prepare(&catalog, &project, &sandbox, &cancel)?;
+        assert_eq!(
+            fs::read_to_string(selected.directory.join("envs/.env"))?,
+            "TOKEN=local-secret"
+        );
+        assert_eq!(
+            fs::read_to_string(selected.directory.join(".env.local"))?,
+            "own worktree settings"
+        );
         Ok(())
     }
 }
