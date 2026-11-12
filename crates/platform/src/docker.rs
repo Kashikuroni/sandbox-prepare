@@ -13,6 +13,54 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// A descendant may keep a command's pipe open after the command exits.
+/// Drain available output, but do not wait forever for that descendant's EOF.
+struct CommandPipe<R> {
+    inner: R,
+    finished: std::sync::Arc<AtomicBool>,
+}
+#[cfg(unix)]
+fn command_pipe<R: Read + std::os::fd::AsRawFd>(
+    inner: R,
+    finished: &std::sync::Arc<AtomicBool>,
+) -> std::io::Result<CommandPipe<R>> {
+    let fd = inner.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(CommandPipe {
+        inner,
+        finished: finished.clone(),
+    })
+}
+#[cfg(not(unix))]
+fn command_pipe<R: Read>(
+    inner: R,
+    finished: &std::sync::Arc<AtomicBool>,
+) -> std::io::Result<CommandPipe<R>> {
+    Ok(CommandPipe {
+        inner,
+        finished: finished.clone(),
+    })
+}
+impl<R: Read> Read for CommandPipe<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            match self.inner.read(buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if self.finished.load(Ordering::Acquire) {
+                        return Ok(0);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Docker {
     pub binary: PathBuf,
@@ -89,16 +137,16 @@ impl Docker {
                 stdin.flush()
             })
         });
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let stdout = command_pipe(child.stdout.take().unwrap(), &finished)?;
+        let stderr = command_pipe(child.stderr.take().unwrap(), &finished)?;
         let tail = Mutex::new(VecDeque::<String>::new());
         let started = Instant::now();
         thread::scope(|scope| -> Result<String> {
             let log = &log;
             let tail = &tail;
             let mut readers = Vec::new();
-            for pipe in [
-                Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
-                Box::new(child.stderr.take().unwrap()),
-            ] {
+            for pipe in [Box::new(stdout) as Box<dyn Read + Send>, Box::new(stderr)] {
                 readers.push(scope.spawn(move || {
                     let mut reader = BufReader::new(pipe);
                     let mut bytes = Vec::new();
@@ -130,10 +178,12 @@ impl Docker {
                     Err(error) => {
                         kill_group(&mut child);
                         let _ = child.wait();
+                        finished.store(true, Ordering::Release);
                         return Err(error.into());
                     }
                 }
             };
+            finished.store(true, Ordering::Release);
             let writer_result = writer.map(|writer| {
                 writer
                     .join()
@@ -180,8 +230,9 @@ impl Docker {
             .envs(environment)
             .spawn()
             .with_context(|| format!("Could not start {}", self.binary.display()))?;
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let stdout = command_pipe(child.stdout.take().unwrap(), &finished)?;
+        let stderr = command_pipe(child.stderr.take().unwrap(), &finished)?;
         let started = Instant::now();
         thread::scope(|scope| -> Result<String> {
             let read = |pipe: Box<dyn Read + Send>| -> std::io::Result<Vec<u8>> {
@@ -202,10 +253,12 @@ impl Docker {
                     Err(error) => {
                         kill_group(&mut child);
                         let _ = child.wait();
+                        finished.store(true, Ordering::Release);
                         return Err(error.into());
                     }
                 }
             };
+            finished.store(true, Ordering::Release);
             let stdout = out
                 .join()
                 .map_err(|_| anyhow::anyhow!("Output reader failed"))??;
@@ -346,5 +399,25 @@ mod stream_tests {
             |_| {},
         );
         assert!(result.unwrap_err().to_string().contains("stream backup"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pipe_tests {
+    use super::*;
+    #[test]
+    fn drains_output_without_waiting_for_descendants_to_close_pipe() -> std::io::Result<()> {
+        use std::os::unix::net::UnixStream;
+        let (read, mut writer) = UnixStream::pair()?;
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        writer.write_all(b"complete output\n")?;
+        done.store(true, Ordering::Release);
+        let mut reader = command_pipe(read, &done)?;
+        let mut output = String::new();
+        reader.read_to_string(&mut output)?;
+        assert_eq!(output, "complete output\n");
+        // Writer remains open: the command's completion, rather than EOF, ended the read.
+        drop(writer);
+        Ok(())
     }
 }
