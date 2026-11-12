@@ -641,7 +641,7 @@ impl ProjectsView {
                         }
                     }
                 }
-                self.notice=Some("Configuration inspected. Import application settings, confirm database names, then save the project profile.".into());
+                self.notice=Some("Configuration inspected. Project env files are read directly. Confirm database names, then save the project profile.".into());
             }
             Event::Saved(message) => {
                 self.notice = Some(message);
@@ -1163,18 +1163,18 @@ impl Render for ProjectsView {
                                 .join(" → ")
                         )));
                 }
-                page=page.child(heading("Environment",p))
-                    .child(div().text_sm().text_color(rgb(p.text_muted)).child("Import application settings once. Sandbox connections override DB_* and CLICKHOUSE_* automatically."))
-                    .child(row("Env file to import",self.env_path.clone(),p))
-                    .child(div().flex().child(button("import-env","Import into application storage",ready,p,cx,|this,_,cx|this.import(cx))))
-                    .child(heading("Databases",p))
+                page=page.child(heading("Databases",p))
                     .child(row("MySQL database (DB_NAME)",self.mysql_database.clone(),p))
                     .child(row("ClickHouse database",self.ch_database.clone(),p))
-                    .child(div().text_sm().text_color(rgb(p.text_muted)).child("Names are inferred from imported settings when available. Hosts, ports, logins and passwords are managed by the sandbox."))
+                    .child(div().text_sm().text_color(rgb(p.text_muted)).child("Names are inferred from project env files when available. Hosts, ports, logins and passwords are managed by the sandbox."))
                     .child(button("advanced-launch",if self.advanced{"Hide advanced settings"}else{"Advanced settings…"},ready,p,cx,|this,_,cx|{this.advanced=!this.advanced;cx.notify();}));
                 if self.advanced {
                     page = page
+                        .child(heading("Optional environment overrides", p))
+                        .child(div().text_sm().text_color(rgb(p.text_muted)).child("Compose reads the project's env_file directly. Import only to keep explicit overrides in application storage; existing imports remain active."))
+                        .child(row("Env file to import", self.env_path.clone(), p))
                         .child(row("Import environment for", self.env_service.clone(), p))
+                        .child(div().flex().child(button("import-env", "Import overrides into application storage", ready, p, cx, |this, _, cx| this.import(cx))))
                         .child(heading("Optional HTTP readiness check", p))
                         .child(row("Application service", self.probe_service.clone(), p))
                         .child(row("Published container port", self.probe_port.clone(), p))

@@ -88,8 +88,6 @@ fn args(directory: &Path, spec: &ComposeLaunchSpec) -> Result<Vec<String>> {
         "sandbox-inspect",
         "--profile",
         "*",
-        "--env-file",
-        if cfg!(windows) { "NUL" } else { "/dev/null" },
     ]);
     for file in &spec.files {
         ensure!(
@@ -128,6 +126,35 @@ pub fn inspect(
         decode_export(&mut document);
     }
     Ok(document)
+}
+/// Resolve project env files with Compose itself for inference and consumer detection.
+/// Values are transient: the generated plan keeps env_file references, not their contents.
+pub fn inspect_environment(
+    directory: &Path,
+    spec: &ComposeLaunchSpec,
+    environment: &BTreeMap<String, String>,
+    cancel: &AtomicBool,
+) -> Result<Value> {
+    let mut command = args(directory, spec)?;
+    command.retain(|arg| arg != "--no-env-resolution");
+    let output =
+        Docker::discover().capture(&command, environment, cancel, Duration::from_secs(60))?;
+    let mut document = serde_json::from_str(&output).context("Compose returned invalid JSON")?;
+    decode_export(&mut document);
+    if let Some(services) = document["services"].as_object() {
+        for service in services.keys() {
+            register_secrets(&service_environment(&document, service));
+        }
+    }
+    Ok(document)
+}
+pub(crate) fn service_environment(document: &Value, name: &str) -> BTreeMap<String, String> {
+    document["services"][name]["environment"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_owned())))
+        .collect()
 }
 // `compose config` exports a reusable Compose document, doubling literal dollars.
 // Our plan stores runtime values separately, so decode that serialization exactly once.
@@ -338,6 +365,7 @@ pub fn build(
         global.extend(values.clone());
     }
     register_secrets(&global);
+    let resolved_environment = inspect_environment(directory, spec, &global, cancel)?;
     let mut document = inspect(directory, spec, &global, cancel, true)?;
     let source = document["services"]
         .as_object_mut()
@@ -427,10 +455,7 @@ pub fn build(
         labels.insert(scope_label("role"), json!("application"));
         let mut environment = BTreeMap::new();
         if object.get("env_file").is_some() {
-            ensure!(
-                !global.is_empty() || !catalog.environment(&project.id, name)?.is_empty(),
-                "Import the env-file values for service {name} before launching"
-            );
+            // Retain previously imported values as optional explicit overrides.
             environment.extend(imported_global.clone());
         }
         environment.extend(catalog.environment(&project.id, name)?);
@@ -443,9 +468,27 @@ pub fn build(
                 }
             }
         }
-        object.remove("env_file");
+        let null_variables: Vec<_> = object
+            .get("environment")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(_, value)| value.is_null())
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut effective = service_environment(&resolved_environment, name);
+        effective.extend(environment.clone());
+        for key in &null_variables {
+            effective.remove(key);
+        }
         if let Some(values) = &automatic {
-            let (mysql, ch) = crate::launch_profile::inject(&mut environment, values);
+            let mysql = crate::launch_profile::uses_mysql(&effective);
+            let ch = crate::launch_profile::uses_clickhouse(&effective);
+            for (key, value) in values {
+                if (mysql && key.starts_with("DB_")) || (ch && key.starts_with("CLICKHOUSE_")) {
+                    environment.insert(key.clone(), value.clone());
+                }
+            }
             for (used, role, key) in [
                 (mysql, "mysql", "DB_NAME"),
                 (ch, "clickhouse", "CLICKHOUSE_DATABASE"),
@@ -468,7 +511,13 @@ pub fn build(
             }
         }
         register_secrets(&environment);
-        object.insert("environment".into(), serde_json::to_value(environment)?);
+        let mut final_environment = serde_json::to_value(&environment)?;
+        for key in null_variables {
+            if !environment.contains_key(&key) {
+                final_environment[&key] = Value::Null;
+            }
+        }
+        object.insert("environment".into(), final_environment);
         if let Some(mounts) = object.get_mut("volumes").and_then(Value::as_array_mut) {
             for mount in mounts {
                 if mount["type"] != "bind" {
@@ -749,6 +798,7 @@ mod integration {
         let file = directory.join("compose.yml");
         let bytes = serde_json::to_vec_pretty(&original)?;
         fs::write(&file, &bytes)?;
+        fs::write(directory.join("secrets.env"), "FROM_FILE=project-value\n")?;
         catalog.save_environment(
             &project.id,
             "*",
@@ -821,7 +871,11 @@ mod integration {
             managed["services"]["mysql"]["image"]
         );
         assert!(resolved["services"].get("other").is_none());
-        assert!(resolved["services"]["api"].get("env_file").is_none());
+        assert!(plan.document["services"]["api"].get("env_file").is_some());
+        assert_eq!(
+            resolved["services"]["api"]["environment"]["FROM_FILE"],
+            "project-value"
+        );
         assert_eq!(
             resolved["services"]["api"]["container_name"],
             "sp-fixture-first-app-api"
@@ -890,7 +944,7 @@ mod automatic_integration {
         git(&["config", "commit.gpgsign", "false"])?;
         git(&["config", "core.hooksPath", "/dev/null"])?;
         let document = json!({"services":{
-            "api":{"image":"alpine:3.21","env_file":["app.env"],"environment":{"DB_HOST":"production-explicit","TOKEN":"${TOKEN}"},"volumes":["./src:/code","./storage:/storage"],"networks":["app"]},
+            "api":{"image":"alpine:3.21","env_file":["app.env"],"environment":{"DB_HOST":"production-explicit","PROJECT_TOKEN":"${PROJECT_TOKEN}","REMOVED":null},"volumes":["./src:/code","./storage:/storage"],"networks":["app"]},
             "worker":{"image":"alpine:3.21","env_file":["app.env"],"networks":["app"]},
             "database":{"image":"mysql:8.4"},"analytics":{"image":"clickhouse/clickhouse-server:26.8"},"redis":{"image":"redis:7"}
         },"networks":{"app":{}}});
@@ -903,21 +957,11 @@ mod automatic_integration {
         git(&["worktree", "add", "-b", "second", second.to_str().unwrap()])?;
         let catalog = Catalog::open(root.join("data/application.sqlite3"))?;
         let project = catalog.create_project("Fixture".into(), None, Default::default())?;
-        catalog.save_environment(
-            &project.id,
-            "*",
-            &BTreeMap::from([
-                ("DB_NAME".into(), "app".into()),
-                ("DB_HOST".into(), "production".into()),
-                ("DB_PASSWORD".into(), "production-password".into()),
-                ("CLICKHOUSE_DATABASE".into(), "analytics".into()),
-                (
-                    "CLICKHOUSE_URL".into(),
-                    "https://production.invalid/analytics".into(),
-                ),
-                ("TOKEN".into(), "private $literal ${keep}".into()),
-            ]),
-        )?;
+        let env_file = "DB_NAME=app\nDB_HOST=production\nDB_PASSWORD=production-password\nCLICKHOUSE_DATABASE=analytics\nCLICKHOUSE_URL=https://production.invalid/analytics\nTOKEN='private $literal ${keep}'\nREMOVED=from-file\n";
+        for working in [&directory, &second] {
+            fs::write(working.join("app.env"), env_file)?;
+            fs::write(working.join(".env"), "PROJECT_TOKEN=from-dotenv\n")?;
+        }
         let cancel = AtomicBool::new(false);
         let mut passwords = vec![];
         for (index, working) in [directory.clone(), second.clone()].into_iter().enumerate() {
@@ -955,7 +999,7 @@ mod automatic_integration {
             assert!(!serde_json::to_string(&plan.document)?.contains(&sandbox.password));
             let generated = working.join("generated.json");
             fs::write(&generated, serde_json::to_vec(&plan.document)?)?;
-            let resolved = inspect(
+            let resolved = inspect_environment(
                 &working,
                 &ComposeLaunchSpec {
                     files: vec!["generated.json".into()],
@@ -963,7 +1007,6 @@ mod automatic_integration {
                 },
                 &plan.environment,
                 &cancel,
-                true,
             )?;
             for service in ["api", "worker"] {
                 let env = &resolved["services"][service]["environment"];
@@ -988,7 +1031,44 @@ mod automatic_integration {
                     .is_none()
             );
             assert_eq!(fs::read(working.join("compose.json"))?, original);
-            assert!(!working.join("app.env").exists());
+            assert_eq!(fs::read_to_string(working.join("app.env"))?, env_file);
+            assert_eq!(
+                resolved["services"]["api"]["environment"]["PROJECT_TOKEN"],
+                "from-dotenv"
+            );
+            assert!(resolved["services"]["api"]["environment"]["REMOVED"].is_null());
+            assert_eq!(
+                resolved["services"]["worker"]["environment"]["REMOVED"],
+                "from-file"
+            );
+            assert!(
+                !plan
+                    .environment
+                    .values()
+                    .any(|v| v == "private $literal ${keep}")
+            );
+            // Env files remain live inputs: a later Compose resolution reads updated settings.
+            fs::write(
+                working.join("app.env"),
+                env_file.replace("private $literal ${keep}", "updated token"),
+            )?;
+            let fresh = inspect_environment(
+                &working,
+                &ComposeLaunchSpec {
+                    files: vec!["generated.json".into()],
+                    ..Default::default()
+                },
+                &plan.environment,
+                &cancel,
+            )?;
+            assert_eq!(
+                fresh["services"]["worker"]["environment"]["TOKEN"],
+                "updated token"
+            );
+            assert_eq!(
+                fresh["services"]["worker"]["environment"]["DB_PASSWORD"],
+                sandbox.password
+            );
             passwords.push(sandbox.password);
         }
         assert_ne!(passwords[0], passwords[1]);

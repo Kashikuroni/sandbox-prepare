@@ -196,6 +196,7 @@ pub fn prepare(
         &spec,
         &spec.databases.keys().cloned().collect(),
     )?;
+    let resolved = crate::compose::inspect_environment(&source.directory, &spec, &global, cancel)?;
     let mut names = spec.automatic_connections.clone().unwrap_or_default();
     let mut mysql = BTreeSet::new();
     let mut clickhouse = BTreeSet::new();
@@ -209,13 +210,10 @@ pub fn prepare(
             continue;
         }
         let scoped = catalog.environment(&sandbox.project_id, service)?;
+        let mut env = crate::compose::service_environment(&resolved, service);
         if config.get("env_file").is_some() {
-            ensure!(
-                !global.is_empty() || !scoped.is_empty(),
-                "Import the env file for {service} into the project profile"
-            );
+            env.extend(global.clone());
         }
-        let mut env = global.clone();
         env.extend(scoped);
         if let Some(explicit) = config["environment"].as_object() {
             for (key, value) in explicit {
