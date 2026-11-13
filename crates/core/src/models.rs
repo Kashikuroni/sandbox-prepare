@@ -139,8 +139,20 @@ pub struct ReadinessProbe {
     /// HTTP path checked through this sandbox's published localhost port.
     pub path: String,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PreparationStep {
+    pub command: String,
+    #[serde(default)]
+    pub directory: PathBuf,
+    #[serde(default)]
+    pub inputs: Vec<PathBuf>,
+    #[serde(default)]
+    pub outputs: Vec<PathBuf>,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ComposeLaunchSpec {
+    #[serde(default)]
+    pub preparation: Option<PreparationStep>,
     #[serde(default)]
     pub automatic_connections: Option<DatabaseNames>,
     #[serde(default)]

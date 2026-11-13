@@ -57,6 +57,12 @@ impl Runtime {
                 let spec = launch_profile::prepare(&runtime.catalog, &sandbox, spec, &cancel)?;
                 sandbox.compose = Some(spec);
                 runtime.catalog.save_sandbox(&sandbox)?;
+                controller.report("Preparing project…".into(), None);
+                sandbox_projects::preparation::run(&runtime.catalog, &sandbox, &cancel, |line| {
+                    controller.logs.append("Preparation", line)
+                })?;
+                controller.report("Checking source and configuration mounts…".into(), None);
+                sandbox_projects::compose::validate_mounts(&runtime.catalog, &sandbox, &cancel)?;
                 ensure!(!cancel.load(Ordering::Acquire), "Cancelled");
                 // A normal start never refreshes an existing generation, even if S3 has newer data.
                 if replace_databases || !controller.has_database_data()? {

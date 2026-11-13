@@ -148,6 +148,69 @@ pub fn inspect_environment(
     }
     Ok(document)
 }
+/// Validate required source/configuration mounts after preparation, before downloads/images.
+pub fn validate_mounts(catalog: &Catalog, sandbox: &Sandbox, cancel: &AtomicBool) -> Result<()> {
+    let Some(spec) = &sandbox.compose else {
+        return Ok(());
+    };
+    let directory = &sandbox
+        .source
+        .as_ref()
+        .context("Choose a working copy first")?
+        .directory;
+    let document = inspect(
+        directory,
+        spec,
+        &catalog.environment(&sandbox.project_id, "*")?,
+        cancel,
+        true,
+    )?;
+    let included = included_services(
+        document["services"]
+            .as_object()
+            .context("Compose has no services")?,
+        spec,
+        &spec.databases.keys().cloned().collect(),
+    )?;
+    for (name, service) in document["services"].as_object().into_iter().flatten() {
+        if !included.contains(name) || spec.databases.contains_key(name) {
+            continue;
+        }
+        for mount in service["volumes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|mount| mount["type"] == "bind")
+        {
+            let key = format!("{name}:{}", mount["target"].as_str().unwrap_or(""));
+            let required =
+                spec.mounts.get(&key).is_some_and(|role| {
+                    matches!(role, MountRole::Source | MountRole::Configuration)
+                }) || (!spec.mounts.contains_key(&key)
+                    && (mount["read_only"] == true
+                        || mount["source"] == directory.to_string_lossy().as_ref()));
+            if required {
+                let original = PathBuf::from(
+                    mount["source"]
+                        .as_str()
+                        .context("Bind mount lacks source")?,
+                );
+                let path = spec.mount_paths.get(&key).cloned().unwrap_or(original);
+                let path = if path.is_relative() {
+                    directory.join(path)
+                } else {
+                    path
+                };
+                ensure!(
+                    path.exists(),
+                    "Mount {key} is missing: {}. Configure a project preparation command or choose an existing source/configuration path.",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
 pub(crate) fn service_environment(document: &Value, name: &str) -> BTreeMap<String, String> {
     document["services"][name]["environment"]
         .as_object()

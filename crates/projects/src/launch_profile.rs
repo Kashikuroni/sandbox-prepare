@@ -187,6 +187,9 @@ pub fn prepare(
         sandbox,
         cancel,
     )?;
+    if let Some(step) = &spec.preparation {
+        crate::preparation::validate(sandbox, step)?;
+    }
     spec = resolve_paths(spec, &source.directory);
     let global = catalog.environment(&sandbox.project_id, "*")?;
     let document = crate::compose::inspect(&source.directory, &spec, &global, cancel, false)?;

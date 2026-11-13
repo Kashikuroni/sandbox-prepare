@@ -121,15 +121,32 @@ impl Docker {
         environment: &std::collections::BTreeMap<String, String>,
         log: impl Fn(String) + Send + Sync,
     ) -> Result<String> {
+        self.run_with_env_in(args, input, cancel, timeout, environment, None, log)
+    }
+    /// Runs a foreground project preparation command in its working directory.
+    /// Its entire process group is reaped on completion or cancellation.
+    pub fn run_with_env_in(
+        &self,
+        args: &[String],
+        input: Option<Box<dyn Read + Send>>,
+        cancel: &AtomicBool,
+        timeout: Duration,
+        environment: &std::collections::BTreeMap<String, String>,
+        directory: Option<&Path>,
+        log: impl Fn(String) + Send + Sync,
+    ) -> Result<String> {
         ensure!(!cancel.load(Ordering::Acquire), "Operation cancelled");
         let mut command = self.command(args);
         command.envs(environment);
+        if let Some(directory) = directory {
+            command.current_dir(directory);
+        }
         if input.is_some() {
             command.stdin(Stdio::piped());
         }
         let mut child = command
             .spawn()
-            .context("Could not run Docker. Install Docker Desktop and start its engine.")?;
+            .with_context(|| format!("Could not run {}", self.binary.display()))?;
         let writer = input.map(|mut input| {
             let mut stdin = child.stdin.take().expect("piped stdin");
             thread::spawn(move || -> std::io::Result<()> {
@@ -183,6 +200,9 @@ impl Docker {
                     }
                 }
             };
+            if directory.is_some() {
+                kill_group(&mut child);
+            }
             finished.store(true, Ordering::Release);
             let writer_result = writer.map(|writer| {
                 writer
