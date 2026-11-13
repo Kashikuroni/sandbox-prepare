@@ -244,7 +244,7 @@ impl Workspace {
                             {
                                 match std::env::var("SANDBOX_PREPARE_UI_PREVIEW_SCREEN").as_deref()
                                 {
-                                    Ok("launch" | "preparation") => {
+                                    Ok("launch" | "preparation" | "removal") => {
                                         workspace.active_section = Section::Projects;
                                         workspace
                                             .projects
@@ -304,7 +304,7 @@ impl Workspace {
             && std::env::var_os("SANDBOX_PREPARE_UI_PREVIEW").is_some()
         {
             match std::env::var("SANDBOX_PREPARE_UI_PREVIEW_SCREEN").as_deref() {
-                Ok("launch" | "preparation") => {
+                Ok("launch" | "preparation" | "removal") => {
                     workspace.active_section = Section::Projects;
                     workspace
                         .projects

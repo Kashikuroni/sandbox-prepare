@@ -19,6 +19,7 @@ pub struct Changed {
 }
 enum Event {
     Created(ProjectId, Option<SandboxId>),
+    Removed(ProjectId, Option<std::path::PathBuf>),
     Discovered(Vec<compose::Candidate>),
     Inspected(
         serde_json::Value,
@@ -26,6 +27,7 @@ enum Event {
     ),
     Saved(String),
     Configured(ComposeLaunchSpec),
+    RemovalReviewed(sandbox_projects::removal::RemovalReview),
 }
 #[derive(Clone)]
 struct Mount {
@@ -83,7 +85,9 @@ pub struct ProjectsView {
     error: Option<String>,
     notice: Option<String>,
     tab: usize,
-    remove_confirmation: bool,
+    removal: Option<sandbox_projects::removal::RemovalReview>,
+    removal_focus: [FocusHandle; 4],
+    focus_removal: bool,
     drafts: std::collections::BTreeMap<SandboxId, LaunchDraft>,
     form_focus: Option<()>,
     binding_error: Option<String>,
@@ -213,13 +217,23 @@ impl ProjectsView {
             error: None,
             notice: None,
             tab: 0,
-            remove_confirmation: false,
+            removal: None,
+            removal_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            focus_removal: false,
             drafts: Default::default(),
             form_focus: None,
             binding_error: None,
             save_error: None,
         };
         view.load(cx);
+        if removal_preview() {
+            view.removal = view
+                .sandbox
+                .as_ref()
+                .and_then(|id| view.app.manager(id).ok())
+                .and_then(|manager| manager.review_removal(&AtomicBool::new(false)).ok());
+            view.focus_removal = view.removal.is_some();
+        }
         view
     }
     pub fn prepare_project_form(&mut self, clone_remote: bool, cx: &mut Context<Self>) {
@@ -333,7 +347,8 @@ impl ProjectsView {
     fn load(&mut self, cx: &mut Context<Self>) {
         self.error = None;
         self.notice = None;
-        self.remove_confirmation = false;
+        self.removal = None;
+        self.focus_removal = false;
         self.binding_error = None;
         self.save_error = None;
         // New entities prevent another sandbox's retained draft being mutated through shared handles.
@@ -496,8 +511,15 @@ impl ProjectsView {
                 self.binding_parameter,
             ] = draft.selects;
             self.set_theme(self.theme, cx);
-        } else if preparation_preview() {
-            self.notice = Some("Project preparation preview — select text to copy.".into());
+        } else if preparation_preview() || removal_preview() {
+            self.notice = Some(
+                if removal_preview() {
+                    "Removal preview — nothing has been deleted."
+                } else {
+                    "Project preparation preview — select text to copy."
+                }
+                .into(),
+            );
         } else if !self.spec.files.is_empty() {
             self.inspect(cx);
         } else if self
@@ -593,6 +615,25 @@ impl ProjectsView {
     }
     fn receive(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
+            Event::Removed(project, kept) => {
+                self.tab = 0;
+                cx.emit(Changed {
+                    project,
+                    sandbox: None,
+                });
+                self.notice = Some(if let Some(path) = kept {
+                    format!(
+                        "Sandbox removed. Working directory kept at {}. Backups and Git branches are preserved.",
+                        path.display()
+                    )
+                } else {
+                    "Sandbox and app-owned worktree removed. Backups and Git branches are preserved.".into()
+                });
+            }
+            Event::RemovalReviewed(review) => {
+                self.removal = Some(review);
+                self.focus_removal = true;
+            }
             Event::Created(project, sandbox) => {
                 // Workspace owns selection and may refuse a project switch with unsaved Settings.
                 // Its context() call saves the outgoing draft before loading the new sandbox.
@@ -852,6 +893,224 @@ impl ProjectsView {
             },
             cx,
         );
+    }
+    fn review_removal(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.sandbox.clone() else {
+            return;
+        };
+        self.run(
+            "Review sandbox removal",
+            move |app, cancel| {
+                Ok(Event::RemovalReviewed(
+                    app.review_sandbox_removal(&id, &cancel)?,
+                ))
+            },
+            cx,
+        );
+    }
+    fn confirm_removal(&mut self, choice: WorktreeRemoval, cx: &mut Context<Self>) {
+        let (Some(id), Some(review)) = (self.sandbox.clone(), self.removal.take()) else {
+            return;
+        };
+        let project = self.project.clone();
+        let kept = if choice == WorktreeRemoval::Keep {
+            review.directory.clone()
+        } else {
+            None
+        };
+        let approval = RemovalApproval {
+            worktree: choice,
+            identity: review.identity,
+            fingerprint: review.worktree,
+        };
+        self.run(
+            "Remove sandbox",
+            move |app, cancel| {
+                app.remove_sandbox(&id, approval, &cancel)?;
+                Ok(Event::Removed(project, kept))
+            },
+            cx,
+        );
+    }
+    fn close_removal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.removal = None;
+        self.removal_focus[3].focus(window);
+        cx.notify();
+    }
+    fn removal_dialog(
+        &self,
+        review: sandbox_projects::removal::RemovalReview,
+        p: Palette,
+        cx: &Context<Self>,
+    ) -> Div {
+        let mut body=div().id("removal-dialog-body").flex().flex_col().gap_3().w_full().flex_1().min_h_0().overflow_y_scroll()
+            .child(div().text_lg().child("Remove sandbox?"))
+            .child(div().text_sm().child("Database volumes and private application data will be deleted. Backups and Git branches are kept. Choose what happens to the working directory before anything is deleted."));
+        if let Some(path) = &review.directory {
+            body = body.child(div().text_sm().text_color(rgb(p.text_muted)).child(
+                SelectableText::new("removal-directory", path.display().to_string(), p),
+            ));
+        }
+        if let Some(warning) = &review.warning {
+            body = body.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(if review.owned { p.error } else { p.text_muted }))
+                    .child(SelectableText::new("removal-warning", warning.clone(), p)),
+            );
+        }
+        let change_count = review.changes.len();
+        body = body.child(div().text_sm().child(if change_count == 0 {
+            if review.can_delete {
+                "No local changes were found.".to_owned()
+            } else {
+                "The working directory can be kept; automatic deletion is unavailable.".to_owned()
+            }
+        } else {
+            format!("{change_count} local change entries, including ignored/generated paths:")
+        }));
+        if !review.changes.is_empty() {
+            body = body.child(
+                div()
+                    .id("removal-changes")
+                    .max_h(px(220.))
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(review.changes.iter().enumerate().map(|(index, change)| {
+                        div().text_sm().child(SelectableText::new(
+                            ("removal-change", index),
+                            format!("{} · {}", change.status, change.path),
+                            p,
+                        ))
+                    })),
+            );
+        }
+        if review.owned {
+            body=body.child(div().text_sm().text_color(rgb(p.error)).child("Remove sandbox + worktree permanently deletes every file in this app-owned directory, including .env files, generated output and uncommitted changes."));
+        }
+        let mut actions = div()
+            .flex_shrink_0()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .justify_end()
+            .child(
+                button(
+                    "cancel-remove",
+                    "Cancel",
+                    true,
+                    p,
+                    cx,
+                    |this, window, cx| this.close_removal(window, cx),
+                )
+                .track_focus(&self.removal_focus[0]),
+            )
+            .child(
+                button(
+                    "keep-worktree",
+                    if review.directory.is_some() {
+                        "Remove sandbox, keep worktree"
+                    } else {
+                        "Remove sandbox"
+                    },
+                    true,
+                    p,
+                    cx,
+                    |this, _, cx| this.confirm_removal(WorktreeRemoval::Keep, cx),
+                )
+                .track_focus(&self.removal_focus[1]),
+            );
+        if review.owned {
+            actions = actions.child(
+                button(
+                    "delete-worktree",
+                    "Remove sandbox + worktree",
+                    review.can_delete,
+                    p,
+                    cx,
+                    |this, _, cx| this.confirm_removal(WorktreeRemoval::Delete, cx),
+                )
+                .track_focus(&self.removal_focus[2])
+                .text_color(rgb(if review.can_delete {
+                    p.error
+                } else {
+                    p.text_muted
+                })),
+            );
+        }
+        let count = if review.owned && review.can_delete {
+            3
+        } else {
+            2
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .bg(gpui::black().opacity(0.3))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_action(cx.listener(move |this, _: &crate::FocusNext, window, cx| {
+                let current = (0..count)
+                    .find(|index| this.removal_focus[*index].is_focused(window))
+                    .unwrap_or(0);
+                this.removal_focus[(current + 1) % count].focus(window);
+                cx.stop_propagation();
+            }))
+            .on_action(
+                cx.listener(move |this, _: &crate::FocusPrevious, window, cx| {
+                    let current = (0..count)
+                        .find(|index| this.removal_focus[*index].is_focused(window))
+                        .unwrap_or(0);
+                    this.removal_focus[(current + count - 1) % count].focus(window);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => {
+                        this.close_removal(window, cx);
+                        cx.stop_propagation();
+                    }
+                    "tab" => {
+                        let current = (0..count)
+                            .find(|index| this.removal_focus[*index].is_focused(window))
+                            .unwrap_or(0);
+                        let next = if event.keystroke.modifiers.shift {
+                            (current + count - 1) % count
+                        } else {
+                            (current + 1) % count
+                        };
+                        this.removal_focus[next].focus(window);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
+            .child(
+                div()
+                    .id("removal-dialog")
+                    .w_full()
+                    .max_w(px(650.))
+                    .max_h_full()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .rounded_md()
+                    .shadow_lg()
+                    .p_4()
+                    .bg(rgb(p.editor_background))
+                    .text_color(rgb(p.text))
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(body)
+                    .child(actions),
+            )
     }
     fn import(&mut self, cx: &mut Context<Self>) {
         let project = self.project.clone();
@@ -1151,27 +1410,20 @@ impl Render for ProjectsView {
             page = page
                 .child(heading("Project launch profile", p))
                 .child(div().child(sandbox.name));
-            if self.remove_confirmation {
-                page=page.child(div().text_sm().text_color(rgb(p.error)).child("Remove this sandbox and all of its database/application data? Clean app-owned worktrees will be removed; user directories and branches are kept."))
-                    .child(div().flex().gap_2().child(button("cancel-remove","Cancel",ready,p,cx,|this,_,cx|{this.remove_confirmation=false;cx.notify();})).child(button("confirm-remove","Remove sandbox",ready,p,cx,|this,_,cx|{if let Some(id)=this.sandbox.clone(){let project=this.project.clone();this.remove_confirmation=false;this.run("Remove sandbox",move |app,cancel|{app.remove_sandbox(&id,&cancel)?;Ok(Event::Created(project,None))},cx);}}).text_color(rgb(p.error))));
-            } else {
-                page = page.child(
-                    div().flex().child(
-                        button(
-                            "request-remove",
-                            "Remove sandbox…",
-                            ready,
-                            p,
-                            cx,
-                            |this, _, cx| {
-                                this.remove_confirmation = true;
-                                cx.notify();
-                            },
-                        )
-                        .text_color(rgb(p.error)),
-                    ),
-                );
-            }
+            page = page.child(
+                div().flex().child(
+                    button(
+                        "remove-sandbox",
+                        "Remove sandbox…",
+                        ready,
+                        p,
+                        cx,
+                        |this, _, cx| this.review_removal(cx),
+                    )
+                    .track_focus(&self.removal_focus[3])
+                    .text_color(rgb(p.error)),
+                ),
+            );
 
             if let Some(source) = sandbox.source {
                 page = page
@@ -1450,7 +1702,20 @@ impl Render for ProjectsView {
                 page=page.child(div().text_sm().text_color(rgb(p.text_muted)).child("Legacy database-only environment. Choose a working copy in the titlebar to run project services."));
             }
         }
-        div().flex().flex_col().size_full().min_h_0().child(page)
+        if self.focus_removal {
+            self.focus_removal = false;
+            self.removal_focus[0].focus(window);
+        }
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h_0()
+            .child(page)
+            .when_some(self.removal.clone(), |container, review| {
+                container.child(self.removal_dialog(review, p, cx))
+            })
     }
 }
 fn toggle(values: &mut Vec<String>, value: &str) {
@@ -1466,4 +1731,11 @@ fn preparation_preview() -> bool {
         && std::env::var_os("SANDBOX_PREPARE_TEST_DATA_DIR").is_some()
         && std::env::var_os("SANDBOX_PREPARE_UI_PREVIEW").is_some()
         && std::env::var("SANDBOX_PREPARE_UI_PREVIEW_SCREEN").as_deref() == Ok("preparation")
+}
+
+fn removal_preview() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("SANDBOX_PREPARE_TEST_DATA_DIR").is_some()
+        && std::env::var_os("SANDBOX_PREPARE_UI_PREVIEW").is_some()
+        && std::env::var("SANDBOX_PREPARE_UI_PREVIEW_SCREEN").as_deref() == Ok("removal")
 }

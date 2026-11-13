@@ -514,6 +514,36 @@ fn two_sandboxes_share_archives_but_not_databases_or_project_processes() -> Resu
     assert_ne!(managers[0].store.password, managers[1].store.password);
     managers[0].sql(&first, true, "INSERT INTO fixture.numbers VALUES (99);")?;
     assert!(managers.iter().all(|m| m.snapshot().application_ready));
+    // A rejected worktree deletion must leave the restored databases and process alive.
+    let review = managers[0].review_removal(&AtomicBool::new(false))?;
+    managers[0].launch(Action::Remove(sandbox_core::models::RemovalApproval {
+        worktree: sandbox_core::models::WorktreeRemoval::Delete,
+        identity: review.identity,
+        fingerprint: review.worktree,
+    }));
+    assert!(wait(&managers[0], Duration::from_secs(60)).is_err());
+    assert!(managers[0].has_database_data()?);
+    assert_eq!(
+        managers[0]
+            .sql(&first, true, "SELECT COUNT(*) FROM fixture.numbers;")?
+            .trim(),
+        "4"
+    );
+    assert_eq!(
+        managers[0]
+            .docker
+            .output(
+                &strings(&[
+                    "inspect",
+                    "--format",
+                    "{{.State.Running}}",
+                    &format!("{}-app-api", first.project)
+                ]),
+                SHORT
+            )?
+            .trim(),
+        "true"
+    );
     managers[0].launch(Action::Run);
     wait(&managers[0], Duration::from_secs(180))?;
     assert_eq!(managers[0].snapshot().active.as_ref().unwrap().id, first.id);
@@ -644,6 +674,29 @@ fn two_sandboxes_share_archives_but_not_databases_or_project_processes() -> Resu
         managers[0].has_database_data().is_err(),
         "Partial data loss must require explicit replacement"
     );
+    let kept_source = managers[0]
+        .store
+        .scope
+        .as_ref()
+        .unwrap()
+        .0
+        .sandbox(&managers[0].store.scope.as_ref().unwrap().1)?
+        .source
+        .unwrap()
+        .directory;
+    let review = managers[0].review_removal(&AtomicBool::new(false))?;
+    managers[0].launch(Action::Remove(sandbox_core::models::RemovalApproval {
+        worktree: sandbox_core::models::WorktreeRemoval::Keep,
+        identity: review.identity,
+        fingerprint: review.worktree,
+    }));
+    wait(&managers[0], Duration::from_secs(120))?;
+    assert!(
+        kept_source.is_dir(),
+        "Keep worktree must preserve the user's directory"
+    );
+    let (removed_catalog, removed_id, _) = managers[0].store.scope.as_ref().unwrap();
+    assert!(removed_catalog.sandbox(removed_id).is_err());
     operations.stop();
     executor.block_on(operations.join());
     for manager in &managers {

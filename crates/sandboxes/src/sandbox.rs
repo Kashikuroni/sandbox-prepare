@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use sandbox_core::{
-    models::{Sandbox, Scope},
+    models::{RemovalApproval, Sandbox, Scope, WorktreeRemoval},
     operations::{Operations, RestoreLimit},
 };
 use sandbox_platform::catalog::Catalog;
@@ -57,7 +57,7 @@ pub enum Action {
     Start,
     Stop,
     Delete,
-    Remove,
+    Remove(RemovalApproval),
 }
 pub struct Watchdog {
     input: Option<ChildStdin>,
@@ -350,7 +350,7 @@ impl Manager {
                     Action::Start => manager.start(),
                     Action::Stop => manager.stop(),
                     Action::Delete => manager.delete(),
-                    Action::Remove => manager.remove(),
+                    Action::Remove(approval) => manager.remove(approval),
                 }
             }))
             .unwrap_or_else(|_| {
@@ -375,7 +375,7 @@ impl Manager {
                 if s.error.is_none() {
                     s.stage = match action {
                         Action::Stop => "Stopped",
-                        Action::Delete | Action::Remove => "Removed",
+                        Action::Delete | Action::Remove(_) => "Removed",
                         _ if s.application_running && !s.application_ready => {
                             "Running — readiness not confirmed"
                         }
@@ -1138,21 +1138,65 @@ impl Manager {
         });
         Ok(())
     }
-    fn remove(&self) -> Result<()> {
-        self.delete()?;
-        if let Some((catalog, id, project)) = &self.store.scope {
-            let sandbox = catalog.sandbox(id)?;
-            if sandbox.source.as_ref().is_some_and(|source| source.owned) {
-                ensure!(
-                    sandbox_projects::git::Git::default().remove_owned(
-                        catalog,
-                        &catalog.project(project)?,
-                        &sandbox,
-                        &self.cancel
-                    )?,
-                    "Database data was deleted, but the owned worktree is dirty or locked. The sandbox was kept. Commit or save your changes and retry removal."
-                );
-            }
+    pub fn review_removal(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<sandbox_projects::removal::RemovalReview> {
+        let (catalog, id, project) = self
+            .store
+            .scope
+            .as_ref()
+            .context("Only a project sandbox can be removed")?;
+        let mut review = sandbox_projects::git::Git::default().review_removal(
+            catalog,
+            &catalog.project(project)?,
+            &catalog.sandbox(id)?,
+            cancel,
+        )?;
+        use sha2::{Digest, Sha256};
+        let mut identity = Sha256::new();
+        identity.update(review.identity);
+        identity.update(serde_json::to_vec(&self.store.load()?)?);
+        review.identity = identity.finalize().into();
+        Ok(review)
+    }
+    fn remove(&self, approval: RemovalApproval) -> Result<()> {
+        // All known ownership/lock/dirty-state failures must happen before destroying any DB data.
+        let review = self.review_removal(&self.cancel)?;
+        ensure!(
+            review.identity == approval.identity,
+            "Sandbox changed after confirmation. Review removal again; database data has not been deleted."
+        );
+        if approval.worktree == WorktreeRemoval::Delete {
+            ensure!(
+                review.can_delete,
+                "{}",
+                review
+                    .warning
+                    .as_deref()
+                    .unwrap_or("Worktree cannot be deleted")
+            );
+            ensure!(
+                review.worktree == approval.fingerprint,
+                "Worktree changed after confirmation. Review removal again; database data has not been deleted."
+            );
+        }
+        self.stop_all()?;
+        if approval.worktree == WorktreeRemoval::Delete {
+            let (catalog, id, project) =
+                self.store.scope.as_ref().context("Sandbox is not scoped")?;
+            self.stage("Removing confirmed worktree…");
+            sandbox_projects::git::Git::default().remove_reviewed_worktree(
+                catalog,
+                &catalog.project(project)?,
+                &catalog.sandbox(id)?,
+                approval.fingerprint,
+                &self.cancel,
+            )?;
+        }
+        self.stage("Removing confirmed sandbox data…");
+        self.delete().with_context(|| if approval.worktree==WorktreeRemoval::Delete { "Worktree was removed, but sandbox data cleanup failed. Retry removal with Keep worktree." } else { "Sandbox cleanup failed; the working directory was kept." })?;
+        if let Some((catalog, id, _)) = &self.store.scope {
             catalog.remove_sandbox(id)?;
         }
         Ok(())

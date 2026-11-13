@@ -300,14 +300,31 @@ impl Runtime {
         self.manager(&sandbox.id)?;
         Ok(sandbox)
     }
-    pub fn remove_sandbox(&self, id: &SandboxId, cancel: &AtomicBool) -> Result<()> {
+    pub fn review_sandbox_removal(
+        &self,
+        id: &SandboxId,
+        cancel: &AtomicBool,
+    ) -> Result<sandbox_projects::removal::RemovalReview> {
         ensure!(!self.is_stopping(), "Application is shutting down");
         let manager = self.manager(id)?;
         ensure!(
             !manager.snapshot().busy,
             "Wait for the current sandbox operation"
         );
-        manager.launch(sandbox_sandboxes::sandbox::Action::Remove);
+        manager.review_removal(cancel)
+    }
+    pub fn remove_sandbox(
+        &self,
+        id: &SandboxId,
+        approval: sandbox_core::models::RemovalApproval,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        ensure!(!self.is_stopping(), "Application is shutting down");
+        ensure!(!cancel.load(Ordering::Acquire), "Removal cancelled");
+        let manager = self.manager(id)?;
+        manager.launch_prepared(sandbox_sandboxes::sandbox::Action::Remove(approval), |_| {
+            Ok(())
+        })?;
         while manager.snapshot().busy {
             if cancel.load(Ordering::Acquire) {
                 manager.cancel();

@@ -198,3 +198,15 @@ pub struct Scope {
     pub sandbox: Option<SandboxId>,
     pub operation: Option<OperationId>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeRemoval {
+    Keep,
+    Delete,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct RemovalApproval {
+    pub worktree: WorktreeRemoval,
+    pub identity: [u8; 32],
+    pub fingerprint: [u8; 32],
+}
