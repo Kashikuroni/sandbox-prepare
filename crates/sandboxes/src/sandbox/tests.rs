@@ -558,6 +558,43 @@ fn two_sandboxes_share_archives_but_not_databases_or_project_processes() -> Resu
         )?;
         assert!(environment.contains("DB_HOST=db"));
     }
+    let identity_args = strings(&[
+        "inspect",
+        "--format",
+        "{{.Id}}",
+        &managers[0].store.container(&first, "mysql"),
+        &managers[0].store.container(&first, "clickhouse"),
+        &format!("{}-app-api", first.project),
+    ]);
+    let before_stop = managers[0].docker.capture(
+        &identity_args,
+        &Default::default(),
+        &AtomicBool::new(false),
+        SHORT,
+    )?;
+    managers[0].stop()?;
+    assert!(
+        managers[0].has_database_data()?,
+        "Stop must preserve database volumes"
+    );
+    managers[0].launch(Action::Run);
+    wait(&managers[0], Duration::from_secs(120))?;
+    let after_start = managers[0].docker.capture(
+        &identity_args,
+        &Default::default(),
+        &AtomicBool::new(false),
+        SHORT,
+    )?;
+    assert_eq!(
+        before_stop, after_start,
+        "Unchanged DB and project containers must be reused"
+    );
+    assert_eq!(
+        managers[0]
+            .sql(&first, true, "SELECT COUNT(*) FROM fixture.numbers;")?
+            .trim(),
+        "4"
+    );
     managers[0].stop()?;
     assert_eq!(
         managers[1]

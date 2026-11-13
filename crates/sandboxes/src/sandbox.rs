@@ -27,6 +27,7 @@ use std::{
 pub const MYSQL_IMAGE: &str = "percona/percona-server:8.4.11-11@sha256:95d276d7f2b2718b725ad834a4d8a6f9e855b9566e51be8a9ff98d54b675f644";
 pub const CH_IMAGE: &str = "clickhouse/clickhouse-server:26.8.19.9@sha256:3ddc359dd4c29921f1b926559344c14c7d98f024e1db9d9d02926e182426fba2";
 pub const XB_IMAGE: &str = "percona/percona-xtrabackup:8.4@sha256:3b8032f97ba8e5c184803d0b644a893e80a613a9ca7806eb386aa5fb313778ff";
+mod launch_state;
 mod readiness;
 const OWNER_LABEL: &str = "ru.mentormarketplace.sandbox-prepare.owner";
 const SESSION_LABEL: &str = "ru.mentormarketplace.sandbox-prepare.session";
@@ -488,13 +489,9 @@ impl Manager {
             return Ok(());
         }
         self.validate_connection_databases(instance, &plan)?;
-        self.stage("Building and starting project services…");
-        let mut args = strings(&["up", "-d", if build { "--build" } else { "--no-build" }]);
-        args.extend(plan.application_services.clone());
-        self.compose_command(instance, &args)?;
-        self.follow(instance);
-        self.wait_for_application(instance, &plan)
+        self.start_project(instance, &plan, build)
     }
+
     fn owned_containers(&self) -> Result<Vec<String>> {
         if self.store.scope.is_some() {
             let saved = self.store.load()?;
