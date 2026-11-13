@@ -5,6 +5,7 @@ pub use sandbox_sandboxes::sandbox;
 pub use sandbox_settings::settings;
 pub use sandbox_telemetry::logging;
 pub use sandbox_telemetry::process_log;
+use sandbox_ui::selectable_text::SelectableText;
 pub use sandbox_ui::{icons, text_input, theme};
 use std::sync::Arc;
 mod context_bar;
@@ -243,7 +244,7 @@ impl Workspace {
                             {
                                 match std::env::var("SANDBOX_PREPARE_UI_PREVIEW_SCREEN").as_deref()
                                 {
-                                    Ok("launch") => {
+                                    Ok("launch" | "preparation") => {
                                         workspace.active_section = Section::Projects;
                                         workspace
                                             .projects
@@ -303,7 +304,7 @@ impl Workspace {
             && std::env::var_os("SANDBOX_PREPARE_UI_PREVIEW").is_some()
         {
             match std::env::var("SANDBOX_PREPARE_UI_PREVIEW_SCREEN").as_deref() {
-                Ok("launch") => {
+                Ok("launch" | "preparation") => {
                     workspace.active_section = Section::Projects;
                     workspace
                         .projects
@@ -666,7 +667,7 @@ impl Render for Workspace {
                     .py_2()
                     .text_sm()
                     .text_color(rgb(palette.error))
-                    .child(error)
+                    .child(SelectableText::new("shutdown-error", error, palette))
             }))
             .child(
                 div()
@@ -708,8 +709,11 @@ impl Render for Workspace {
                                 content.child(self.projects.clone())
                             })
                             .when_some(self.context_error.clone(), |content, error| {
-                                content
-                                    .child(div().p_3().text_color(rgb(palette.error)).child(error))
+                                content.child(
+                                    div().p_3().text_color(rgb(palette.error)).child(
+                                        SelectableText::new("context-error", error, palette),
+                                    ),
+                                )
                             }),
                     )
                     .when(self.logs_open, |row| {

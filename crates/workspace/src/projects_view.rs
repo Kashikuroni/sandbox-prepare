@@ -7,6 +7,7 @@ use sandbox_core::{models::*, operations::Operation};
 use sandbox_projects::compose;
 use sandbox_runtime::Runtime;
 use sandbox_ui::select::{OptionItem, Select};
+use sandbox_ui::selectable_text::SelectableText;
 use std::{
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool, mpsc},
@@ -39,7 +40,7 @@ struct LaunchDraft {
     profiles: Vec<String>,
     services: Vec<String>,
     mounts: Vec<Mount>,
-    inputs: [Entity<TextInput>; 10],
+    inputs: [Entity<TextInput>; 14],
     selects: [Entity<Select>; 4],
 }
 pub struct ProjectsView {
@@ -60,6 +61,10 @@ pub struct ProjectsView {
     probe_service: Entity<TextInput>,
     probe_port: Entity<TextInput>,
     probe_path: Entity<TextInput>,
+    preparation_command: Entity<TextInput>,
+    preparation_directory: Entity<TextInput>,
+    preparation_inputs: Entity<TextInput>,
+    preparation_outputs: Entity<TextInput>,
     advanced: bool,
     mysql: Entity<TextInput>,
     clickhouse: Entity<TextInput>,
@@ -169,6 +174,10 @@ impl ProjectsView {
             probe_service: input("", cx),
             probe_port: input("", cx),
             probe_path: input("", cx),
+            preparation_command: input("", cx),
+            preparation_directory: input(".", cx),
+            preparation_inputs: cx.new(|cx| TextInput::multiline(String::new(), theme, cx)),
+            preparation_outputs: cx.new(|cx| TextInput::multiline(String::new(), theme, cx)),
             advanced: false,
             mysql: input("mysql", cx),
             clickhouse: input("clickhouse", cx),
@@ -286,6 +295,10 @@ impl ProjectsView {
                         self.probe_service.clone(),
                         self.probe_port.clone(),
                         self.probe_path.clone(),
+                        self.preparation_command.clone(),
+                        self.preparation_directory.clone(),
+                        self.preparation_inputs.clone(),
+                        self.preparation_outputs.clone(),
                     ],
                     selects: [
                         self.env_service.clone(),
@@ -332,6 +345,10 @@ impl ProjectsView {
         self.probe_service = input("", cx);
         self.probe_port = input("", cx);
         self.probe_path = input("", cx);
+        self.preparation_command = input("", cx);
+        self.preparation_directory = input(".", cx);
+        self.preparation_inputs = cx.new(|cx| TextInput::multiline(String::new(), self.theme, cx));
+        self.preparation_outputs = cx.new(|cx| TextInput::multiline(String::new(), self.theme, cx));
         self.mysql = input("mysql", cx);
         self.clickhouse = input("clickhouse", cx);
         self.env_path = input("", cx);
@@ -407,6 +424,33 @@ impl ProjectsView {
             self.probe_path
                 .update(cx, |field, cx| field.set_value(probe.path.clone(), cx));
         }
+        if let Some(step) = &self.spec.preparation {
+            self.preparation_command
+                .update(cx, |field, cx| field.set_value(step.command.clone(), cx));
+            self.preparation_directory.update(cx, |field, cx| {
+                field.set_value(step.directory.display().to_string(), cx)
+            });
+            self.preparation_inputs.update(cx, |field, cx| {
+                field.set_value(
+                    step.inputs
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    cx,
+                )
+            });
+            self.preparation_outputs.update(cx, |field, cx| {
+                field.set_value(
+                    step.outputs
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    cx,
+                )
+            });
+        }
         self.fill_database_names(cx);
         for (role, field) in [("mysql", &self.mysql), ("clickhouse", &self.clickhouse)] {
             let name = self
@@ -440,6 +484,10 @@ impl ProjectsView {
                 self.probe_service,
                 self.probe_port,
                 self.probe_path,
+                self.preparation_command,
+                self.preparation_directory,
+                self.preparation_inputs,
+                self.preparation_outputs,
             ] = draft.inputs;
             [
                 self.env_service,
@@ -448,6 +496,8 @@ impl ProjectsView {
                 self.binding_parameter,
             ] = draft.selects;
             self.set_theme(self.theme, cx);
+        } else if preparation_preview() {
+            self.notice = Some("Project preparation preview — select text to copy.".into());
         } else if !self.spec.files.is_empty() {
             self.inspect(cx);
         } else if self
@@ -470,6 +520,10 @@ impl ProjectsView {
             &self.probe_service,
             &self.probe_port,
             &self.probe_path,
+            &self.preparation_command,
+            &self.preparation_directory,
+            &self.preparation_inputs,
+            &self.preparation_outputs,
             &self.clickhouse,
             &self.env_path,
             &self.variable,
@@ -741,6 +795,23 @@ impl ProjectsView {
                 path: self.probe_path.read(cx).value().trim().to_owned(),
             })
         };
+        let command = self.preparation_command.read(cx).value().trim().to_owned();
+        let paths = |field: &Entity<TextInput>| {
+            field
+                .read(cx)
+                .value()
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        };
+        spec.preparation = (!command.is_empty()).then(|| PreparationStep {
+            command,
+            directory: self.preparation_directory.read(cx).value().trim().into(),
+            inputs: paths(&self.preparation_inputs),
+            outputs: paths(&self.preparation_outputs),
+        });
         spec.databases.clear();
         for (role, input) in [("mysql", &self.mysql), ("clickhouse", &self.clickhouse)] {
             let name = input.read(cx).value();
@@ -944,11 +1015,15 @@ impl Render for ProjectsView {
                 div()
                     .text_sm()
                     .text_color(rgb(p.error))
-                    .child(error.clone()),
+                    .child(SelectableText::new("project-error", error.clone(), p)),
             );
         }
         if let Some(notice) = &self.notice {
-            page = page.child(div().text_sm().child(notice.clone()));
+            page = page.child(div().text_sm().child(SelectableText::new(
+                "project-notice",
+                notice.clone(),
+                p,
+            )));
         }
         if let Some(job) = &self.operation {
             page = page.child(
@@ -1100,12 +1175,13 @@ impl Render for ProjectsView {
 
             if let Some(source) = sandbox.source {
                 page = page
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(p.text_muted))
-                            .child(source.directory.display().to_string()),
-                    )
+                    .child(div().text_sm().text_color(rgb(p.text_muted)).child(
+                        SelectableText::new(
+                            "working-directory",
+                            source.directory.display().to_string(),
+                            p,
+                        ),
+                    ))
                     .child(
                         div()
                             .flex()
@@ -1167,6 +1243,40 @@ impl Render for ProjectsView {
                     .child(row("MySQL database (DB_NAME)",self.mysql_database.clone(),p))
                     .child(row("ClickHouse database",self.ch_database.clone(),p))
                     .child(div().text_sm().text_color(rgb(p.text_muted)).child("Names are inferred from project env files when available. Hosts, ports, logins and passwords are managed by the sandbox."))
+                    ;
+                if preparation_preview() {
+                    page = div()
+                        .id("preparation-preview-form")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_6()
+                        .w_full()
+                        .child(div().text_sm().text_color(rgb(p.text_muted)).child(
+                            SelectableText::new(
+                                "preparation-preview-path",
+                                source.directory.display().to_string(),
+                                p,
+                            ),
+                        ));
+                }
+                page = page.child(heading("Project preparation", p))
+                    .child(div().text_sm().text_color(rgb(p.text_muted)).child("Optional command before Compose, for example a frontend build. Output appears in Processes. Leave the command empty to disable."))
+                    .child(button("frontend-preparation-example", "Use frontend build example", ready, p, cx, |this,_,cx| {
+                        this.preparation_command.update(cx, |field,cx| field.set_value("pnpm --dir frontend install --frozen-lockfile && make build-frontend-dev".into(),cx));
+                        this.preparation_directory.update(cx, |field,cx| field.set_value(".".into(),cx));
+                        this.preparation_inputs.update(cx, |field,cx| field.set_value("frontend\nMakefile".into(),cx));
+                        this.preparation_outputs.update(cx, |field,cx| field.set_value("frontend/nginx_dist\nfrontend/nginx_dist/index.html\nfrontend/dist".into(),cx));
+                        cx.notify();
+                    }))
+                    .child(row("Command", self.preparation_command.clone(), p))
+                    .child(row("Working directory (relative to worktree)", self.preparation_directory.clone(), p))
+                    .child(div().text_sm().text_color(rgb(p.text_muted)).child("Input and output paths are relative to that directory, one per line. Both lists enable reuse until inputs or outputs change. Exclude generated files from inputs."))
+                    .child(div().flex().flex_col().gap_1().child(div().text_sm().text_color(rgb(p.text_muted)).child("Inputs to watch")).child(div().h(px(88.)).child(self.preparation_inputs.clone())))
+                    .child(div().flex().flex_col().gap_1().child(div().text_sm().text_color(rgb(p.text_muted)).child("Expected outputs")).child(div().h(px(88.)).child(self.preparation_outputs.clone())))
                     .child(button("advanced-launch",if self.advanced{"Hide advanced settings"}else{"Advanced settings…"},ready,p,cx,|this,_,cx|{this.advanced=!this.advanced;cx.notify();}));
                 if self.advanced {
                     page = page
@@ -1291,7 +1401,7 @@ impl Render for ProjectsView {
                             div()
                                 .text_sm()
                                 .text_color(rgb(p.error))
-                                .child(error.clone()),
+                                .child(SelectableText::new("binding-error", error.clone(), p)),
                         );
                     }
                     if !self.mounts.is_empty() {
@@ -1321,7 +1431,12 @@ impl Render for ProjectsView {
                 }
                 page = page
                     .when_some(self.save_error.clone(), |d, error| {
-                        d.child(div().text_sm().text_color(rgb(p.error)).child(error))
+                        d.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(p.error))
+                                .child(SelectableText::new("save-profile-error", error, p)),
+                        )
                     })
                     .child(div().flex().child(button(
                         "save-compose",
@@ -1344,4 +1459,11 @@ fn toggle(values: &mut Vec<String>, value: &str) {
     } else {
         values.push(value.into());
     }
+}
+
+fn preparation_preview() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("SANDBOX_PREPARE_TEST_DATA_DIR").is_some()
+        && std::env::var_os("SANDBOX_PREPARE_UI_PREVIEW").is_some()
+        && std::env::var("SANDBOX_PREPARE_UI_PREVIEW_SCREEN").as_deref() == Ok("preparation")
 }

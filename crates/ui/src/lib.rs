@@ -8,3 +8,5 @@ pub mod select;
 pub mod context_picker;
 
 pub mod titlebar_style;
+
+pub mod selectable_text;

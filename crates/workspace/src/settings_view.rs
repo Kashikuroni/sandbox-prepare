@@ -8,6 +8,7 @@ use crate::{
 };
 use gpui::{Context, Div, Entity, FocusHandle, Render, Stateful, Window, div, prelude::*, px, rgb};
 use sandbox_backups::service::Service;
+use sandbox_ui::selectable_text::SelectableText;
 use std::{sync::Arc, time::Duration};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -531,10 +532,13 @@ impl SettingsWindow {
                             .flex_shrink_0()
                             .child(self.logs[index].clone())
                             .children(self.log_errors[index].as_ref().map(|error| {
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette.error))
-                                    .child(error.clone())
+                                div().text_xs().text_color(rgb(palette.error)).child(
+                                    SelectableText::new(
+                                        gpui::SharedString::from(format!("settings-error-{error}")),
+                                        error.clone(),
+                                        palette,
+                                    ),
+                                )
                             })),
                     ),
                 );
@@ -575,7 +579,11 @@ impl SettingsWindow {
                         div()
                             .text_sm()
                             .text_color(rgb(palette.error))
-                            .child(error.clone())
+                            .child(SelectableText::new(
+                                gpui::SharedString::from(format!("settings-error-{error}")),
+                                error.clone(),
+                                palette,
+                            ))
                     }))
                     .child(
                         div()
@@ -752,7 +760,7 @@ impl Render for SettingsWindow {
                     .child(if self.json_mode {
                         button("show-form", "Back to settings", palette, cx, |view, window, cx| view.request(Destination::Form(view.section), window, cx))
                     } else { button("edit-settings-json", "Edit settings.json", palette, cx, |view, window, cx| view.request(Destination::Json, window, cx)) }.border_color(rgb(palette.border)).bg(rgb(palette.panel_background))))
-                .children(self.model.read(cx).error.as_ref().map(|error| div().px_6().py_2().text_sm().text_color(rgb(palette.error)).child(error.clone())))
+                .children(self.model.read(cx).error.as_ref().map(|error| div().px_6().py_2().text_sm().text_color(rgb(palette.error)).child(SelectableText::new(gpui::SharedString::from(format!("settings-error-{error}")), error.clone(), palette))))
                 .children(self.message.as_ref().map(|(error, message)| div().px_6().py_2().text_sm().text_color(rgb(if *error { palette.error } else { palette.text_muted })).child(message.clone())))
                 .when(self.json_mode, |el| el.child(div().flex().flex_col().flex_1().min_h_0().px_6().pb_6().gap_3()
                     .child(div().text_sm().text_color(rgb(palette.text_muted)).child("Connection keys are edited in Storage. Save to validate and apply JSON changes."))

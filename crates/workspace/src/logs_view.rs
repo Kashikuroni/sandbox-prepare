@@ -8,6 +8,7 @@ use gpui::{
     Context, Div, IntoElement, ListAlignment, ListState, Render, Stateful, Window, div, list,
     prelude::*, px, rgb,
 };
+use sandbox_ui::selectable_text::SelectableText;
 use std::{
     cell::Cell,
     rc::Rc,
@@ -587,7 +588,14 @@ impl LogsView {
                     .w_full()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(log_title(&entry.message).to_owned()),
+                    .child(SelectableText::new(
+                        gpui::SharedString::from(format!(
+                            "log-message-{}-{}",
+                            entry.session_id, entry.seq
+                        )),
+                        log_title(&entry.message).to_owned(),
+                        palette,
+                    )),
             )
     }
     fn render_details(&self, entry: Arc<Entry>, palette: Palette, cx: &mut Context<Self>) -> Div {
@@ -660,7 +668,11 @@ impl LogsView {
                         div()
                             .text_sm()
                             .text_color(rgb(palette.error))
-                            .child(error.clone())
+                            .child(SelectableText::new(
+                                "log-copy-error",
+                                error.clone(),
+                                palette,
+                            ))
                     }))
                     .child(detail_field("Message", &entry.message, palette))
                     .child(detail_field("Level", &entry.level, palette))
@@ -695,7 +707,11 @@ fn detail_field(label: &str, value: &str, palette: Palette) -> Div {
                 .text_color(rgb(palette.text_muted))
                 .child(label.to_owned()),
         )
-        .child(div().text_sm().w_full().child(value.to_owned()))
+        .child(div().text_sm().w_full().child(SelectableText::new(
+            gpui::SharedString::from(format!("detail-{label}")),
+            value.to_owned(),
+            palette,
+        )))
 }
 fn log_title(message: &str) -> &str {
     message
@@ -847,11 +863,13 @@ impl Render for LogsView {
                     .into_iter()
                     .chain(self.error.clone())
                     .map(|error| {
-                        div()
-                            .px_3()
-                            .text_sm()
-                            .text_color(rgb(palette.error))
-                            .child(error)
+                        div().px_3().text_sm().text_color(rgb(palette.error)).child(
+                            SelectableText::new(
+                                gpui::SharedString::from(format!("log-error-{error}")),
+                                error,
+                                palette,
+                            ),
+                        )
                     }),
             )
             .when(self.malformed > 0 && self.source == Source::History, |el| {

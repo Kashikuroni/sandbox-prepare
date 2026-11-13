@@ -7,6 +7,7 @@ use crate::{
 };
 use gpui::{Context, Div, Render, Window, div, prelude::*, px, rgb};
 use sandbox_backups::service::Service;
+use sandbox_ui::selectable_text::SelectableText;
 use std::sync::{Arc, atomic::Ordering};
 use std::{
     sync::mpsc,
@@ -533,22 +534,22 @@ impl BackupsView {
                 ),
             );
         if let Some(error) = &row.error {
-            content = content.child(
-                div()
-                    .px_2()
-                    .text_sm()
-                    .text_color(rgb(palette.error))
-                    .child(error.clone()),
-            );
+            content = content.child(div().px_2().text_sm().text_color(rgb(palette.error)).child(
+                SelectableText::new(
+                    gpui::SharedString::from(format!("backup-error-{error}")),
+                    error.clone(),
+                    palette,
+                ),
+            ));
         }
         if let Some(error) = local.and_then(|record| record.verification_error.as_ref()) {
-            content = content.child(
-                div()
-                    .px_2()
-                    .text_sm()
-                    .text_color(rgb(palette.error))
-                    .child(format!("Local verification: {error}")),
-            );
+            content = content.child(div().px_2().text_sm().text_color(rgb(palette.error)).child(
+                SelectableText::new(
+                    "backup-verification-error",
+                    format!("Local verification: {error}"),
+                    palette,
+                ),
+            ));
         }
         if row.expanded {
             let mut details = div()
@@ -561,6 +562,7 @@ impl BackupsView {
                 .text_sm()
                 .text_color(rgb(palette.text_muted))
                 .child(detail(
+                    palette,
                     index,
                     "Source",
                     format!(
@@ -572,8 +574,14 @@ impl BackupsView {
                 ));
             if let Some(remote) = &row.remote {
                 details = details
-                    .child(detail(index, "S3 file", remote.file_name().to_owned()))
                     .child(detail(
+                        palette,
+                        index,
+                        "S3 file",
+                        remote.file_name().to_owned(),
+                    ))
+                    .child(detail(
+                        palette,
                         index,
                         "S3 modified",
                         exact_date(&remote.modified.to_string()),
@@ -581,8 +589,14 @@ impl BackupsView {
             }
             if let Some(record) = local {
                 details = details
-                    .child(detail(index, "Local source file", record.key.clone()))
                     .child(detail(
+                        palette,
+                        index,
+                        "Local source file",
+                        record.key.clone(),
+                    ))
+                    .child(detail(
+                        palette,
                         index,
                         "Local modified",
                         exact_date(&record.modified),
@@ -592,6 +606,7 @@ impl BackupsView {
                     && let Ok(directory) = cache.directory(&pair.generation)
                 {
                     details = details.child(detail(
+                        palette,
                         index,
                         "Local path",
                         directory
@@ -826,7 +841,11 @@ impl Render for BackupsView {
                     .py_2()
                     .text_sm()
                     .text_color(rgb(palette.error))
-                    .child(error.clone())
+                    .child(SelectableText::new(
+                        gpui::SharedString::from(format!("backup-error-{error}")),
+                        error.clone(),
+                        palette,
+                    ))
             }))
             .children(self.local.warnings.iter().map(|warning| {
                 div()
@@ -859,7 +878,12 @@ fn exact_date(timestamp: &str) -> String {
         .unwrap_or_else(|_| timestamp.into())
 }
 
-fn detail(index: usize, label: &'static str, value: String) -> gpui::Stateful<Div> {
+fn detail(
+    palette: Palette,
+    index: usize,
+    label: &'static str,
+    value: String,
+) -> gpui::Stateful<Div> {
     // Keep long object keys and paths available without widening the page.
     div()
         .id((label, index))
@@ -867,7 +891,11 @@ fn detail(index: usize, label: &'static str, value: String) -> gpui::Stateful<Di
         .min_w_0()
         .overflow_x_scroll()
         .whitespace_nowrap()
-        .child(format!("{label}: {value}"))
+        .child(SelectableText::new(
+            gpui::SharedString::from(format!("backup-detail-{index}-{label}")),
+            format!("{label}: {value}"),
+            palette,
+        ))
 }
 
 struct RefreshTooltip(Palette);

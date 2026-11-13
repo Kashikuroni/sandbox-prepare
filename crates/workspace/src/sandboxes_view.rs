@@ -9,6 +9,7 @@ use gpui::{
     ClipboardItem, Context, Div, FocusHandle, ListAlignment, ListState, Render, Window, div, list,
     prelude::*, px, rgb,
 };
+use sandbox_ui::selectable_text::SelectableText;
 use std::{
     sync::{Arc, atomic::Ordering},
     time::Duration,
@@ -254,7 +255,16 @@ impl SandboxesView {
                     .text_color(rgb(palette.text_muted))
                     .child(format!("{} · {}", line.time, line.process)),
             )
-            .child(div().text_sm().whitespace_normal().child(line.text.clone()))
+            .child(
+                div()
+                    .text_sm()
+                    .whitespace_normal()
+                    .child(SelectableText::new(
+                        gpui::SharedString::from(format!("process-line-{index}")),
+                        line.text.clone(),
+                        palette,
+                    )),
+            )
     }
     fn sandbox_page(&self, palette: Palette, cx: &Context<Self>) -> Div {
         let state = self
@@ -264,104 +274,115 @@ impl SandboxesView {
             .unwrap_or_default();
         let busy = state.busy || state.shutting_down || self.exit_requested;
         let active = state.active.as_ref();
-        let mut page = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .p_4()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        button("sandbox-refresh", "", palette, !busy, cx, |view, _, cx| {
-                            view.act(Action::Refresh, cx)
-                        })
-                        .w(px(28.))
-                        .p_0()
-                        .child(Icon::Refresh.render(palette.icon)),
-                    )
-                    .child(div().flex_1())
-                    .child(button(
-                        "sandbox-run",
-                        "Start sandbox",
+        let mut page =
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .p_4()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            button("sandbox-refresh", "", palette, !busy, cx, |view, _, cx| {
+                                view.act(Action::Refresh, cx)
+                            })
+                            .w(px(28.))
+                            .p_0()
+                            .child(Icon::Refresh.render(palette.icon)),
+                        )
+                        .child(div().flex_1())
+                        .child(button(
+                            "sandbox-run",
+                            "Start sandbox",
+                            palette,
+                            !busy && self.manager.is_some(),
+                            cx,
+                            |view, _, cx| view.run_sandbox(false, cx),
+                        ))
+                        .child(button(
+                            "sandbox-create",
+                            "Update databases…",
+                            palette,
+                            !busy && active.is_some(),
+                            cx,
+                            |view, window, cx| view.confirm(Confirmation::Recreate, window, cx),
+                        ))
+                        .child(button(
+                            "configure-launch",
+                            "Configure…",
+                            palette,
+                            !busy,
+                            cx,
+                            |_, _, cx| cx.emit(ConfigureLaunch),
+                        ))
+                        .child(button(
+                            "sandbox-stop",
+                            "Stop",
+                            palette,
+                            !busy && state.running.contains(&true),
+                            cx,
+                            |view, _, cx| view.act(Action::Stop, cx),
+                        ))
+                        .child(button(
+                            "sandbox-delete",
+                            "Delete…",
+                            palette,
+                            !busy && active.is_some(),
+                            cx,
+                            |view, window, cx| view.confirm(Confirmation::Delete, window, cx),
+                        )),
+                )
+                .child(div().text_sm().text_color(rgb(palette.text_muted)).child(
+                    SelectableText::new(
+                        "sandbox-stage",
+                        if !state.busy
+                            && state.error.is_none()
+                            && state.active.is_none()
+                            && state.docker_ready
+                        {
+                            "Not started".into()
+                        } else if state.stage.is_empty() {
+                            "Checking Docker…".into()
+                        } else {
+                            state.stage.clone()
+                        },
                         palette,
-                        !busy && self.manager.is_some(),
-                        cx,
-                        |view, _, cx| view.run_sandbox(false, cx),
-                    ))
-                    .child(button(
-                        "sandbox-create",
-                        "Update databases…",
-                        palette,
-                        !busy && active.is_some(),
-                        cx,
-                        |view, window, cx| view.confirm(Confirmation::Recreate, window, cx),
-                    ))
-                    .child(button(
-                        "configure-launch",
-                        "Configure…",
-                        palette,
-                        !busy,
-                        cx,
-                        |_, _, cx| cx.emit(ConfigureLaunch),
-                    ))
-                    .child(button(
-                        "sandbox-stop",
-                        "Stop",
-                        palette,
-                        !busy && state.running.contains(&true),
-                        cx,
-                        |view, _, cx| view.act(Action::Stop, cx),
-                    ))
-                    .child(button(
-                        "sandbox-delete",
-                        "Delete…",
-                        palette,
-                        !busy && active.is_some(),
-                        cx,
-                        |view, window, cx| view.confirm(Confirmation::Delete, window, cx),
-                    )),
-            )
-            .child(div().text_sm().text_color(rgb(palette.text_muted)).child(
-                if !state.busy
-                    && state.error.is_none()
-                    && state.active.is_none()
-                    && state.docker_ready
-                {
-                    "Not started".into()
-                } else if state.stage.is_empty() {
-                    "Checking Docker…".into()
-                } else {
-                    state.stage.clone()
-                },
-            ))
-            .when(state.busy && !self.exit_requested, |page| {
-                page.child(button(
-                    "sandbox-cancel",
-                    "Cancel operation",
-                    palette,
-                    true,
-                    cx,
-                    |view, _, cx| {
-                        if let Some(manager) = &view.manager {
-                            manager.cancel();
-                        }
-                        cx.notify();
-                    },
+                    ),
                 ))
-            })
-            .children(state.error.iter().chain(self.error.iter()).map(|error| {
-                div()
-                    .text_sm()
-                    .text_color(rgb(palette.error))
-                    .child(error.clone())
-            }));
+                .when(state.busy && !self.exit_requested, |page| {
+                    page.child(button(
+                        "sandbox-cancel",
+                        "Cancel operation",
+                        palette,
+                        true,
+                        cx,
+                        |view, _, cx| {
+                            if let Some(manager) = &view.manager {
+                                manager.cancel();
+                            }
+                            cx.notify();
+                        },
+                    ))
+                })
+                .children(state.error.iter().chain(self.error.iter()).enumerate().map(
+                    |(index, error)| {
+                        div()
+                            .text_sm()
+                            .text_color(rgb(palette.error))
+                            .child(SelectableText::new(
+                                gpui::SharedString::from(format!("sandbox-error-{index}")),
+                                error.clone(),
+                                palette,
+                            ))
+                    },
+                ));
         if state.stage.starts_with("Extracting")
             && let Some(manager) = &self.manager
         {
@@ -459,7 +480,11 @@ impl SandboxesView {
                                 .text_color(rgb(palette.text_muted))
                                 .child(version),
                         )
-                        .child(div().text_sm().child(endpoint))
+                        .child(div().text_sm().child(SelectableText::new(
+                            gpui::SharedString::from(format!("endpoint-{endpoint}")),
+                            endpoint,
+                            palette,
+                        )))
                         .child(
                             div()
                                 .text_sm()

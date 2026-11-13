@@ -982,6 +982,7 @@ impl Focusable for TextInput {
 }
 
 pub fn bind_keys(cx: &mut App) {
+    crate::selectable_text::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new("tab", Indent, Some("JsonEditor")),
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
